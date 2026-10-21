@@ -27,6 +27,7 @@ NVIDIA.
 | Sandbox Pods run in Kata Containers microVMs (Cloud Hypervisor) through a RuntimeClass | in testing; configuration only, no code change |
 | Agent Sandbox warm pools: claim a pre-started sandbox before creating a cold one | in progress |
 | Operator-fixed labels and annotations on every Sandbox, workload and supervisor Pod and workspace claim (`fixed_pod_labels`, `fixed_pod_annotations`), for clusters whose admission, telemetry or retention policy requires them | available |
+| Supervisor telemetry to the gateway's collector, a separate collector, or none (`supervisor_telemetry`), without forwarding the gateway's collector credentials | available |
 | Retention class and expiry on every sandbox object | in progress |
 | A run receipt per sandbox: policy and image digests, runtime, OCSF event counts, exit status, output checksums | in progress |
 
