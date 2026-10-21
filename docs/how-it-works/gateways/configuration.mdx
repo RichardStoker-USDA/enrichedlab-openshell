@@ -966,6 +966,14 @@ workspace_default_storage_size = "10Gi"
 # Labels select pods for NetworkPolicy rules and Services, so only allow keys
 # that no other rule in the sandbox namespace selects on.
 # allowed_pod_labels           = ["app", "team.example.org/*"]
+# Labels and annotations the driver adds to every sandbox it creates: the
+# Sandbox resource, its workload and supervisor pods and its default workspace
+# claim, also on restart. For clusters whose admission, telemetry or retention
+# policy requires them. Exact keys only, outside the reserved domains and not
+# a key the driver writes itself (OpenShift SCC ranges, the trace context);
+# templates cannot set these keys. Empty (default) adds nothing.
+# fixed_pod_labels             = { "example.com/owner" = "research", "example.com/retention" = "audit" }
+# fixed_pod_annotations        = { "example.com/contact" = "ops@example.com" }
 # Kubelet clamps projected tokens below 600 seconds. The driver caps values at 86400.
 sa_token_ttl_secs              = 3600
 # Optional SPIFFE Workload API socket mounted into sandbox pods for dynamic

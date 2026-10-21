@@ -109,12 +109,13 @@ struct Args {
     #[arg(long, env = "OPENSHELL_K8S_ALLOWED_POD_LABELS", value_delimiter = ',')]
     allowed_pod_labels: Vec<String>,
 
-    /// Label added to every sandbox object, as KEY=VALUE; repeat or separate with commas.
+    /// Label added to every sandbox object, as KEY=VALUE; repeat or separate with commas (label values cannot
+    /// contain commas).
     #[arg(long = "fixed-pod-label", env = "OPENSHELL_K8S_FIXED_POD_LABELS", value_delimiter = ',', value_parser = parse_key_value)]
     fixed_pod_labels: Vec<(String, String)>,
 
-    /// Annotation added to every sandbox object, as KEY=VALUE; repeat or separate with commas.
-    #[arg(long = "fixed-pod-annotation", env = "OPENSHELL_K8S_FIXED_POD_ANNOTATIONS", value_delimiter = ',', value_parser = parse_key_value)]
+    /// Annotation added to every sandbox object, as KEY=VALUE; repeat the flag for more. Values may contain commas.
+    #[arg(long = "fixed-pod-annotation", value_parser = parse_key_value)]
     fixed_pod_annotations: Vec<(String, String)>,
 
     #[arg(long, env = "OPENSHELL_MANAGED_SSH_INGRESS_ENABLED")]
@@ -383,6 +384,38 @@ fn parse_key_value(raw: &str) -> Result<(String, String), String> {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser as _;
+
+    #[test]
+    fn fixed_metadata_flags_keep_commas_in_annotation_values() {
+        let args = Args::try_parse_from([
+            "openshell-driver-kubernetes",
+            "--fixed-pod-label",
+            "example.com/a=x,example.com/b=y",
+            "--fixed-pod-annotation",
+            "example.com/targets=a,b",
+            "--fixed-pod-annotation",
+            "example.com/owner=research",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.fixed_pod_labels,
+            vec![
+                ("example.com/a".to_string(), "x".to_string()),
+                ("example.com/b".to_string(), "y".to_string()),
+            ]
+        );
+        assert_eq!(
+            args.fixed_pod_annotations,
+            vec![
+                ("example.com/targets".to_string(), "a,b".to_string()),
+                ("example.com/owner".to_string(), "research".to_string()),
+            ]
+        );
+        assert!(parse_key_value("no-equals").is_err());
+        assert!(parse_key_value("=value").is_err());
+    }
+
     use super::*;
 
     #[test]
