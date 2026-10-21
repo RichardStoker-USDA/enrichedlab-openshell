@@ -46,12 +46,18 @@ git merge --ff-only enrichedlab/merge-v0.1.6
 git push origin enrichedlab/main
 ```
 
+rerere replays conflicting hunks only. A fork change that has to move to new upstream code without a textual
+conflict is listed here and checked by hand on every merge:
+
+- Upstream `main` after v0.1.5 creates every supervisor Pod in `create_sandbox_runtime_supervisor`; the fixed
+  labels and annotations are applied there (`apply_fixed_pod_metadata`), as on `enrichedlab/next`.
+
 When pushing, the script also disables any upstream workflow GitHub has enabled in the fork. Upstream's workflows
 expect NVIDIA's runners and secrets; the fork runs only its own `enrichedlab-*` workflows.
 
 ## Images
 
-`.github/workflows/enrichedlab-images.yml` builds the gateway, supervisor and sandbox images for linux/amd64 and
+`.github/workflows/enrichedlab-images.yml` builds the gateway, supervisor, sandbox and CLI images for linux/amd64 and
 linux/arm64 with upstream's build actions on GitHub-hosted runners, pushes them to
 `ghcr.io/richardstoker-usda/enrichedlab-openshell/<component>`, and signs a SLSA build provenance attestation for each
 image index. A release tag produces `<component>:X.Y.Z-el.N`; a push to `enrichedlab/main` produces
