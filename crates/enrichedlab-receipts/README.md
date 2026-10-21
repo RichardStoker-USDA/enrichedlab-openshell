@@ -11,8 +11,11 @@ only. Every record is keyed by the gateway's sandbox id, which the gateway assig
 Kubernetes driver writes on every object of that sandbox (`openshell.ai/sandbox-id`); nothing is matched by name.
 Sandbox objects are watched and listed with the driver's own selector, including this gateway's id
 (`openshell.ai/gateway-id`), so another gateway's sandboxes in the same namespace are never receipted as this one's.
-Pods are watched by the driver's labels and kept only for a sandbox that scoped watch saw or whose committed start
-this gateway sent.
+Pods are watched by the driver's boundary labels (`openshell.ai/boundary-pair`, the lowercased sandbox id, and
+`openshell.ai/boundary-role`), which both the supervisor and the workload Pod carry. The supervisor names its sandbox
+by label and the workload Pod, made by the Agent Sandbox controller, by the driver's annotation; either must agree
+with the pair label. A Pod's facts are kept only for a sandbox the scoped watch saw or whose committed start this
+gateway sent.
 
 ## What a receipt holds
 
@@ -36,7 +39,9 @@ Every receipt lists these under `not_recorded`: the main process's exit status a
 the gateway keeps in its own store and audit log; the prover's verdicts on policy proposals, also kept by the
 gateway; the supervisor's OCSF events, which are counted elsewhere (join
 them by the supervisor Pod's name and UID); output checksums, because workspace contents are not read; and policy
-changes after the start, because a policy change's committed response does not name its sandbox. A receipt
+changes after the start, because a policy change's committed response does not name its sandbox. A sandbox created
+without a policy of its own also lists `policy`: the gateway's default applied, which the committed sandbox does
+not carry. A receipt
 without `start` says the gateway's commit was not seen.
 
 ## How the end is observed

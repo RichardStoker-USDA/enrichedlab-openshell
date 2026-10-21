@@ -300,6 +300,16 @@ impl Tracker {
             }
             Err(error) => return Err(error),
         };
+        if start
+            .as_ref()
+            .is_some_and(|start| start.policy_hash.is_none())
+        {
+            gaps.insert(
+                "policy".to_string(),
+                "the sandbox was created without a policy of its own; the gateway's default applied, which the committed sandbox does not carry"
+                    .to_string(),
+            );
+        }
         if observed
             .as_ref()
             .is_none_or(|observed| observed.pods.is_empty())

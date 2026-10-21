@@ -25,9 +25,15 @@ use crate::store::valid_sandbox_id;
 use crate::telemetry;
 use crate::tracker::{Tracker, stamp};
 
-/// Pods: the driver's labels. Pods may not carry the gateway id, so a Pod's facts are kept only for a
-/// sandbox this gateway's scoped watch or committed start established (`Tracker::pod_seen`).
-const POD_SELECTOR: &str = "openshell.ai/managed-by=openshell,openshell.ai/sandbox-id";
+/// Sandbox objects carry the driver's labels; with this gateway's id they select its sandboxes.
+const SANDBOX_BASE: &str = "openshell.ai/managed-by=openshell,openshell.ai/sandbox-id";
+/// Both Pods of a sandbox carry the driver's boundary labels: the pair (the lowercased sandbox id) and the
+/// role (workload or supervisor). The supervisor also has the sandbox id as a label; the workload Pod,
+/// made by the Agent Sandbox controller from the Sandbox's template, has it as an annotation. Pods may not
+/// carry the gateway id, so a Pod's facts are kept only for a sandbox this gateway's scoped watch or
+/// committed start established (`Tracker::pod_seen`).
+const POD_SELECTOR: &str = "openshell.ai/boundary-pair,openshell.ai/boundary-role";
+const BOUNDARY_PAIR: &str = "openshell.ai/boundary-pair";
 const GATEWAY_ID: &str = "openshell.ai/gateway-id";
 const SANDBOX_ID: &str = "openshell.ai/sandbox-id";
 const SANDBOX_NAME: &str = "openshell.ai/sandbox-name";
@@ -50,7 +56,7 @@ fn annotation_or_label(object: &DynamicObject, key: &str) -> Option<String> {
 
 /// Sandbox objects: the driver's labels and this gateway's id, as the driver's own lookups select them.
 pub fn sandbox_selector(gateway_id: &str) -> String {
-    format!("{POD_SELECTOR},{GATEWAY_ID}={gateway_id}")
+    format!("{SANDBOX_BASE},{GATEWAY_ID}={gateway_id}")
 }
 
 /// Whether `id` can be a Kubernetes label value, so it can be put in a selector.
@@ -229,7 +235,7 @@ async fn catch_up_pods(tracker: &Tracker, pods: &Api<Pod>, sandbox_id: &str) {
     if !valid_label_value(sandbox_id) {
         return;
     }
-    let selector = format!("openshell.ai/managed-by=openshell,{SANDBOX_ID}={sandbox_id}");
+    let selector = format!("{BOUNDARY_PAIR}={}", sandbox_id.to_ascii_lowercase());
     if let Err(error) = each_listed(pods, &selector, |pod| record_pod(tracker, pod)).await {
         telemetry::failure("watch");
         warn!(sandbox_id = %sandbox_id, error = %error, "could not list a sandbox's Pods; the next sweep retries");
@@ -249,15 +255,21 @@ async fn sandbox_event(tracker: &Tracker, pods: &Api<Pod>, object: SandboxObject
     }
 }
 
-/// Records a Pod's facts when its sandbox is tracked; one of another gateway, or not yet tracked, is
-/// left for a later event or the next sweep.
-fn record_pod(tracker: &Tracker, pod: &Pod) {
-    if let Some(id) = pod
+/// The sandbox id of one of a sandbox's Pods: its label (supervisor) or the driver's annotation
+/// (workload), which must agree with the Pod's boundary pair label.
+pub fn pod_sandbox_id(pod: &Pod) -> Option<String> {
+    let id = pod
         .labels()
         .get(SANDBOX_ID)
-        .filter(|id| valid_sandbox_id(id))
-        .cloned()
-    {
+        .or_else(|| pod.annotations().get(SANDBOX_ID))?;
+    let pair = pod.labels().get(BOUNDARY_PAIR)?;
+    (valid_sandbox_id(id) && *pair == id.to_ascii_lowercase()).then(|| id.clone())
+}
+
+/// Records a Pod's facts when its sandbox is tracked; one of another gateway, or not yet tracked, is
+/// held for later (`Tracker::pod_seen`).
+fn record_pod(tracker: &Tracker, pod: &Pod) {
+    if let Some(id) = pod_sandbox_id(pod) {
         match blocking(|| tracker.pod_seen(&id, pod_facts(pod), &now())) {
             Ok(true) => {}
             Ok(false) => debug!(sandbox_id = %id, "Pod of an untracked sandbox left for now"),
@@ -535,6 +547,40 @@ mod tests {
         assert_eq!(container.state, "terminated");
         assert_eq!(container.exit_code, Some(3));
         assert_eq!(container.restart_count, 2);
+    }
+
+    #[test]
+    fn both_pods_of_a_sandbox_name_it_through_the_driver_labels() {
+        let pod = |labels: serde_json::Value, annotations: serde_json::Value| -> Pod {
+            serde_json::from_value(serde_json::json!({"metadata": {"name": "p", "labels": labels, "annotations": annotations}}))
+                .unwrap()
+        };
+        let id = "0D3C5D0E-6a0f-4c2e-9a51-000000000001";
+        let pair = id.to_ascii_lowercase();
+        let supervisor = pod(
+            serde_json::json!({SANDBOX_ID: id, BOUNDARY_PAIR: pair, "openshell.ai/boundary-role": "supervisor"}),
+            serde_json::json!({}),
+        );
+        let workload = pod(
+            serde_json::json!({BOUNDARY_PAIR: pair, "openshell.ai/boundary-role": "workload"}),
+            serde_json::json!({SANDBOX_ID: id}),
+        );
+        assert_eq!(pod_sandbox_id(&supervisor).as_deref(), Some(id));
+        assert_eq!(
+            pod_sandbox_id(&workload).as_deref(),
+            Some(id),
+            "the workload Pod names its sandbox by annotation"
+        );
+        let mismatched = pod(
+            serde_json::json!({BOUNDARY_PAIR: "other"}),
+            serde_json::json!({SANDBOX_ID: id}),
+        );
+        assert!(
+            pod_sandbox_id(&mismatched).is_none(),
+            "the id must agree with the pair label"
+        );
+        let unpaired = pod(serde_json::json!({SANDBOX_ID: id}), serde_json::json!({}));
+        assert!(pod_sandbox_id(&unpaired).is_none());
     }
 
     #[test]
