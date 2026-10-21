@@ -3134,7 +3134,11 @@ impl KubernetesComputeDriver {
             names,
             sandbox_id,
             descriptor.payload,
-            serde_json::to_vec(&launch_authentication.supervisor).map_err(|error| {
+            supervisor_auth_json(
+                &launch_authentication.supervisor,
+                &self.config.supervisor_telemetry,
+            )
+            .map_err(|error| {
                 KubernetesDriverError::Message(format!("encode supervisor auth bundle: {error}"))
             })?,
             proxy_ca.certificate_pem.into_bytes(),
@@ -7783,9 +7787,60 @@ fn spawn_namespace_file_watcher(
     });
 }
 
+/// The supervisor's launch bundle as written to its Secret. The gateway's OTLP
+/// collector headers go only to supervisors that export to the gateway's own
+/// collector; a supervisor sent elsewhere, or nowhere, never receives them.
+fn supervisor_auth_json(
+    bundle: &openshell_core::jwt::SupervisorAuthBundle,
+    telemetry: &crate::config::SupervisorTelemetry,
+) -> Result<Vec<u8>, serde_json::Error> {
+    if telemetry.uses_gateway_collector() {
+        return serde_json::to_vec(bundle);
+    }
+    let mut bundle = bundle.clone();
+    bundle.ocsf_otlp_headers = None;
+    serde_json::to_vec(&bundle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collector_headers_reach_only_supervisors_using_the_gateway_collector() {
+        use crate::config::SupervisorTelemetry;
+        let bundle: openshell_core::jwt::SupervisorAuthBundle =
+            serde_json::from_value(serde_json::json!({
+                "session_id": "0f6b6d2e-3a1f-4b55-9a1e-6f5b7f1c2d3e",
+                "runtime_generation": "0f6b6d2e-3a1f-4b55-9a1e-6f5b7f1c2d3f",
+                "session_rotation": 1,
+                "auth_epoch": 1,
+                "gateway_token": "gateway.jwt.value",
+                "gateway_expires_at": 1,
+                "sandbox_token": "sandbox.jwt.value",
+                "sandbox_expires_at": 1,
+                "ocsf_otlp_headers": "authorization=collector-token"
+            }))
+            .expect("bundle fixture");
+        let written = |telemetry: SupervisorTelemetry| {
+            serde_json::from_slice::<serde_json::Value>(
+                &supervisor_auth_json(&bundle, &telemetry).unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            written(SupervisorTelemetry::Gateway)["ocsf_otlp_headers"],
+            "authorization=collector-token"
+        );
+        for telemetry in [
+            SupervisorTelemetry::Off,
+            SupervisorTelemetry::Endpoint("http://10.43.81.82:4317".into()),
+        ] {
+            let value = written(telemetry);
+            assert!(value.get("ocsf_otlp_headers").is_none(), "{value}");
+            assert_eq!(value["gateway_token"], "gateway.jwt.value");
+        }
+    }
 
     /// Serve Pod GETs over one reusable HTTP/1 connection per client,
     /// delaying a request for Pod `slow-<millis>` by that many milliseconds.
