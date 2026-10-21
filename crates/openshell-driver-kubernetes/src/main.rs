@@ -118,6 +118,14 @@ struct Args {
     #[arg(long = "fixed-pod-annotation", value_parser = parse_key_value)]
     fixed_pod_annotations: Vec<(String, String)>,
 
+    /// Fixed annotations as one JSON object of strings, for environments that set the driver up through variables.
+    /// Combined with --fixed-pod-annotation; a key given both ways is an error.
+    #[arg(
+        long = "fixed-pod-annotations-json",
+        env = "OPENSHELL_K8S_FIXED_POD_ANNOTATIONS"
+    )]
+    fixed_pod_annotations_json: Option<String>,
+
     #[arg(long, env = "OPENSHELL_MANAGED_SSH_INGRESS_ENABLED")]
     managed_ssh_ingress_enabled: bool,
 
@@ -330,7 +338,11 @@ async fn main() -> Result<()> {
             allowed_pod_annotations: args.allowed_pod_annotations,
             allowed_pod_labels: args.allowed_pod_labels,
             fixed_pod_labels: args.fixed_pod_labels.into_iter().collect(),
-            fixed_pod_annotations: args.fixed_pod_annotations.into_iter().collect(),
+            fixed_pod_annotations: fixed_annotations(
+                args.fixed_pod_annotations,
+                args.fixed_pod_annotations_json.as_deref(),
+            )
+            .map_err(|err| miette::miette!("{err}"))?,
             sa_token_ttl_secs: args.sa_token_ttl_secs,
             provider_spiffe_workload_api_socket_path: args
                 .provider_spiffe_workload_api_socket_path
@@ -374,9 +386,30 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Fixed annotations from repeated flags and an optional JSON object; a key given both ways is refused.
+fn fixed_annotations(
+    flags: Vec<(String, String)>,
+    json: Option<&str>,
+) -> std::result::Result<BTreeMap<String, String>, String> {
+    let mut map: BTreeMap<String, String> = match json {
+        Some(text) if !text.trim().is_empty() => serde_json::from_str(text).map_err(|error| {
+            format!("OPENSHELL_K8S_FIXED_POD_ANNOTATIONS must be a JSON object of strings: {error}")
+        })?,
+        _ => BTreeMap::new(),
+    };
+    for (key, value) in flags {
+        if map.insert(key.clone(), value).is_some() {
+            return Err(format!(
+                "fixed pod annotation {key:?} is given more than once"
+            ));
+        }
+    }
+    Ok(map)
+}
+
 /// Parse a `KEY=VALUE` flag value; the key is validated with the rest of the
 /// driver configuration.
-fn parse_key_value(raw: &str) -> Result<(String, String), String> {
+fn parse_key_value(raw: &str) -> std::result::Result<(String, String), String> {
     raw.split_once('=')
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .filter(|(key, _)| !key.is_empty())
@@ -386,6 +419,26 @@ fn parse_key_value(raw: &str) -> Result<(String, String), String> {
 #[cfg(test)]
 mod tests {
     use clap::Parser as _;
+
+    #[test]
+    fn fixed_annotations_combine_flags_and_json() {
+        let both = fixed_annotations(
+            vec![("example.com/owner".into(), "research".into())],
+            Some(r#"{"example.com/targets": "a,b"}"#),
+        )
+        .unwrap();
+        assert_eq!(both["example.com/targets"], "a,b");
+        assert_eq!(both["example.com/owner"], "research");
+        assert!(fixed_annotations(Vec::new(), Some("not json")).is_err());
+        assert!(fixed_annotations(Vec::new(), Some(r#"{"k": 1}"#)).is_err());
+        let duplicate = fixed_annotations(
+            vec![("example.com/owner".into(), "x".into())],
+            Some(r#"{"example.com/owner": "y"}"#),
+        )
+        .unwrap_err();
+        assert!(duplicate.contains("more than once"), "{duplicate}");
+        assert!(fixed_annotations(Vec::new(), None).unwrap().is_empty());
+    }
 
     #[test]
     fn fixed_metadata_flags_keep_commas_in_annotation_values() {
@@ -413,6 +466,7 @@ mod tests {
                 ("example.com/owner".to_string(), "research".to_string()),
             ]
         );
+        assert!(args.fixed_pod_annotations_json.is_none());
         assert!(parse_key_value("no-equals").is_err());
         assert!(parse_key_value("=value").is_err());
     }
