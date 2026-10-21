@@ -968,10 +968,14 @@ workspace_default_storage_size = "10Gi"
 # allowed_pod_labels           = ["app", "team.example.org/*"]
 # Labels and annotations the driver adds to every sandbox it creates: the
 # Sandbox resource, its workload and supervisor pods and its default workspace
-# claim, also on restart. For clusters whose admission, telemetry or retention
-# policy requires them. Exact keys only, outside the reserved domains and not
-# a key the driver writes itself (OpenShift SCC ranges, the trace context);
-# templates cannot set these keys. Empty (default) adds nothing.
+# claim. A restart sets the current values on the Sandbox and both pods; the
+# claim keeps the values it was created with, and keys later removed from these
+# maps stay on existing objects. For clusters whose admission, telemetry or
+# retention policy requires them. Exact keys only, outside the reserved domains
+# and not a key the driver writes itself (OpenShift SCC ranges, the trace
+# context); templates cannot set these keys. Empty (default) adds nothing. The
+# standalone driver takes --fixed-pod-label KEY=VALUE, --fixed-pod-annotation
+# KEY=VALUE, or OPENSHELL_K8S_FIXED_POD_ANNOTATIONS as a JSON object.
 # fixed_pod_labels             = { "example.com/owner" = "research", "example.com/retention" = "audit" }
 # fixed_pod_annotations        = { "example.com/contact" = "ops@example.com" }
 # Kubelet clamps projected tokens below 600 seconds. The driver caps values at 86400.

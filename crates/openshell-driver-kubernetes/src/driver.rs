@@ -3445,24 +3445,21 @@ impl KubernetesComputeDriver {
                 &sandbox_api.api,
                 cr_name,
                 |version| {
-                    let mut running_patch =
-                        sandbox_operating_state_patch(&sandbox_api.resource.version, version, true);
-                    running_patch["metadata"]["annotations"] = serde_json::json!({
-                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: "true",
-                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: openshell_core::time::now_ms().to_string(),
-                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: "restart",
-                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: SandboxRuntimeBootstrapPhase::Preparing.as_str(),
-                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_SESSION: launch_authentication.supervisor.session_id.to_string(),
-                        ANNOTATION_SANDBOX_RUNTIME_GENERATION: generation.as_str(),
-                        ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid.clone(),
-                    });
-                    running_patch["spec"]["podTemplate"]["spec"] = restart_pod_template_spec(
-                        &volumes,
-                        &init_containers,
-                        &image_pull_secrets,
-                    );
-                    add_fixed_metadata_to_restart_patch(&mut running_patch, &self.config);
-                    running_patch
+                    restart_running_patch(
+                        &sandbox_api.resource.version,
+                        version,
+                        serde_json::json!({
+                            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: "true",
+                            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: openshell_core::time::now_ms().to_string(),
+                            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: "restart",
+                            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: SandboxRuntimeBootstrapPhase::Preparing.as_str(),
+                            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_SESSION: launch_authentication.supervisor.session_id.to_string(),
+                            ANNOTATION_SANDBOX_RUNTIME_GENERATION: generation.as_str(),
+                            ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid.clone(),
+                        }),
+                        restart_pod_template_spec(&volumes, &init_containers, &image_pull_secrets),
+                        &self.config,
+                    )
                 },
             )
             .await?;
@@ -7032,6 +7029,22 @@ fn apply_fixed_pod_metadata(metadata: &mut ObjectMeta, config: &KubernetesComput
     }
 }
 
+/// The merge patch that restarts a stopped sandbox: running state, the new generation's bootstrap annotations, the new
+/// Pod spec, and the operator's current fixed metadata on the Sandbox and its workload Pod template.
+fn restart_running_patch(
+    api_version: &str,
+    resource_version: &str,
+    bootstrap_annotations: serde_json::Value,
+    pod_spec: serde_json::Value,
+    config: &KubernetesComputeConfig,
+) -> serde_json::Value {
+    let mut patch = sandbox_operating_state_patch(api_version, resource_version, true);
+    patch["metadata"]["annotations"] = bootstrap_annotations;
+    patch["spec"]["podTemplate"]["spec"] = pod_spec;
+    add_fixed_metadata_to_restart_patch(&mut patch, config);
+    patch
+}
+
 /// Bring a restart patch's Sandbox metadata and workload Pod template metadata to the operator's current fixed labels
 /// and annotations, so a sandbox created before a fixed key was added, or under an older value, restarts with it. The
 /// merge patch sets those keys and leaves every other key as stored.
@@ -10320,41 +10333,74 @@ mod tests {
         );
     }
 
+    /// RFC 7386 merge patch, enough for these tests.
+    fn json_merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
+        if let (Some(target), Some(patch)) = (target.as_object_mut(), patch.as_object()) {
+            for (key, value) in patch {
+                if value.is_null() {
+                    target.remove(key);
+                } else if value.is_object()
+                    && target.get(key).is_some_and(serde_json::Value::is_object)
+                {
+                    json_merge(target.get_mut(key).unwrap(), value);
+                } else {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+
     #[test]
     fn restart_patch_brings_fixed_metadata_up_to_date() {
         let config = fixed_metadata_config();
-        let mut patch = serde_json::json!({
-            "metadata": { "annotations": { "openshell.ai/bootstrap-operation": "restart" } },
-            "spec": { "podTemplate": { "spec": { "containers": [] } } }
+        // A sandbox created before `example.com/enrollment` was fixed and under an older retention value.
+        let mut stored = serde_json::json!({
+            "metadata": {
+                "labels": { LABEL_SANDBOX_ID: "sandbox-123", "example.com/retention": "service" },
+                "annotations": { "example.com/unrelated": "kept" }
+            },
+            "spec": { "podTemplate": {
+                "metadata": { "labels": { BOUNDARY_ROLE_LABEL: "workload", "app": "v" } },
+                "spec": { "containers": [] }
+            } }
         });
-        add_fixed_metadata_to_restart_patch(&mut patch, &config);
-        assert_eq!(
-            patch["metadata"]["labels"]["example.com/retention"],
-            "audit"
+        let patch = restart_running_patch(
+            "agents.x-k8s.io/v1beta1",
+            "41",
+            serde_json::json!({ ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: "restart" }),
+            serde_json::json!({ "containers": [{ "name": "agent" }] }),
+            &config,
         );
+        json_merge(&mut stored, &patch);
+        let meta = &stored["metadata"];
+        assert_eq!(meta["labels"][LABEL_SANDBOX_ID], "sandbox-123");
+        assert_eq!(meta["labels"]["example.com/retention"], "audit");
+        assert_eq!(meta["labels"]["example.com/enrollment"], "service-agents");
+        assert_eq!(meta["annotations"]["example.com/unrelated"], "kept");
+        assert_eq!(meta["annotations"]["example.com/owner"], "research");
         assert_eq!(
-            patch["metadata"]["annotations"]["example.com/owner"],
-            "research"
-        );
-        assert_eq!(
-            patch["metadata"]["annotations"]["openshell.ai/bootstrap-operation"],
+            meta["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION],
             "restart"
         );
-        let pod = &patch["spec"]["podTemplate"];
-        assert_eq!(
-            pod["metadata"]["labels"]["example.com/enrollment"],
-            "service-agents"
-        );
+        let pod = &stored["spec"]["podTemplate"];
+        assert_eq!(pod["metadata"]["labels"][BOUNDARY_ROLE_LABEL], "workload");
+        assert_eq!(pod["metadata"]["labels"]["app"], "v");
+        assert_eq!(pod["metadata"]["labels"]["example.com/retention"], "audit");
         assert_eq!(
             pod["metadata"]["annotations"]["example.com/owner"],
             "research"
         );
-        assert!(pod["spec"]["containers"].is_array());
+        assert_eq!(pod["spec"]["containers"][0]["name"], "agent");
 
-        let mut untouched = serde_json::json!({ "spec": { "podTemplate": { "spec": {} } } });
-        add_fixed_metadata_to_restart_patch(&mut untouched, &KubernetesComputeConfig::default());
-        assert!(untouched.get("metadata").is_none());
-        assert!(untouched["spec"]["podTemplate"].get("metadata").is_none());
+        let plain = restart_running_patch(
+            "agents.x-k8s.io/v1beta1",
+            "41",
+            serde_json::json!({}),
+            serde_json::json!({}),
+            &KubernetesComputeConfig::default(),
+        );
+        assert!(plain["metadata"].get("labels").is_none());
+        assert!(plain["spec"]["podTemplate"].get("metadata").is_none());
     }
 
     #[tokio::test]
