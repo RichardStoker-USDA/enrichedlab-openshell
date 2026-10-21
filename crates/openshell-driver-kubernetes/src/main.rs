@@ -109,6 +109,14 @@ struct Args {
     #[arg(long, env = "OPENSHELL_K8S_ALLOWED_POD_LABELS", value_delimiter = ',')]
     allowed_pod_labels: Vec<String>,
 
+    /// Label added to every sandbox object, as KEY=VALUE; repeat or separate with commas.
+    #[arg(long = "fixed-pod-label", env = "OPENSHELL_K8S_FIXED_POD_LABELS", value_delimiter = ',', value_parser = parse_key_value)]
+    fixed_pod_labels: Vec<(String, String)>,
+
+    /// Annotation added to every sandbox object, as KEY=VALUE; repeat or separate with commas.
+    #[arg(long = "fixed-pod-annotation", env = "OPENSHELL_K8S_FIXED_POD_ANNOTATIONS", value_delimiter = ',', value_parser = parse_key_value)]
+    fixed_pod_annotations: Vec<(String, String)>,
+
     #[arg(long, env = "OPENSHELL_MANAGED_SSH_INGRESS_ENABLED")]
     managed_ssh_ingress_enabled: bool,
 
@@ -319,6 +327,8 @@ async fn main() -> Result<()> {
                 .unwrap_or_default(),
             allowed_pod_annotations: args.allowed_pod_annotations,
             allowed_pod_labels: args.allowed_pod_labels,
+            fixed_pod_labels: args.fixed_pod_labels.into_iter().collect(),
+            fixed_pod_annotations: args.fixed_pod_annotations.into_iter().collect(),
             sa_token_ttl_secs: args.sa_token_ttl_secs,
             provider_spiffe_workload_api_socket_path: args
                 .provider_spiffe_workload_api_socket_path
@@ -360,6 +370,15 @@ async fn main() -> Result<()> {
             .await
             .into_diagnostic()
     }
+}
+
+/// Parse a `KEY=VALUE` flag value; the key is validated with the rest of the
+/// driver configuration.
+fn parse_key_value(raw: &str) -> Result<(String, String), String> {
+    raw.split_once('=')
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .filter(|(key, _)| !key.is_empty())
+        .ok_or_else(|| format!("expected KEY=VALUE, got {raw:?}"))
 }
 
 #[cfg(test)]
