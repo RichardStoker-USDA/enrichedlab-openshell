@@ -47,7 +47,7 @@ pub struct WrittenReceipt {
 pub enum StoreError {
     #[error("{path}: {source}")]
     Io { path: PathBuf, source: io::Error },
-    #[error("{0} is readable or writable by others; the store needs mode 0700")]
+    #[error("{0} is open to other users; the store needs mode 0700")]
     Permissions(PathBuf),
     #[error("sandbox id {0:?} cannot name a record")]
     SandboxId(String),
@@ -316,8 +316,15 @@ fn ensure_private_dir(path: &Path) -> Result<(), StoreError> {
                     source: io::Error::new(io::ErrorKind::InvalidInput, "not a directory"),
                 });
             }
-            if metadata.permissions().mode() & 0o077 != 0 {
+            let mode = metadata.permissions().mode();
+            if mode & 0o007 != 0 {
                 return Err(StoreError::Permissions(path.to_path_buf()));
+            }
+            // Kubernetes' fsGroup handling gives the Pod's own group access when it mounts the volume
+            // again; take the directory back to owner-only.
+            if mode & 0o7077 != 0 {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                    .map_err(io_error(path))?;
             }
             Ok(())
         }
@@ -503,6 +510,26 @@ pub(crate) mod tests {
             Store::open(&root),
             Err(StoreError::Permissions(_))
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn group_access_added_by_a_remount_is_taken_back() {
+        let root = temp_root();
+        drop(Store::open(&root).unwrap());
+        for sub in ["", "starts", "observed", "receipts"] {
+            fs::set_permissions(root.join(sub), fs::Permissions::from_mode(0o2770)).unwrap();
+        }
+        let store = Store::open(&root).unwrap();
+        for sub in ["", "starts", "observed", "receipts"] {
+            assert_eq!(mode(&store.root().join(sub)), 0o700, "{sub}");
+        }
+        drop(store);
+        fs::set_permissions(root.join("receipts"), fs::Permissions::from_mode(0o705)).unwrap();
+        assert!(
+            matches!(Store::open(&root), Err(StoreError::Permissions(_))),
+            "access for others is refused"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

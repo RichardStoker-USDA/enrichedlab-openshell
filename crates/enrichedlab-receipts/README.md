@@ -74,7 +74,10 @@ while the service was down, with its create unseen, gets no receipt; alert on th
 ```
 
 A sandbox id names a file only when it is 1 to 128 letters, digits, `-`, `_` or `.` and does not start with a dot.
-Files are mode 0600, directories 0700, and every write is flushed and its directory synced. A start or receipt is
+Files are written mode 0600 and directories 0700, and every write is flushed and its directory synced. When the
+volume is mounted again, Kubernetes' `fsGroup` handling may give the Pod's own group access; the service takes its
+directories back to 0700 at start and refuses to start if other users have access. Set `fsGroupChangePolicy:
+OnRootMismatch` so a restart does not rewrite every receipt's ownership. A start or receipt is
 written to a temporary file, flushed, and hard-linked to its name, so the name never holds a partial record and an
 existing one is never replaced. An existing receipt is checked against its digest file before its sandbox's working
 records are removed; a digest file lost to a crash between the two writes is written again. At most 4,096 start and 4,096 observed
