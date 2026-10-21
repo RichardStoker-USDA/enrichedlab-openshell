@@ -119,7 +119,7 @@ struct Args {
     fixed_pod_annotations: Vec<(String, String)>,
 
     /// Fixed annotations as one JSON object of strings, for environments that set the driver up through variables.
-    /// Combined with --fixed-pod-annotation; a key given both ways is an error.
+    /// Combined with --fixed-pod-annotation; a key given both ways is an error. An empty or blank value means unset.
     #[arg(
         long = "fixed-pod-annotations-json",
         env = "OPENSHELL_K8S_FIXED_POD_ANNOTATIONS"
@@ -438,6 +438,16 @@ mod tests {
         .unwrap_err();
         assert!(duplicate.contains("more than once"), "{duplicate}");
         assert!(fixed_annotations(Vec::new(), None).unwrap().is_empty());
+        assert!(
+            fixed_annotations(Vec::new(), Some("  "))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            fixed_annotations(Vec::new(), Some("{}"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

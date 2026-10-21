@@ -10548,7 +10548,7 @@ mod tests {
             } }
         });
         let patch = restart_running_patch(
-            "agents.x-k8s.io/v1beta1",
+            SANDBOX_VERSION_V1BETA1,
             "41",
             serde_json::json!({ ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: "restart" }),
             serde_json::json!({ "containers": [{ "name": "agent" }] }),
@@ -10574,9 +10574,24 @@ mod tests {
             "research"
         );
         assert_eq!(pod["spec"]["containers"][0]["name"], "agent");
+        assert_eq!(stored["spec"]["operatingMode"], "Running");
+        assert_eq!(stored["metadata"]["resourceVersion"], "41");
+
+        let alpha = restart_running_patch(
+            SANDBOX_VERSION_V1ALPHA1,
+            "7",
+            serde_json::json!({}),
+            serde_json::json!({}),
+            &config,
+        );
+        assert_eq!(alpha["spec"]["replicas"], 1);
+        assert_eq!(
+            alpha["spec"]["podTemplate"]["metadata"]["labels"]["example.com/retention"],
+            "audit"
+        );
 
         let plain = restart_running_patch(
-            "agents.x-k8s.io/v1beta1",
+            SANDBOX_VERSION_V1BETA1,
             "41",
             serde_json::json!({}),
             serde_json::json!({}),
