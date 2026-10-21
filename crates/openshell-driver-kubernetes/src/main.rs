@@ -312,6 +312,8 @@ async fn main() -> Result<()> {
             proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
             proxy_ca_bundle: args.proxy_ca_bundle,
             grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
+            // The standalone driver takes the supervisors' endpoints from its own flags.
+            supervisor_telemetry: openshell_driver_kubernetes::SupervisorTelemetry::Gateway,
             supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
             supervisor_gateway_name: args.gateway_name.clone(),
             supervisor_ocsf_export: args.otlp_ocsf_endpoint.clone().map(|endpoint| {

@@ -153,6 +153,70 @@ where
     Ok(value)
 }
 
+/// Where supervisors send their own traces and OCSF events.
+///
+/// In TOML: `supervisor_telemetry = "gateway"` (the default) hands supervisors
+/// the gateway's export; `"off"` hands them none; and
+/// `supervisor_telemetry = { endpoint = "http://collector:4317" }` sends the
+/// same signals the gateway exports to a separate OTLP/gRPC collector, for
+/// clusters that keep sandbox telemetry apart from the gateway's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum SupervisorTelemetry {
+    #[default]
+    Gateway,
+    Off,
+    Endpoint(String),
+}
+
+impl SupervisorTelemetry {
+    /// Reject an endpoint that is not an `http://` or `https://` URL with a host.
+    pub fn validate(&self) -> Result<(), String> {
+        let Self::Endpoint(endpoint) = self else {
+            return Ok(());
+        };
+        let host = endpoint
+            .strip_prefix("http://")
+            .or_else(|| endpoint.strip_prefix("https://"))
+            .ok_or_else(|| {
+                format!(
+                    "supervisor_telemetry endpoint {endpoint:?} must start with http:// or https://"
+                )
+            })?;
+        if host.is_empty() || host.starts_with(['/', ':']) || host.chars().any(char::is_whitespace)
+        {
+            return Err(format!(
+                "supervisor_telemetry endpoint {endpoint:?} must name a host"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The trace endpoint and OCSF export supervisors receive, given what the
+    /// gateway itself exports. A separate endpoint carries the same signals the
+    /// gateway exports, with the gateway's OCSF schema version.
+    pub fn resolve(
+        &self,
+        gateway_traces: Option<String>,
+        gateway_ocsf: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
+    ) -> (
+        Option<String>,
+        Option<openshell_core::sandbox_env::OcsfOtlpExport>,
+    ) {
+        match self {
+            Self::Gateway => (gateway_traces, gateway_ocsf),
+            Self::Off => (None, None),
+            Self::Endpoint(endpoint) => (
+                gateway_traces.map(|_| endpoint.clone()),
+                gateway_ocsf.map(|ocsf| openshell_core::sandbox_env::OcsfOtlpExport {
+                    endpoint: endpoint.clone(),
+                    schema_version: ocsf.schema_version,
+                }),
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesComputeConfig {
@@ -244,8 +308,12 @@ pub struct KubernetesComputeConfig {
     /// contain at least one usable trust anchor.
     pub proxy_ca_bundle: Option<String>,
     pub grpc_endpoint: String,
-    /// OTLP/gRPC collector endpoint passed to supervisor pods. The gateway
-    /// supplies its own export endpoint; driver TOML cannot set it.
+    /// Where supervisors send their traces and OCSF events: the gateway's
+    /// own collector (default), nowhere, or a separate collector.
+    pub supervisor_telemetry: SupervisorTelemetry,
+    /// OTLP/gRPC collector endpoint passed to supervisor pods, resolved from
+    /// `supervisor_telemetry` and the gateway's export; driver TOML cannot
+    /// set it.
     #[serde(skip)]
     pub supervisor_otlp_endpoint: Option<String>,
     /// OCSF event export passed to supervisors. The gateway supplies its own
@@ -389,6 +457,7 @@ impl Default for KubernetesComputeConfig {
             proxy_connect_by_hostname: None,
             proxy_ca_bundle: None,
             grpc_endpoint: String::new(),
+            supervisor_telemetry: SupervisorTelemetry::default(),
             supervisor_otlp_endpoint: None,
             supervisor_ocsf_export: None,
             supervisor_gateway_name: None,
@@ -421,7 +490,8 @@ impl KubernetesComputeConfig {
         self.validate_upstream_proxy_config()?;
         self.validate_allowed_pod_annotations()?;
         self.validate_allowed_pod_labels()?;
-        self.validate_fixed_pod_metadata()
+        self.validate_fixed_pod_metadata()?;
+        self.supervisor_telemetry.validate()
     }
 
     /// Validate `fixed_pod_labels` and `fixed_pod_annotations`: exact keys
@@ -1027,6 +1097,82 @@ fn validate_provider_spiffe_workload_api_socket_path_value(
 mod tests {
     use super::*;
     use std::collections::BTreeMap as HashMap;
+
+    #[test]
+    fn supervisor_telemetry_parses_and_resolves() {
+        use openshell_core::sandbox_env::OcsfOtlpExport;
+        let parse = |toml_text: &str| {
+            toml::from_str::<KubernetesComputeConfig>(toml_text).map(|c| c.supervisor_telemetry)
+        };
+        assert_eq!(parse("").unwrap(), SupervisorTelemetry::Gateway);
+        assert_eq!(
+            parse(r#"supervisor_telemetry = "off""#).unwrap(),
+            SupervisorTelemetry::Off
+        );
+        let separate =
+            parse(r#"supervisor_telemetry = { endpoint = "http://10.43.81.82:4317" }"#).unwrap();
+        assert_eq!(
+            separate,
+            SupervisorTelemetry::Endpoint("http://10.43.81.82:4317".to_string())
+        );
+        assert!(parse(r#"supervisor_telemetry = "elsewhere""#).is_err());
+        assert!(
+            parse(r#"supervisor_telemetry = { endpoint = "http://x:4317", extra = 1 }"#).is_err()
+        );
+
+        for bad in [
+            "10.43.81.82:4317",
+            "grpc://x:4317",
+            "http://",
+            "http://:4317",
+            "http:///path",
+            "http://a b",
+        ] {
+            assert!(
+                SupervisorTelemetry::Endpoint(bad.to_string())
+                    .validate()
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        assert!(separate.validate().is_ok());
+        let mut config = KubernetesComputeConfig {
+            supervisor_telemetry: SupervisorTelemetry::Endpoint("nope".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(
+            config
+                .validate_configuration()
+                .unwrap_err()
+                .contains("supervisor_telemetry")
+        );
+        config.supervisor_telemetry = SupervisorTelemetry::Off;
+        assert!(config.validate_configuration().is_ok());
+
+        let traces = Some("http://gateway-collector:4317".to_string());
+        let ocsf = Some(OcsfOtlpExport {
+            endpoint: "http://gateway-collector:4317".to_string(),
+            schema_version: Some("1.3".to_string()),
+        });
+        assert_eq!(
+            SupervisorTelemetry::Gateway.resolve(traces.clone(), ocsf.clone()),
+            (traces.clone(), ocsf.clone())
+        );
+        assert_eq!(
+            SupervisorTelemetry::Off.resolve(traces.clone(), ocsf.clone()),
+            (None, None)
+        );
+        let (t, o) = separate.resolve(traces, ocsf);
+        assert_eq!(t.as_deref(), Some("http://10.43.81.82:4317"));
+        let o = o.unwrap();
+        assert_eq!(o.endpoint, "http://10.43.81.82:4317");
+        assert_eq!(o.schema_version.as_deref(), Some("1.3"));
+        assert_eq!(
+            separate.resolve(None, None),
+            (None, None),
+            "a separate endpoint adds no signal the gateway lacks"
+        );
+    }
 
     #[test]
     fn image_pull_policy_accepts_config_and_kubernetes_spellings() {

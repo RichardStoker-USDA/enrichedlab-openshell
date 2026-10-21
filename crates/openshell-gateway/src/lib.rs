@@ -279,11 +279,16 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let mut config = kubernetes_config(context.config_context())?;
-        config.supervisor_otlp_endpoint = context
-            .otlp_config()
-            .and_then(OtlpConfig::traces_endpoint)
-            .map(str::to_string);
-        config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
+        (
+            config.supervisor_otlp_endpoint,
+            config.supervisor_ocsf_export,
+        ) = config.supervisor_telemetry.resolve(
+            context
+                .otlp_config()
+                .and_then(OtlpConfig::traces_endpoint)
+                .map(str::to_string),
+            supervisor_ocsf_export(context.otlp_config()),
+        );
         config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         let driver = openshell_driver_kubernetes::KubernetesComputeDriver::new(
             config,

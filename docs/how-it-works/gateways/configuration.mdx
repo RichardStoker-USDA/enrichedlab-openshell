@@ -978,6 +978,13 @@ workspace_default_storage_size = "10Gi"
 # KEY=VALUE, or OPENSHELL_K8S_FIXED_POD_ANNOTATIONS as a JSON object.
 # fixed_pod_labels             = { "example.com/owner" = "research", "example.com/retention" = "audit" }
 # fixed_pod_annotations        = { "example.com/contact" = "ops@example.com" }
+# Where supervisors send their own traces and OCSF events. "gateway"
+# (default) hands them the gateway's [openshell.gateway.otlp] export; "off"
+# hands them none; an endpoint sends the same signals to a separate OTLP/gRPC
+# collector, for clusters that keep sandbox telemetry apart from the
+# gateway's. The standalone driver takes --otlp-endpoint and
+# --otlp-ocsf-endpoint instead.
+# supervisor_telemetry         = { endpoint = "http://10.43.0.50:4317" }
 # Kubelet clamps projected tokens below 600 seconds. The driver caps values at 86400.
 sa_token_ttl_secs              = 3600
 # Optional SPIFFE Workload API socket mounted into sandbox pods for dynamic
