@@ -908,6 +908,9 @@ impl KubernetesComputeDriver {
         config
             .validate_allowed_pod_labels()
             .map_err(KubernetesDriverError::Precondition)?;
+        config
+            .validate_fixed_pod_metadata()
+            .map_err(KubernetesDriverError::Precondition)?;
         // Read the bundle once at startup so an unreadable path or a
         // certificate-free file fails the gateway here, rather than as a
         // repeated sandbox-create failure. The authoritative read still
@@ -3573,6 +3576,7 @@ impl KubernetesComputeDriver {
                         &init_containers,
                         &image_pull_secrets,
                     );
+                    add_fixed_metadata_to_restart_patch(&mut running_patch, &self.config);
                     running_patch
                 },
             )
@@ -7152,6 +7156,35 @@ fn apply_fixed_pod_metadata(metadata: &mut ObjectMeta, config: &KubernetesComput
     }
 }
 
+/// Bring a restart patch's Sandbox metadata and workload Pod template metadata to the operator's current fixed labels
+/// and annotations, so a sandbox created before a fixed key was added, or under an older value, restarts with it. The
+/// merge patch sets those keys and leaves every other key as stored.
+fn add_fixed_metadata_to_restart_patch(
+    patch: &mut serde_json::Value,
+    config: &KubernetesComputeConfig,
+) {
+    for (field, fixed) in [
+        ("labels", &config.fixed_pod_labels),
+        ("annotations", &config.fixed_pod_annotations),
+    ] {
+        if fixed.is_empty() {
+            continue;
+        }
+        for path in [&["metadata"][..], &["spec", "podTemplate", "metadata"][..]] {
+            let mut target = &mut *patch;
+            for key in path {
+                target = &mut target[*key];
+            }
+            if !target[field].is_object() {
+                target[field] = serde_json::json!({});
+            }
+            for (key, value) in fixed {
+                target[field][key] = serde_json::Value::String(value.clone());
+            }
+        }
+    }
+}
+
 /// JSON form of `apply_fixed_pod_metadata` for rendered pod and claim templates.
 fn apply_fixed_metadata_json(
     metadata: &mut serde_json::Map<String, serde_json::Value>,
@@ -10467,6 +10500,62 @@ mod tests {
             plain["spec"]["volumeClaimTemplates"][0]["metadata"]
                 .get("labels")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn restart_patch_brings_fixed_metadata_up_to_date() {
+        let config = fixed_metadata_config();
+        let mut patch = serde_json::json!({
+            "metadata": { "annotations": { "openshell.ai/bootstrap-operation": "restart" } },
+            "spec": { "podTemplate": { "spec": { "containers": [] } } }
+        });
+        add_fixed_metadata_to_restart_patch(&mut patch, &config);
+        assert_eq!(
+            patch["metadata"]["labels"]["example.com/retention"],
+            "audit"
+        );
+        assert_eq!(
+            patch["metadata"]["annotations"]["example.com/owner"],
+            "research"
+        );
+        assert_eq!(
+            patch["metadata"]["annotations"]["openshell.ai/bootstrap-operation"],
+            "restart"
+        );
+        let pod = &patch["spec"]["podTemplate"];
+        assert_eq!(
+            pod["metadata"]["labels"]["example.com/enrollment"],
+            "service-agents"
+        );
+        assert_eq!(
+            pod["metadata"]["annotations"]["example.com/owner"],
+            "research"
+        );
+        assert!(pod["spec"]["containers"].is_array());
+
+        let mut untouched = serde_json::json!({ "spec": { "podTemplate": { "spec": {} } } });
+        add_fixed_metadata_to_restart_patch(&mut untouched, &KubernetesComputeConfig::default());
+        assert!(untouched.get("metadata").is_none());
+        assert!(untouched["spec"]["podTemplate"].get("metadata").is_none());
+    }
+
+    #[tokio::test]
+    async fn driver_refuses_invalid_fixed_metadata_before_connecting() {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let config = KubernetesComputeConfig {
+            fixed_pod_labels: BTreeMap::from([(
+                "example.com/a".to_string(),
+                "not valid".to_string(),
+            )]),
+            ..KubernetesComputeConfig::default()
+        };
+        let Err(error) = KubernetesComputeDriver::new(config, rx).await else {
+            panic!("invalid fixed metadata must be refused");
+        };
+        assert!(
+            error.to_string().contains("not a valid label value"),
+            "{error}"
         );
     }
 

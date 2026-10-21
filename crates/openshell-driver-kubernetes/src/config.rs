@@ -494,6 +494,17 @@ impl KubernetesComputeConfig {
                 validate_pod_metadata_allowlist(field, std::slice::from_ref(key))?;
             }
         }
+        for key in self
+            .fixed_pod_labels
+            .keys()
+            .chain(self.fixed_pod_annotations.keys())
+        {
+            if DRIVER_OWNED_POD_METADATA_KEYS.contains(&key.as_str()) {
+                return Err(format!(
+                    "fixed pod metadata key {key:?} is written by the driver and cannot be fixed"
+                ));
+            }
+        }
         for (key, value) in &self.fixed_pod_labels {
             if !is_label_value(value) {
                 return Err(format!(
@@ -1008,6 +1019,15 @@ fn is_reserved_pod_metadata_domain(domain: &str) -> bool {
     })
 }
 
+/// Keys outside the reserved domains that the driver itself writes on sandbox objects (copied `OpenShift` SCC ranges
+/// and the propagated trace context); an operator-fixed value for them would not be applied consistently.
+const DRIVER_OWNED_POD_METADATA_KEYS: &[&str] = &[
+    ANNOTATION_SCC_UID_RANGE,
+    ANNOTATION_SCC_MCS,
+    ANNOTATION_SCC_SUPPLEMENTAL_GROUPS,
+    "opentelemetry.io/trace-context",
+];
+
 /// Kubernetes label value: empty, or at most 63 alphanumeric, `-`, `_`, or
 /// `.` characters, beginning and ending with an alphanumeric character.
 fn is_label_value(value: &str) -> bool {
@@ -1341,6 +1361,16 @@ mod tests {
                 vec![],
                 vec![("openshell.ai/x", "y")],
                 "fixed_pod_annotations",
+            ),
+            (
+                vec![],
+                vec![("openshift.io/sa.scc.uid-range", "1000/1")],
+                "written by the driver",
+            ),
+            (
+                vec![],
+                vec![("opentelemetry.io/trace-context", "x")],
+                "written by the driver",
             ),
         ] {
             let err = fixed_metadata(&labels, &annotations)
