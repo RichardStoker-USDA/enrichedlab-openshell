@@ -1,0 +1,18 @@
+# syntax=docker/dockerfile:1.4
+
+# SPDX-FileCopyrightText: Copyright (c) 2026 Richard Stoker
+# SPDX-License-Identifier: Apache-2.0
+
+# The openshell CLI for in-cluster clients such as qualification and automation Jobs. The static musl binary is staged
+# at deploy/docker/.build/prebuilt-binaries/<arch>/openshell; Ubuntu provides a shell and coreutils for the Job around it.
+
+ARG CLI_BASE_IMAGE=ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
+FROM ${CLI_BASE_IMAGE} AS cli
+
+ARG TARGETARCH
+
+COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell /usr/local/bin/openshell
+
+USER 1500:1500
+
+ENTRYPOINT ["/usr/local/bin/openshell"]

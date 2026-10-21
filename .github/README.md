@@ -14,7 +14,7 @@ NVIDIA.
 | --- | --- |
 | Upstream release | v0.1.5 |
 | Default branch | `enrichedlab/main` (upstream release plus the changes below) |
-| Images | `ghcr.io/richardstoker-usda/enrichedlab-openshell/{gateway,supervisor,sandbox}`, linux/amd64 and linux/arm64 |
+| Images | `ghcr.io/richardstoker-usda/enrichedlab-openshell/{gateway,supervisor,sandbox,cli}`, linux/amd64 and linux/arm64 |
 | Chart | `oci://ghcr.io/richardstoker-usda/enrichedlab-openshell/charts/helm-chart` |
 | License | Apache 2.0, as upstream |
 

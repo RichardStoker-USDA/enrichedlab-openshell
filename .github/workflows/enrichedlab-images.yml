@@ -114,6 +114,7 @@ jobs:
           - { component: gateway, binary: openshell-gateway, suffix: unknown-linux-gnu }
           - { component: supervisor, binary: openshell-supervisor, suffix: unknown-linux-gnu }
           - { component: sandbox, binary: openshell-sandbox, suffix: unknown-linux-musl }
+          - { component: cli, binary: openshell, suffix: unknown-linux-musl }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
