@@ -170,26 +170,32 @@ pub enum SupervisorTelemetry {
 }
 
 impl SupervisorTelemetry {
-    /// Reject an endpoint that is not an `http://` or `https://` URL with a host.
+    /// Reject an endpoint that is not an absolute `http://` or `https://` URL
+    /// with a host, parsed the way the exporter parses it.
     pub fn validate(&self) -> Result<(), String> {
         let Self::Endpoint(endpoint) = self else {
             return Ok(());
         };
-        let host = endpoint
-            .strip_prefix("http://")
-            .or_else(|| endpoint.strip_prefix("https://"))
-            .ok_or_else(|| {
-                format!(
-                    "supervisor_telemetry endpoint {endpoint:?} must start with http:// or https://"
-                )
-            })?;
-        if host.is_empty() || host.starts_with(['/', ':']) || host.chars().any(char::is_whitespace)
-        {
+        let uri: http::Uri = endpoint.parse().map_err(|error| {
+            format!("supervisor_telemetry endpoint {endpoint:?} is not a URL: {error}")
+        })?;
+        if !matches!(uri.scheme_str(), Some("http" | "https")) {
+            return Err(format!(
+                "supervisor_telemetry endpoint {endpoint:?} must start with http:// or https://"
+            ));
+        }
+        if uri.host().is_none_or(str::is_empty) {
             return Err(format!(
                 "supervisor_telemetry endpoint {endpoint:?} must name a host"
             ));
         }
         Ok(())
+    }
+
+    /// Whether supervisors export to the gateway's own collector, and so may
+    /// carry its collector headers.
+    pub fn uses_gateway_collector(&self) -> bool {
+        matches!(self, Self::Gateway)
     }
 
     /// The trace endpoint and OCSF export supervisors receive, given what the
@@ -1127,6 +1133,8 @@ mod tests {
             "http://:4317",
             "http:///path",
             "http://a b",
+            "http://[::1",
+            "",
         ] {
             assert!(
                 SupervisorTelemetry::Endpoint(bad.to_string())
@@ -1172,6 +1180,34 @@ mod tests {
             (None, None),
             "a separate endpoint adds no signal the gateway lacks"
         );
+        let only_ocsf = separate.resolve(
+            None,
+            Some(OcsfOtlpExport {
+                endpoint: "http://g:4317".into(),
+                schema_version: None,
+            }),
+        );
+        assert_eq!(only_ocsf.0, None);
+        assert_eq!(only_ocsf.1.unwrap().endpoint, "http://10.43.81.82:4317");
+        assert_eq!(
+            separate.resolve(Some("http://g:4317".into()), None),
+            (Some("http://10.43.81.82:4317".to_string()), None)
+        );
+        for good in [
+            "http://10.43.81.82:4317",
+            "https://collector.example.org:4317",
+            "http://[fd00::1]:4317",
+        ] {
+            assert!(
+                SupervisorTelemetry::Endpoint(good.to_string())
+                    .validate()
+                    .is_ok(),
+                "{good}"
+            );
+        }
+        assert!(SupervisorTelemetry::Gateway.uses_gateway_collector());
+        assert!(!SupervisorTelemetry::Off.uses_gateway_collector());
+        assert!(!separate.uses_gateway_collector());
     }
 
     #[test]
