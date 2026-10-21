@@ -1,0 +1,188 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Richard Stoker
+# SPDX-License-Identifier: Apache-2.0
+#
+# Build the gateway, supervisor and sandbox images from this fork on GitHub-hosted runners, push them to GHCR, and sign
+# a SLSA build provenance attestation for each image index. Binaries are built with upstream's own Nix shell and
+# build-rust-binary action, so toolchains match upstream releases. Verify before deploying (FORK.md, "Images").
+name: EnrichedLab images
+
+on:
+  push:
+    branches: [enrichedlab/main]
+    tags: ["v*-el.*"]
+    paths-ignore: ["**/*.md", "docs/**", "fern/**", "rfc/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: enrichedlab-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-24.04
+    outputs:
+      cargo-version: ${{ steps.version.outputs.cargo }}
+      image-tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Derive version and image tag
+        id: version
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ $REF_TYPE == tag ]]; then
+            [[ $REF_NAME =~ ^v[0-9]+\.[0-9]+\.[0-9]+-el\.[0-9]+$ ]] || { echo "::error::tag must be vX.Y.Z-el.N"; exit 1; }
+            cargo=${REF_NAME#v}
+            tag=$cargo
+          else
+            base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' HEAD)
+            commit=$(git rev-parse --short=12 HEAD)
+            cargo="${base#v}-el.dev+g${commit}"
+            tag="${base#v}-el.dev.g${commit}"
+          fi
+          echo "cargo=$cargo" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version $cargo, image tag $tag"
+
+  binaries:
+    name: ${{ matrix.binary }} (${{ matrix.triple }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { package: openshell-gateway, binary: openshell-gateway, triple: x86_64-unknown-linux-gnu, runner: ubuntu-24.04 }
+          - { package: openshell-gateway, binary: openshell-gateway, triple: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+          - { package: openshell-supervisor, binary: openshell-supervisor, triple: x86_64-unknown-linux-gnu, runner: ubuntu-24.04 }
+          - { package: openshell-supervisor, binary: openshell-supervisor, triple: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+          - { package: openshell-sandbox, binary: openshell-sandbox, triple: x86_64-unknown-linux-musl, runner: ubuntu-24.04 }
+          - { package: openshell-sandbox, binary: openshell-sandbox, triple: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      # Hosted runners start with about 14 GB free; the Nix shell and a release target need more.
+      - name: Free disk space
+        shell: bash
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          prepare-shell: "true"
+
+      - uses: ./.github/actions/build-rust-binary
+        with:
+          package: ${{ matrix.package }}
+          binary: ${{ matrix.binary }}
+          triple: ${{ matrix.triple }}
+          cargo-version: ${{ needs.version.outputs.cargo-version }}
+          supervisor-image-tag: ${{ needs.version.outputs.image-tag }}
+
+  images:
+    name: ${{ matrix.component }} image
+    needs: [version, binaries]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { component: gateway, binary: openshell-gateway, suffix: unknown-linux-gnu }
+          - { component: supervisor, binary: openshell-supervisor, suffix: unknown-linux-gnu }
+          - { component: sandbox, binary: openshell-sandbox, suffix: unknown-linux-musl }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download amd64 binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.binary }}-x86_64-${{ matrix.suffix }}
+          path: artifact/amd64
+
+      - name: Download arm64 binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.binary }}-aarch64-${{ matrix.suffix }}
+          path: artifact/arm64
+
+      - name: Stage binaries
+        shell: bash
+        env:
+          BINARY: ${{ matrix.binary }}
+        run: |
+          install -Dm0755 "artifact/amd64/$BINARY" "deploy/docker/.build/prebuilt-binaries/amd64/$BINARY"
+          install -Dm0755 "artifact/arm64/$BINARY" "deploy/docker/.build/prebuilt-binaries/arm64/$BINARY"
+
+      - uses: ./.github/actions/setup-buildx
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        shell: bash
+        env:
+          COMPONENT: ${{ matrix.component }}
+          IMAGE_TAG: ${{ needs.version.outputs.image-tag }}
+          OWNER: ${{ github.repository_owner }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+          REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          name="ghcr.io/${OWNER,,}/enrichedlab-openshell/${COMPONENT}"
+          docker buildx build \
+            --builder openshell \
+            --platform linux/amd64,linux/arm64 \
+            --file "deploy/docker/Dockerfile.${COMPONENT}" \
+            --target "${COMPONENT}" \
+            --tag "${name}:${IMAGE_TAG}" \
+            --label "org.opencontainers.image.source=${SOURCE}" \
+            --label "org.opencontainers.image.revision=${REVISION}" \
+            --label "org.opencontainers.image.version=${IMAGE_TAG}" \
+            --label "org.opencontainers.image.licenses=Apache-2.0" \
+            --annotation "index:org.opencontainers.image.source=${SOURCE}" \
+            --annotation "index:org.opencontainers.image.revision=${REVISION}" \
+            --provenance=mode=max \
+            --sbom=true \
+            --metadata-file metadata.json \
+            --output "type=image,push=true,oci-mediatypes=true" \
+            .
+          digest=$(jq -r '."containerimage.digest"' metadata.json)
+          [[ $digest == sha256:* ]] || { echo "::error::no image digest in build metadata"; exit 1; }
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "### ${COMPONENT}: \`${name}:${IMAGE_TAG}@${digest}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.build.outputs.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
