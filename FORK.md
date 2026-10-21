@@ -57,8 +57,9 @@ expect NVIDIA's runners and secrets; the fork runs only its own `enrichedlab-*` 
 
 ## Images
 
-`.github/workflows/enrichedlab-images.yml` builds the gateway, supervisor, sandbox and CLI images for linux/amd64 and
-linux/arm64 with upstream's build actions on GitHub-hosted runners, pushes them to
+`.github/workflows/enrichedlab-images.yml` builds the gateway, supervisor, sandbox and CLI images, and the run receipt
+interceptor's (`crates/enrichedlab-receipts`), for linux/amd64 and linux/arm64 with upstream's build actions on
+GitHub-hosted runners, pushes them to
 `ghcr.io/richardstoker-usda/enrichedlab-openshell/<component>`, and signs a SLSA build provenance attestation for each
 image index. A release tag produces `<component>:X.Y.Z-el.N`; a push to `enrichedlab/main` produces
 `<component>:X.Y.Z-el.dev.g<commit>`. Deploy by digest, after verifying:

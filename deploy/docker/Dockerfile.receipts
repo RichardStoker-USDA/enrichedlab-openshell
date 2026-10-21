@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Richard Stoker
+# SPDX-License-Identifier: Apache-2.0
+
+# The run receipt interceptor (crates/enrichedlab-receipts). Built from the prebuilt binaries the
+# EnrichedLab images workflow stages, like the gateway image.
+
+ARG RECEIPTS_BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2
+FROM ${RECEIPTS_BASE_IMAGE} AS receipts
+
+ARG TARGETARCH
+
+COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/enrichedlab-receipts /usr/local/bin/enrichedlab-receipts
+
+USER 1000:1000
+EXPOSE 8443
+
+ENTRYPOINT ["/usr/local/bin/enrichedlab-receipts"]

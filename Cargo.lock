@@ -2021,6 +2021,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
 
 [[package]]
+name = "enrichedlab-receipts"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "futures",
+ "jsonwebtoken",
+ "k8s-openapi",
+ "kube",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "openshell-core",
+ "openshell-crypto",
+ "openshell-extension-core",
+ "openshell-gateway-interceptors",
+ "prost",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "enum-ordinalize"
 version = "4.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

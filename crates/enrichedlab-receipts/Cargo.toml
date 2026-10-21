@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Richard Stoker
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "enrichedlab-receipts"
+description = "Run receipts for OpenShell sandboxes: the committed start from an observe-only gateway interceptor and the run from read-only Kubernetes watches"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "enrichedlab-receipts"
+path = "src/main.rs"
+
+[dependencies]
+openshell-core = { path = "../openshell-core", default-features = false }
+openshell-crypto = { workspace = true, features = ["tls-tonic", "tls-kube"] }
+openshell-extension-core = { path = "../openshell-extension-core" }
+openshell-gateway-interceptors = { path = "../openshell-gateway-interceptors" }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { workspace = true }
+futures = { workspace = true }
+jsonwebtoken = { workspace = true }
+k8s-openapi = { workspace = true }
+kube = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true, features = ["transport", "tls-aws-lc"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }
+
+[lints]
+workspace = true

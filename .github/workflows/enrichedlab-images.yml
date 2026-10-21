@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Richard Stoker
 # SPDX-License-Identifier: Apache-2.0
 #
-# Build the gateway, supervisor and sandbox images, the static CLI and the Helm chart from this fork on GitHub-hosted
-# runners, push the images and the chart to GHCR, and sign a SLSA build provenance attestation for each image index, CLI
-# binary and chart. Binaries are built with upstream's own Nix shell and
+# Build the gateway, supervisor, sandbox and run receipt images, the static CLI and the Helm chart from this fork on
+# GitHub-hosted runners, push the images and the chart to GHCR, and sign a SLSA build provenance attestation for each
+# image index, CLI binary and chart. Binaries are built with upstream's own Nix shell and
 # build-rust-binary action, so toolchains match upstream releases. Verify before deploying (FORK.md, "Images").
 name: EnrichedLab images
 
@@ -71,6 +71,8 @@ jobs:
           - { package: openshell-sandbox, binary: openshell-sandbox, triple: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm }
           - { package: openshell-cli, binary: openshell, triple: x86_64-unknown-linux-musl, runner: ubuntu-24.04 }
           - { package: openshell-cli, binary: openshell, triple: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm }
+          - { package: enrichedlab-receipts, binary: enrichedlab-receipts, triple: x86_64-unknown-linux-gnu, runner: ubuntu-24.04 }
+          - { package: enrichedlab-receipts, binary: enrichedlab-receipts, triple: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:
@@ -115,6 +117,7 @@ jobs:
           - { component: supervisor, binary: openshell-supervisor, suffix: unknown-linux-gnu }
           - { component: sandbox, binary: openshell-sandbox, suffix: unknown-linux-musl }
           - { component: cli, binary: openshell, suffix: unknown-linux-musl }
+          - { component: receipts, binary: enrichedlab-receipts, suffix: unknown-linux-gnu }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
