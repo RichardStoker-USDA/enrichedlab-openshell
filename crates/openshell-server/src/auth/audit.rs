@@ -1,16 +1,25 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OCSF security events for gateway authentication outcomes.
+//! OCSF security events for gateway authentication and authorization
+//! outcomes.
 //!
 //! Events carry a low-cardinality reason category, never presented
-//! credentials or raw verification errors.
+//! credentials, raw verification errors, or request bodies.
 
 use openshell_ocsf::{
-    ActionId, AuthProtocolId, AuthenticationBuilder, DispositionId, Endpoint, HttpMethod,
-    HttpRequest, Service, SeverityId, StatusId, Url, User, ocsf_emit,
+    ActionId, ActivityId, ApiActivityBuilder, AuthProtocolId, AuthenticationBuilder, ConfidenceId,
+    DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo, HttpMethod, HttpRequest,
+    ResourceDetails, Service, SeverityId, StatusId, Url, User, UserTypeId, ocsf_emit,
 };
+use std::collections::{HashSet, VecDeque};
+use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
+
+use super::identity::IdentityProvider;
+use super::principal::{Principal, SandboxIdentitySource};
 
 /// Where a gateway connection came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +60,7 @@ impl RequestOrigin {
     }
 }
 
-use super::authenticator::{AuthFailureReason, AuthMechanism};
+use super::authenticator::{AuthFailureReason, AuthMechanism, bearer_credential};
 
 fn category(reason: AuthFailureReason) -> &'static str {
     match reason {
@@ -128,4 +137,437 @@ pub fn emit_authentication_failure(
         builder = builder.correlation_uid(request_id);
     }
     ocsf_emit!(builder.build());
+}
+
+/// How long a credential stays logged on before its next use records a new
+/// logon.
+const LOGON_WINDOW: Duration = Duration::from_hours(1);
+
+/// Credentials tracked at once. When full, the oldest logon is forgotten
+/// early, so a busy gateway records some credentials more than once an hour.
+const MAX_LOGONS: usize = 16_384;
+
+/// Credentials that have recently authenticated, shared by every connection
+/// to this gateway replica.
+///
+/// Every request authenticates, so recording each one would bury user logons
+/// under supervisor polling. A credential instead records one logon when the
+/// replica first accepts it, and again after [`LOGON_WINDOW`] if still in use.
+#[derive(Debug, Clone, Default)]
+pub struct Logons(Arc<Mutex<LogonState>>);
+
+#[derive(Debug, Default)]
+struct LogonState {
+    active: HashSet<[u8; 32]>,
+    by_age: VecDeque<([u8; 32], Instant)>,
+}
+
+impl Logons {
+    /// Record a logon for `credential` at `now`, returning whether it is new.
+    fn log_on(&self, credential: [u8; 32], now: Instant) -> bool {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let LogonState { active, by_age } = &mut *state;
+        while let Some(&(oldest, at)) = by_age.front() {
+            if now.saturating_duration_since(at) < LOGON_WINDOW {
+                break;
+            }
+            by_age.pop_front();
+            active.remove(&oldest);
+        }
+        if active.contains(&credential) {
+            return false;
+        }
+        // Only a new credential makes room, so polling a full record of
+        // credentials that are still logged on records nothing.
+        if by_age.len() >= MAX_LOGONS
+            && let Some((oldest, _)) = by_age.pop_front()
+        {
+            active.remove(&oldest);
+        }
+        active.insert(credential);
+        by_age.push_back((credential, now));
+        true
+    }
+}
+
+/// Whether the gateway verified a credential to establish `principal`.
+fn authenticated(principal: &Principal) -> bool {
+    match principal {
+        Principal::User(user) => user.identity.provider != IdentityProvider::LocalDev,
+        Principal::Anonymous => false,
+        Principal::Operator(_) | Principal::Sandbox(_) | Principal::Peer(_) => true,
+    }
+}
+
+/// The mechanism that established `principal`, when it has an audit label.
+fn mechanism(principal: &Principal) -> Option<AuthMechanism> {
+    match principal {
+        Principal::Operator(_) => Some(AuthMechanism::Mtls),
+        Principal::User(user) => match user.identity.provider {
+            IdentityProvider::Oidc => Some(AuthMechanism::Oidc),
+            IdentityProvider::Mtls => Some(AuthMechanism::Mtls),
+            IdentityProvider::CloudflareAccess | IdentityProvider::LocalDev => None,
+        },
+        Principal::Sandbox(sandbox) => Some(match sandbox.source {
+            SandboxIdentitySource::BootstrapJwt { .. } => AuthMechanism::SandboxJwt,
+            SandboxIdentitySource::ComputeDriver { .. } => AuthMechanism::ComputeDriver,
+        }),
+        Principal::Peer(_) => Some(AuthMechanism::GatewayPeer),
+        Principal::Anonymous => None,
+    }
+}
+
+/// A digest identifying the credential that established `principal`: the
+/// operator's or mTLS user's certificate, or the bearer token.
+///
+/// Only verified material goes in, so headers the authenticator ignored
+/// cannot make a new logon.
+fn credential_digest(
+    principal: &Principal,
+    headers: &http::HeaderMap,
+    peer_certificate_sha256: Option<&str>,
+) -> Option<[u8; 32]> {
+    let mut material = principal.audit_actor().into_bytes();
+    material.push(0);
+    match principal {
+        Principal::Operator(operator) => {
+            material.extend_from_slice(operator.certificate_sha256.as_bytes());
+        }
+        Principal::User(user) if user.identity.provider == IdentityProvider::Mtls => {
+            material.extend_from_slice(peer_certificate_sha256.unwrap_or_default().as_bytes());
+        }
+        _ => {
+            if let Some(token) = bearer_credential(headers) {
+                material.extend_from_slice(token.as_bytes());
+            }
+        }
+    }
+    openshell_crypto::sha256(&material).ok()
+}
+
+/// Emit an Authentication logon event for a request to `path` that
+/// authenticated as `principal`, unless its credential is already logged on.
+///
+/// `peer_certificate_sha256` fingerprints the connection's verified client
+/// certificate, which identifies an mTLS user's credential.
+pub fn emit_logon(
+    logons: &Logons,
+    path: &str,
+    origin: &RequestOrigin,
+    principal: &Principal,
+    headers: &http::HeaderMap,
+    peer_certificate_sha256: Option<&str>,
+) {
+    // Without a digest the credential cannot be deduplicated, so it logs on.
+    if !authenticated(principal)
+        || credential_digest(principal, headers, peer_certificate_sha256)
+            .is_some_and(|digest| !logons.log_on(digest, Instant::now()))
+    {
+        return;
+    }
+    let ctx = crate::gateway_ocsf::context("", "");
+    let mut builder = AuthenticationBuilder::new(
+        &ctx,
+        principal_user(principal),
+        Service::new("openshell-gateway"),
+    )
+    .action(ActionId::Allowed)
+    .disposition(DispositionId::Allowed)
+    .severity(SeverityId::Informational)
+    .status(StatusId::Success)
+    .http_request(HttpRequest {
+        http_method: HttpMethod::Post,
+        url: Some(Url::from_path(path)),
+    })
+    .message("authentication succeeded");
+    if let Some(mechanism) = mechanism(principal) {
+        builder = with_protocol(builder, mechanism);
+    }
+    if let Some(source) = origin.source {
+        builder = builder.src_endpoint(source.endpoint());
+    }
+    if let Some(request_id) = &origin.request_id {
+        builder = builder.correlation_uid(request_id);
+    }
+    ocsf_emit!(builder.build());
+}
+
+tokio::task_local! {
+    static REQUEST: RequestContext;
+}
+
+/// The request whose authorization decisions handlers are making.
+#[derive(Debug, Clone)]
+struct RequestContext {
+    path: String,
+    origin: RequestOrigin,
+}
+
+/// Run a request handler so the authorization denials it raises are
+/// recorded against `path` and `origin`.
+///
+/// The scope covers the handler future only. Wrap work the handler spawns in
+/// [`in_current_request`]; denials raised while a streaming response body is
+/// polled are recorded without the request's path and origin.
+pub async fn with_request<F: Future>(path: String, origin: RequestOrigin, handler: F) -> F::Output {
+    REQUEST
+        .scope(RequestContext { path, origin }, handler)
+        .await
+}
+
+/// Carry the current request's audit context into `future`, for work a
+/// handler runs in a spawned task.
+pub fn in_current_request<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    let request = REQUEST.try_with(Clone::clone).ok();
+    async move {
+        match request {
+            Some(request) => REQUEST.scope(request, future).await,
+            None => future.await,
+        }
+    }
+}
+
+/// Why the gateway refused an authenticated caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthzDenial<'a> {
+    /// The principal type may not call the method, or may not call it with
+    /// these arguments.
+    MethodNotPermitted,
+    /// The method is not one the gateway knows, for example one added by a
+    /// newer client.
+    UnknownMethod,
+    /// The caller lacks the role the method requires.
+    MissingRole,
+    /// The caller's token lacks the scope the method requires.
+    MissingScope,
+    /// A sandbox principal referenced a sandbox other than its own by ID.
+    CrossSandbox { sandbox_id: &'a str },
+    /// A sandbox principal referenced a sandbox other than its own by name.
+    CrossSandboxName { name: &'a str },
+    /// The caller is not a member of the workspace.
+    NotWorkspaceMember { workspace: &'a str },
+    /// The caller's workspace role is below the one the operation requires.
+    InsufficientWorkspaceRole { workspace: &'a str },
+    /// The operation spans workspaces and requires a platform admin.
+    PlatformAdminRequired,
+    /// The operation requires a verified mTLS operator.
+    OperatorRequired,
+}
+
+impl AuthzDenial<'_> {
+    fn category(self) -> &'static str {
+        match self {
+            Self::MethodNotPermitted => "method_not_permitted",
+            Self::UnknownMethod => "unknown_method",
+            Self::MissingRole => "missing_role",
+            Self::MissingScope => "missing_scope",
+            Self::CrossSandbox { .. } | Self::CrossSandboxName { .. } => "cross_sandbox",
+            Self::NotWorkspaceMember { .. } => "not_workspace_member",
+            Self::InsufficientWorkspaceRole { .. } => "insufficient_workspace_role",
+            Self::PlatformAdminRequired => "platform_admin_required",
+            Self::OperatorRequired => "operator_required",
+        }
+    }
+
+    fn resource(self) -> Option<ResourceDetails> {
+        match self {
+            Self::CrossSandbox { sandbox_id } => {
+                Some(ResourceDetails::new("sandbox", bounded(sandbox_id)))
+            }
+            Self::CrossSandboxName { name } => {
+                Some(ResourceDetails::named("sandbox", bounded(name)))
+            }
+            Self::NotWorkspaceMember { workspace }
+            | Self::InsufficientWorkspaceRole { workspace } => {
+                Some(ResourceDetails::named("workspace", bounded(workspace)))
+            }
+            _ => None,
+        }
+    }
+
+    /// A sandbox principal is the supervisor, which never attempts these on
+    /// its own: one that does is compromised or impersonated.
+    fn is_boundary_violation(self, principal: &Principal) -> bool {
+        matches!(principal, Principal::Sandbox(_))
+            && matches!(
+                self,
+                Self::MethodNotPermitted
+                    | Self::CrossSandbox { .. }
+                    | Self::CrossSandboxName { .. }
+                    | Self::PlatformAdminRequired
+            )
+    }
+}
+
+/// Longest request-supplied identifier recorded on an event.
+const MAX_REQUESTED_ID_LEN: usize = 128;
+
+/// Cap a request-supplied identifier so a caller cannot inflate events.
+fn bounded(value: &str) -> String {
+    if value.len() <= MAX_REQUESTED_ID_LEN {
+        return value.to_string();
+    }
+    let mut end = MAX_REQUESTED_ID_LEN;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &value[..end])
+}
+
+/// The principal as an OCSF user, identified but never with credentials.
+fn principal_user(principal: &Principal) -> User {
+    match principal {
+        Principal::User(user) => User::new(&user.identity.subject, UserTypeId::User),
+        Principal::Operator(operator) => User::new(&operator.identity.subject, UserTypeId::Admin),
+        Principal::Sandbox(sandbox) => User::other(&sandbox.sandbox_id, "Sandbox"),
+        Principal::Peer(peer) => User::other(&peer.replica_id, "Gateway Peer"),
+        Principal::Anonymous => User::unidentified(),
+    }
+}
+
+/// Emit an authorization denial raised by a handler for the current request.
+pub fn emit_authorization_denial(principal: &Principal, denial: AuthzDenial<'_>) {
+    let request = REQUEST.try_with(Clone::clone).ok();
+    let (path, origin) = request
+        .map(|request| (request.path, request.origin))
+        .unwrap_or_default();
+    emit_authorization_denial_for(&path, &origin, principal, denial);
+}
+
+/// Emit an API Activity denial for a gRPC request to `path`, paired with a
+/// Detection Finding when a sandbox principal crossed its boundary.
+pub fn emit_authorization_denial_for(
+    path: &str,
+    origin: &RequestOrigin,
+    principal: &Principal,
+    denial: AuthzDenial<'_>,
+) {
+    let ctx = crate::gateway_ocsf::context("", "");
+    let category = denial.category();
+    let finding = denial.is_boundary_violation(principal);
+    // Both events of a pair must share an identifier even when the request
+    // has no usable `x-request-id`.
+    let correlation_uid = origin
+        .request_id
+        .clone()
+        .or_else(|| finding.then(|| uuid::Uuid::new_v4().to_string()));
+    let (service, operation) = path
+        .strip_prefix('/')
+        .and_then(|path| path.split_once('/'))
+        .unwrap_or(("", "unknown"));
+
+    let mut builder = ApiActivityBuilder::new(&ctx, operation)
+        .actor_user(principal_user(principal))
+        .src_endpoint(origin.source.map_or_else(
+            || Endpoint::from_name("unknown"),
+            ConnectionSource::endpoint,
+        ))
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .status_detail(category)
+        .message(format!("authorization denied: {category}"));
+    if !service.is_empty() {
+        builder = builder
+            .api_service(Service::new(service))
+            .http_request(HttpRequest {
+                http_method: HttpMethod::Post,
+                url: Some(Url::from_path(path)),
+            });
+    }
+    if let Some(resource) = denial.resource() {
+        builder = builder.resource(resource);
+    }
+    if let Some(uid) = &correlation_uid {
+        builder = builder.correlation_uid(uid);
+    }
+    ocsf_emit!(builder.build());
+
+    if let (true, Principal::Sandbox(sandbox)) = (finding, principal) {
+        let mut evidence = vec![
+            ("sandbox_id", sandbox.sandbox_id.as_str()),
+            ("reason", category),
+        ];
+        if !path.is_empty() {
+            evidence.push(("operation", path));
+        }
+        let requested = match denial {
+            AuthzDenial::CrossSandbox { sandbox_id } => {
+                Some(("requested_sandbox_id", bounded(sandbox_id)))
+            }
+            AuthzDenial::CrossSandboxName { name } => {
+                Some(("requested_sandbox_name", bounded(name)))
+            }
+            _ => None,
+        };
+        if let Some((key, value)) = &requested {
+            evidence.push((key, value));
+        }
+        let mut finding = DetectionFindingBuilder::new(&ctx)
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::High)
+            .is_alert(true)
+            .confidence(ConfidenceId::High)
+            .finding_info(
+                FindingInfo::new(
+                    "sandbox-authorization-boundary",
+                    "Sandbox Principal Exceeded Its Authorization",
+                )
+                .with_desc(
+                    "A sandbox credential was used for an operation outside its own sandbox. \
+                     The supervisor never does this, so the credential may be compromised.",
+                ),
+            )
+            .evidence_pairs(&evidence)
+            .message(format!(
+                "sandbox authorization boundary violation: {category}"
+            ));
+        if let Some(uid) = &correlation_uid {
+            finding = finding.correlation_uid(uid);
+        }
+        ocsf_emit!(finding.build());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_logs_on_again_after_the_window() {
+        let logons = Logons::default();
+        let start = Instant::now();
+
+        assert!(logons.log_on([1; 32], start));
+        assert!(!logons.log_on([1; 32], start + Duration::from_mins(59)));
+        assert!(logons.log_on([1; 32], start + LOGON_WINDOW));
+    }
+
+    #[test]
+    fn oldest_credential_is_forgotten_when_full() {
+        let logons = Logons::default();
+        let now = Instant::now();
+        let credential = |n: usize| {
+            let mut digest = [0; 32];
+            digest[..8].copy_from_slice(&n.to_le_bytes());
+            digest
+        };
+        for n in 0..MAX_LOGONS {
+            assert!(logons.log_on(credential(n), now));
+        }
+        // Polling every credential in turn while full is not a new logon.
+        for n in 0..MAX_LOGONS {
+            assert!(!logons.log_on(credential(n), now), "credential {n}");
+        }
+
+        assert!(logons.log_on(credential(MAX_LOGONS), now));
+        assert!(logons.log_on(credential(0), now), "oldest was evicted");
+        assert!(
+            !logons.log_on(credential(MAX_LOGONS), now),
+            "newest was kept"
+        );
+    }
 }
