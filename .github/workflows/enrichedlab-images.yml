@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Richard Stoker
 # SPDX-License-Identifier: Apache-2.0
 #
-# Build the gateway, supervisor and sandbox images from this fork on GitHub-hosted runners, push them to GHCR, and sign
-# a SLSA build provenance attestation for each image index. Binaries are built with upstream's own Nix shell and
+# Build the gateway, supervisor and sandbox images and the static CLI from this fork on GitHub-hosted runners, push the
+# images to GHCR, and sign a SLSA build provenance attestation for each image index and each CLI binary. Binaries are built with upstream's own Nix shell and
 # build-rust-binary action, so toolchains match upstream releases. Verify before deploying (FORK.md, "Images").
 name: EnrichedLab images
 
@@ -68,6 +68,8 @@ jobs:
           - { package: openshell-supervisor, binary: openshell-supervisor, triple: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
           - { package: openshell-sandbox, binary: openshell-sandbox, triple: x86_64-unknown-linux-musl, runner: ubuntu-24.04 }
           - { package: openshell-sandbox, binary: openshell-sandbox, triple: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm }
+          - { package: openshell-cli, binary: openshell, triple: x86_64-unknown-linux-musl, runner: ubuntu-24.04 }
+          - { package: openshell-cli, binary: openshell, triple: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:
@@ -186,3 +188,51 @@ jobs:
           subject-name: ${{ steps.build.outputs.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+
+  cli:
+    name: CLI attestation
+    needs: [version, binaries]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download amd64 CLI
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-x86_64-unknown-linux-musl
+          path: cli/openshell-x86_64-unknown-linux-musl
+
+      - name: Download arm64 CLI
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-aarch64-unknown-linux-musl
+          path: cli/openshell-aarch64-unknown-linux-musl
+
+      - name: Name the binaries by target
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ needs.version.outputs.image-tag }}
+        run: |
+          set -euo pipefail
+          install -d out
+          for triple in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            install -m0755 "cli/openshell-${triple}/openshell" "out/openshell-${IMAGE_TAG}-${triple}"
+          done
+          (cd out && sha256sum openshell-* > "openshell-${IMAGE_TAG}-checksums-sha256.txt")
+          cat out/*checksums*
+
+      - name: Attest CLI provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/openshell-*-linux-musl
+
+      - name: Keep the CLI binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openshell-cli-${{ needs.version.outputs.image-tag }}
+          path: out
+          retention-days: 90
+          if-no-files-found: error
