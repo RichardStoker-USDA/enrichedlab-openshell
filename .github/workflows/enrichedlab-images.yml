@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Richard Stoker
 # SPDX-License-Identifier: Apache-2.0
 #
-# Build the gateway, supervisor and sandbox images and the static CLI from this fork on GitHub-hosted runners, push the
-# images to GHCR, and sign a SLSA build provenance attestation for each image index and each CLI binary. Binaries are built with upstream's own Nix shell and
+# Build the gateway, supervisor and sandbox images, the static CLI and the Helm chart from this fork on GitHub-hosted
+# runners, push the images and the chart to GHCR, and sign a SLSA build provenance attestation for each image index, CLI
+# binary and chart. Binaries are built with upstream's own Nix shell and
 # build-rust-binary action, so toolchains match upstream releases. Verify before deploying (FORK.md, "Images").
 name: EnrichedLab images
 
@@ -233,6 +234,76 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: openshell-cli-${{ needs.version.outputs.image-tag }}
+          path: out
+          retention-days: 90
+          if-no-files-found: error
+
+  chart:
+    name: Helm chart
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The Helm release and its checksum come from upstream's mise.lock, so the chart is packaged by the same Helm
+      # upstream pins.
+      - name: Install Helm pinned by mise.lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -r url sum < <(python3 -c 'import tomllib; t = tomllib.load(open("mise.lock", "rb"))["tools"]["helm"][0]["platforms.linux-x64"]; print(t["url"], t["checksum"].removeprefix("sha256:"))')
+          curl -fsSL "$url" -o "$RUNNER_TEMP/helm.tgz"
+          echo "$sum  $RUNNER_TEMP/helm.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/helm.tgz" -C "$RUNNER_TEMP" linux-amd64/helm
+          install -Dm0755 "$RUNNER_TEMP/linux-amd64/helm" "$RUNNER_TEMP/bin/helm"
+          "$RUNNER_TEMP/bin/helm" version --short
+
+      - name: Package and push
+        id: chart
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ needs.version.outputs.image-tag }}
+          OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          helm="$RUNNER_TEMP/bin/helm"
+          "$helm" package deploy/helm/openshell --version "$IMAGE_TAG" --app-version "$IMAGE_TAG" -d out
+          printf '%s' "$TOKEN" | "$helm" registry login ghcr.io --username "$ACTOR" --password-stdin
+          repo="ghcr.io/${OWNER,,}/enrichedlab-openshell/charts"
+          "$helm" push "out/helm-chart-${IMAGE_TAG}.tgz" "oci://${repo}" 2>&1 | tee push.log
+          digest=$(grep -o 'sha256:[0-9a-f]\{64\}' push.log | tail -1)
+          [[ $digest == sha256:* ]] || { echo "::error::no chart digest in helm push output"; exit 1; }
+          (cd out && sha256sum "helm-chart-${IMAGE_TAG}.tgz" > "helm-chart-${IMAGE_TAG}.tgz.sha256")
+          echo "name=${repo}/helm-chart" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "### chart: \`${repo}/helm-chart:${IMAGE_TAG}@${digest}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest the chart in the registry
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.chart.outputs.name }}
+          subject-digest: ${{ steps.chart.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest the chart archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/helm-chart-*.tgz
+
+      - name: Keep the chart archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: helm-chart-${{ needs.version.outputs.image-tag }}
           path: out
           retention-days: 90
           if-no-files-found: error
