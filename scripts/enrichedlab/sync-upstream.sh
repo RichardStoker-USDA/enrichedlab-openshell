@@ -38,7 +38,11 @@ trap 'git checkout -q "$start_branch" 2>/dev/null || true' EXIT
 git config rerere.enabled true
 git config rerere.autoupdate true
 
-git fetch --quiet --tags "$upstream"
+# Release tags only: upstream also moves rolling tags such as `dev`, which a plain --tags fetch refuses to update.
+if ! git fetch --quiet --no-tags "$upstream" "+refs/heads/main:refs/remotes/$upstream/main" 'refs/tags/v*:refs/tags/v*'; then
+  echo "refused: fetching $upstream failed; run the fetch by hand to see why" >&2
+  exit 4
+fi
 
 # 1. main follows upstream main, fast-forward only.
 if git show-ref --verify --quiet refs/heads/main; then
