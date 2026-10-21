@@ -1832,6 +1832,8 @@ impl KubernetesComputeDriver {
             image_pull_secrets: &self.config.image_pull_secrets,
             default_runtime_class_name: &self.config.default_runtime_class_name,
             service_account_name: &self.config.service_account_name,
+            fixed_pod_labels: &self.config.fixed_pod_labels,
+            fixed_pod_annotations: &self.config.fixed_pod_annotations,
             ..Default::default()
         };
         let rendered = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
@@ -2130,6 +2132,8 @@ impl KubernetesComputeDriver {
             sandbox_gid: resolved_group_id,
             boundary_port: self.config.sandbox_runtime.boundary_port,
             sandbox_secret_name: &proxy_names.sandbox_secret,
+            fixed_pod_labels: &self.config.fixed_pod_labels,
+            fixed_pod_annotations: &self.config.fixed_pod_annotations,
         };
         let kube_name = self.config.kube_resource_name(workspace, name);
         let mut data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
@@ -2214,6 +2218,7 @@ impl KubernetesComputeDriver {
             annotations: Some(annotations),
             ..Default::default()
         };
+        apply_fixed_pod_metadata(&mut obj.metadata, &self.config);
 
         obj.data = data;
         let created = match tokio::time::timeout(
@@ -2882,49 +2887,48 @@ impl KubernetesComputeDriver {
         upstream_proxy_ca_bundle_staged: bool,
     ) -> Result<String, KubernetesDriverError> {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
-        pods.create(
-            &PostParams::default(),
-            &supervisor_pod(
-                namespace,
-                names,
-                sandbox_id,
-                sandbox_name,
-                &self.config.gateway_id,
-                &self.config.supervisor_image,
-                self.config.supervisor_image_pull_policy,
-                &self.config.service_account_name,
-                agent_uid,
-                agent_gid,
-                &self.generation_image_pull_secret_names(names),
-                &self.config.grpc_endpoint,
-                self.config.supervisor_client_tls(),
-                main_process_spec,
-                log_level,
-                self.config.effective_sa_token_ttl_secs(),
-                self.config.https_proxy.as_deref(),
-                self.config.no_proxy.as_deref(),
+        let mut pod = supervisor_pod(
+            namespace,
+            names,
+            sandbox_id,
+            sandbox_name,
+            &self.config.gateway_id,
+            &self.config.supervisor_image,
+            self.config.supervisor_image_pull_policy,
+            &self.config.service_account_name,
+            agent_uid,
+            agent_gid,
+            &self.generation_image_pull_secret_names(names),
+            &self.config.grpc_endpoint,
+            self.config.supervisor_client_tls(),
+            main_process_spec,
+            log_level,
+            self.config.effective_sa_token_ttl_secs(),
+            self.config.https_proxy.as_deref(),
+            self.config.no_proxy.as_deref(),
+            self.config
+                .proxy_auth_secret_name
+                .as_deref()
+                .zip(self.config.proxy_auth_secret_key.as_deref()),
+            self.config.proxy_auth_allow_insecure == Some(true),
+            self.config.proxy_connect_by_hostname == Some(true),
+            upstream_proxy_ca_bundle_staged,
+            self.config.provider_spiffe_enabled().then_some(
                 self.config
-                    .proxy_auth_secret_name
-                    .as_deref()
-                    .zip(self.config.proxy_auth_secret_key.as_deref()),
-                self.config.proxy_auth_allow_insecure == Some(true),
-                self.config.proxy_connect_by_hostname == Some(true),
-                upstream_proxy_ca_bundle_staged,
-                self.config.provider_spiffe_enabled().then_some(
-                    self.config
-                        .provider_spiffe_workload_api_socket_path
-                        .as_str(),
-                ),
-                owner,
-                &self.supervisor_otlp_environment(),
-            )
-            .map_err(KubernetesDriverError::Message)?,
+                    .provider_spiffe_workload_api_socket_path
+                    .as_str(),
+            ),
+            owner,
+            &self.supervisor_otlp_environment(),
         )
-        .await
-        .map_err(KubernetesDriverError::from_kube)?
-        .metadata
-        .uid
-        .ok_or_else(|| KubernetesDriverError::Message("supervisor Pod has no UID".to_string()))
+        .map_err(KubernetesDriverError::Message)?;
+        apply_fixed_pod_metadata(&mut pod.metadata, &self.config);
+        pods.create(&PostParams::default(), &pod)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?
+            .metadata
+            .uid
+            .ok_or_else(|| KubernetesDriverError::Message("supervisor Pod has no UID".to_string()))
     }
 
     #[allow(clippy::too_many_arguments, clippy::similar_names)]
@@ -6489,7 +6493,13 @@ struct SandboxPodParams<'a> {
     boundary_port: u16,
     /// Immutable Secret name for this workload Pod generation.
     sandbox_secret_name: &'a str,
+    /// Operator-fixed labels for the workload Pod and workspace claim.
+    fixed_pod_labels: &'a BTreeMap<String, String>,
+    /// Operator-fixed annotations for the workload Pod and workspace claim.
+    fixed_pod_annotations: &'a BTreeMap<String, String>,
 }
+
+static NO_FIXED_METADATA: BTreeMap<String, String> = BTreeMap::new();
 
 impl Default for SandboxPodParams<'_> {
     fn default() -> Self {
@@ -6509,6 +6519,8 @@ impl Default for SandboxPodParams<'_> {
             sandbox_gid: DEFAULT_SANDBOX_UID,
             boundary_port: 5500,
             sandbox_secret_name: "os-sandbox-test-generation",
+            fixed_pod_labels: &NO_FIXED_METADATA,
+            fixed_pod_annotations: &NO_FIXED_METADATA,
         }
     }
 }
@@ -6578,13 +6590,22 @@ fn sandbox_to_k8s_spec(
     }
 
     if inject_workspace {
-        root.insert(
-            "volumeClaimTemplates".to_string(),
-            default_workspace_volume_claim_templates(
-                params.workspace_default_storage_size,
-                params.workspace_storage_class,
-            ),
+        let mut claims = default_workspace_volume_claim_templates(
+            params.workspace_default_storage_size,
+            params.workspace_storage_class,
         );
+        if let Some(metadata) = claims
+            .get_mut(0)
+            .and_then(|claim| claim.get_mut("metadata"))
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            apply_fixed_metadata_json(
+                metadata,
+                params.fixed_pod_labels,
+                params.fixed_pod_annotations,
+            );
+        }
+        root.insert("volumeClaimTemplates".to_string(), claims);
     }
 
     // podTemplate is required by the Kubernetes CRD - ensure it's always present
@@ -6658,11 +6679,16 @@ fn sandbox_template_to_k8s_with_validated_config(
     params: &SandboxPodParams<'_>,
 ) -> serde_json::Value {
     let mut metadata = serde_json::Map::new();
-    let pod_labels = template
+    let mut pod_labels = template
         .labels
         .iter()
         .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
         .collect::<serde_json::Map<String, serde_json::Value>>();
+    for (key, value) in params.fixed_pod_labels {
+        pod_labels
+            .entry(key.clone())
+            .or_insert_with(|| serde_json::Value::String(value.clone()));
+    }
     if !pod_labels.is_empty() {
         metadata.insert("labels".to_string(), serde_json::Value::Object(pod_labels));
     }
@@ -6678,6 +6704,11 @@ fn sandbox_template_to_k8s_with_validated_config(
             _ => None,
         })
         .unwrap_or_default();
+    for (key, value) in params.fixed_pod_annotations {
+        pod_annotations
+            .entry(key.clone())
+            .or_insert_with(|| serde_json::Value::String(value.clone()));
+    }
     if !params.sandbox_id.is_empty() {
         pod_annotations.insert(
             LABEL_SANDBOX_ID.to_string(),
@@ -7064,7 +7095,83 @@ fn validate_pod_metadata(
         "allowed_pod_labels",
         template.labels.keys().map(String::as_str),
         |key| config.pod_label_allowed(key),
-    )
+    )?;
+    reject_fixed_pod_metadata_keys(template, config)
+}
+
+/// Reject template pod labels and annotations whose keys the operator fixed
+/// in `fixed_pod_labels` / `fixed_pod_annotations`; a sandbox cannot replace
+/// metadata that admission, telemetry or retention policy relies on.
+fn reject_fixed_pod_metadata_keys(
+    template: &SandboxTemplate,
+    config: &KubernetesComputeConfig,
+) -> Result<(), String> {
+    let mut fixed: Vec<String> = template
+        .labels
+        .keys()
+        .filter(|key| config.pod_label_fixed(key))
+        .map(|key| format!("label {key}"))
+        .collect();
+    if let Some(serde_json::Value::Object(annotations)) =
+        platform_config_struct(template, "annotations")
+    {
+        fixed.extend(
+            annotations
+                .keys()
+                .filter(|key| config.pod_annotation_fixed(key))
+                .map(|key| format!("annotation {key}")),
+        );
+    }
+    if fixed.is_empty() {
+        return Ok(());
+    }
+    fixed.sort_unstable();
+    Err(format!(
+        "pod metadata fixed by the gateway operator cannot be set by a sandbox template: {}",
+        fixed.join(", ")
+    ))
+}
+
+/// Add the operator's fixed labels and annotations to an object's metadata.
+/// Keys `OpenShell` already set are kept; the reserved domains keep the two
+/// sets apart in practice.
+fn apply_fixed_pod_metadata(metadata: &mut ObjectMeta, config: &KubernetesComputeConfig) {
+    if !config.fixed_pod_labels.is_empty() {
+        let labels = metadata.labels.get_or_insert_with(BTreeMap::new);
+        for (key, value) in &config.fixed_pod_labels {
+            labels.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    if !config.fixed_pod_annotations.is_empty() {
+        let annotations = metadata.annotations.get_or_insert_with(BTreeMap::new);
+        for (key, value) in &config.fixed_pod_annotations {
+            annotations
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
+}
+
+/// JSON form of `apply_fixed_pod_metadata` for rendered pod and claim templates.
+fn apply_fixed_metadata_json(
+    metadata: &mut serde_json::Map<String, serde_json::Value>,
+    labels: &BTreeMap<String, String>,
+    annotations: &BTreeMap<String, String>,
+) {
+    for (field, fixed) in [("labels", labels), ("annotations", annotations)] {
+        if fixed.is_empty() {
+            continue;
+        }
+        let entry = metadata
+            .entry(field)
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(map) = entry.as_object_mut() {
+            for (key, value) in fixed {
+                map.entry(key.clone())
+                    .or_insert_with(|| serde_json::Value::String(value.clone()));
+            }
+        }
+    }
 }
 
 fn reject_disallowed_pod_metadata_keys<'a>(
@@ -10278,6 +10385,117 @@ mod tests {
             err.ends_with("allowed_pod_labels: openshell.ai/managed-by, team"),
             "{err}"
         );
+    }
+
+    fn fixed_metadata_config() -> KubernetesComputeConfig {
+        KubernetesComputeConfig {
+            allowed_pod_labels: vec!["example.com/*".into(), "app".into()],
+            allowed_pod_annotations: vec!["example.com/*".into()],
+            fixed_pod_labels: BTreeMap::from([
+                (
+                    "example.com/enrollment".to_string(),
+                    "service-agents".to_string(),
+                ),
+                ("example.com/retention".to_string(), "audit".to_string()),
+            ]),
+            fixed_pod_annotations: BTreeMap::from([(
+                "example.com/owner".to_string(),
+                "research".to_string(),
+            )]),
+            ..KubernetesComputeConfig::default()
+        }
+    }
+
+    #[test]
+    fn validate_pod_metadata_rejects_keys_the_operator_fixed() {
+        let config = fixed_metadata_config();
+        validate_pod_metadata(
+            &template_with_pod_labels(&["app", "example.com/run"]),
+            &config,
+        )
+        .unwrap();
+        let err = validate_pod_metadata(
+            &template_with_pod_labels(&["example.com/retention", "app"]),
+            &config,
+        )
+        .unwrap_err();
+        assert!(
+            err.ends_with("cannot be set by a sandbox template: label example.com/retention"),
+            "{err}"
+        );
+        let err = validate_pod_metadata(
+            &template_with_pod_annotations(&["example.com/owner"]),
+            &config,
+        )
+        .unwrap_err();
+        assert!(err.ends_with("annotation example.com/owner"), "{err}");
+    }
+
+    #[test]
+    fn fixed_pod_metadata_reaches_workload_pod_and_workspace_claim() {
+        let config = fixed_metadata_config();
+        let params = SandboxPodParams {
+            sandbox_id: "sandbox-123",
+            fixed_pod_labels: &config.fixed_pod_labels,
+            fixed_pod_annotations: &config.fixed_pod_annotations,
+            ..Default::default()
+        };
+        let spec = SandboxSpec {
+            template: Some(template_with_pod_labels(&["app"])),
+            ..SandboxSpec::default()
+        };
+        let rendered = sandbox_to_k8s_spec(Some(&spec), &params).unwrap();
+        let pod = &rendered["spec"]["podTemplate"]["metadata"];
+        assert_eq!(pod["labels"]["example.com/enrollment"], "service-agents");
+        assert_eq!(pod["labels"]["example.com/retention"], "audit");
+        assert_eq!(pod["labels"]["app"], "v");
+        assert_eq!(pod["labels"][BOUNDARY_ROLE_LABEL], "workload");
+        assert_eq!(pod["annotations"]["example.com/owner"], "research");
+        assert_eq!(pod["annotations"][LABEL_SANDBOX_ID], "sandbox-123");
+        let claim = &rendered["spec"]["volumeClaimTemplates"][0]["metadata"];
+        assert_eq!(claim["name"], WORKSPACE_VOLUME_NAME);
+        assert_eq!(claim["labels"]["example.com/retention"], "audit");
+        assert_eq!(claim["annotations"]["example.com/owner"], "research");
+
+        let plain = sandbox_to_k8s_spec(Some(&spec), &SandboxPodParams::default()).unwrap();
+        assert!(
+            plain["spec"]["podTemplate"]["metadata"]["labels"]
+                .get("example.com/retention")
+                .is_none()
+        );
+        assert!(
+            plain["spec"]["volumeClaimTemplates"][0]["metadata"]
+                .get("labels")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn apply_fixed_pod_metadata_keeps_keys_openshell_set() {
+        let config = fixed_metadata_config();
+        let mut metadata = ObjectMeta {
+            labels: Some(BTreeMap::from([
+                (
+                    LABEL_MANAGED_BY.to_string(),
+                    LABEL_MANAGED_BY_VALUE.to_string(),
+                ),
+                ("example.com/retention".to_string(), "service".to_string()),
+            ])),
+            ..ObjectMeta::default()
+        };
+        apply_fixed_pod_metadata(&mut metadata, &config);
+        let labels = metadata.labels.unwrap();
+        assert_eq!(labels[LABEL_MANAGED_BY], LABEL_MANAGED_BY_VALUE);
+        assert_eq!(labels["example.com/retention"], "service");
+        assert_eq!(labels["example.com/enrollment"], "service-agents");
+        assert_eq!(
+            metadata.annotations.unwrap()["example.com/owner"],
+            "research"
+        );
+
+        let mut untouched = ObjectMeta::default();
+        apply_fixed_pod_metadata(&mut untouched, &KubernetesComputeConfig::default());
+        assert!(untouched.labels.is_none() && untouched.annotations.is_none());
     }
 
     #[tokio::test]

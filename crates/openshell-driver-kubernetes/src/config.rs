@@ -337,6 +337,17 @@ pub struct KubernetesComputeConfig {
     /// format and reserved domains as `allowed_pod_annotations`. Empty
     /// (default) rejects every caller-supplied pod label.
     pub allowed_pod_labels: Vec<String>,
+    /// Labels the driver adds to every sandbox it creates: the `Sandbox`
+    /// resource, its workload Pod, its supervisor Pod and the default
+    /// workspace volume claim. For clusters whose admission, telemetry or
+    /// retention policy requires fixed labels on every workload. Keys follow
+    /// the `allowed_pod_labels` format (exact keys only, no wildcards) and may
+    /// not use the reserved domains; values must be valid label values.
+    /// Sandbox templates cannot set these keys. Empty (default) adds nothing.
+    pub fixed_pod_labels: BTreeMap<String, String>,
+    /// Annotations the driver adds to the same objects as `fixed_pod_labels`,
+    /// with the same key rules. Sandbox templates cannot set these keys.
+    pub fixed_pod_annotations: BTreeMap<String, String>,
     /// Lifetime (seconds) of the projected `ServiceAccount` token kubelet
     /// writes into each sandbox pod. Used only for the one-shot
     /// `IssueSandboxToken` bootstrap exchange — the gateway-minted JWT
@@ -443,6 +454,8 @@ impl Default for KubernetesComputeConfig {
             default_runtime_class_name: String::new(),
             allowed_pod_annotations: Vec::new(),
             allowed_pod_labels: Vec::new(),
+            fixed_pod_labels: BTreeMap::new(),
+            fixed_pod_annotations: BTreeMap::new(),
             sa_token_ttl_secs: 3600,
             provider_spiffe_workload_api_socket_path: String::new(),
             sandbox_uid: None,
@@ -463,7 +476,42 @@ impl KubernetesComputeConfig {
         self.validate_proxy_uid()?;
         self.validate_upstream_proxy_config()?;
         self.validate_allowed_pod_annotations()?;
-        self.validate_allowed_pod_labels()
+        self.validate_allowed_pod_labels()?;
+        self.validate_fixed_pod_metadata()
+    }
+
+    /// Validate `fixed_pod_labels` and `fixed_pod_annotations`: exact keys
+    /// outside the reserved domains, and Kubernetes label values for labels.
+    pub fn validate_fixed_pod_metadata(&self) -> Result<(), String> {
+        for (field, map) in [
+            ("fixed_pod_labels", &self.fixed_pod_labels),
+            ("fixed_pod_annotations", &self.fixed_pod_annotations),
+        ] {
+            for key in map.keys() {
+                if key.ends_with("/*") {
+                    return Err(format!("{field} key {key:?}: wildcards are not allowed"));
+                }
+                validate_pod_metadata_allowlist(field, std::slice::from_ref(key))?;
+            }
+        }
+        for (key, value) in &self.fixed_pod_labels {
+            if !is_label_value(value) {
+                return Err(format!(
+                    "fixed_pod_labels value for {key:?} is not a valid label value: {value:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `key` is fixed by the operator as a pod label.
+    pub fn pod_label_fixed(&self, key: &str) -> bool {
+        self.fixed_pod_labels.contains_key(key)
+    }
+
+    /// Whether `key` is fixed by the operator as a pod annotation.
+    pub fn pod_annotation_fixed(&self, key: &str) -> bool {
+        self.fixed_pod_annotations.contains_key(key)
     }
 
     pub fn validate_allowed_pod_annotations(&self) -> Result<(), String> {
@@ -960,6 +1008,12 @@ fn is_reserved_pod_metadata_domain(domain: &str) -> bool {
     })
 }
 
+/// Kubernetes label value: empty, or at most 63 alphanumeric, `-`, `_`, or
+/// `.` characters, beginning and ending with an alphanumeric character.
+fn is_label_value(value: &str) -> bool {
+    value.is_empty() || is_qualified_name_segment(value)
+}
+
 /// Kubernetes qualified-name segment: at most 63 alphanumeric, `-`, `_`, or
 /// `.` characters, beginning and ending with an alphanumeric character.
 fn is_qualified_name_segment(value: &str) -> bool {
@@ -1219,6 +1273,86 @@ mod tests {
         assert!(!cfg.pod_label_allowed("openshell.ai/managed-by"));
         let err = cfg.validate_allowed_pod_labels().unwrap_err();
         assert!(err.starts_with("allowed_pod_labels entry"), "{err}");
+    }
+
+    fn fixed_metadata(
+        labels: &[(&str, &str)],
+        annotations: &[(&str, &str)],
+    ) -> KubernetesComputeConfig {
+        KubernetesComputeConfig {
+            fixed_pod_labels: labels
+                .iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect(),
+            fixed_pod_annotations: annotations
+                .iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect(),
+            ..KubernetesComputeConfig::default()
+        }
+    }
+
+    #[test]
+    fn fixed_pod_metadata_accepts_exact_keys_and_label_values() {
+        let cfg = fixed_metadata(
+            &[
+                ("example.com/enrollment", "service-agents"),
+                ("team", "research"),
+                ("example.com/empty", ""),
+            ],
+            &[("example.com/retain-until", "2026-12-31T00:00:00Z")],
+        );
+        cfg.validate_fixed_pod_metadata().unwrap();
+        cfg.validate_configuration().unwrap();
+        assert!(cfg.pod_label_fixed("team"));
+        assert!(!cfg.pod_label_fixed("example.com/retain-until"));
+        assert!(cfg.pod_annotation_fixed("example.com/retain-until"));
+        KubernetesComputeConfig::default()
+            .validate_fixed_pod_metadata()
+            .unwrap();
+    }
+
+    #[test]
+    fn fixed_pod_metadata_rejects_reserved_domains_wildcards_and_bad_values() {
+        for (labels, annotations, expect) in [
+            (
+                vec![("openshell.ai/sandbox-id", "x")],
+                vec![],
+                "fixed_pod_labels",
+            ),
+            (
+                vec![("sub.agents.x-k8s.io/x", "x")],
+                vec![],
+                "fixed_pod_labels",
+            ),
+            (vec![("example.com/*", "x")], vec![], "wildcards"),
+            (
+                vec![("example.com/a", "has space")],
+                vec![],
+                "not a valid label value",
+            ),
+            (
+                vec![("example.com/a", "-leading")],
+                vec![],
+                "not a valid label value",
+            ),
+            (vec![("Bad_Prefix/a", "x")], vec![], "invalid key prefix"),
+            (
+                vec![],
+                vec![("openshell.ai/x", "y")],
+                "fixed_pod_annotations",
+            ),
+        ] {
+            let err = fixed_metadata(&labels, &annotations)
+                .validate_fixed_pod_metadata()
+                .unwrap_err();
+            assert!(err.contains(expect), "{err}");
+        }
+        let long = "v".repeat(64);
+        let err = fixed_metadata(&[("example.com/a", &long)], &[])
+            .validate_configuration()
+            .unwrap_err();
+        assert!(err.contains("not a valid label value"), "{err}");
     }
 
     #[test]
