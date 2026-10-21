@@ -28,6 +28,8 @@ pub use ssh_activity::SshActivityEvent;
 
 use serde::{Deserialize, Serialize};
 
+use crate::enums::ActionId;
+
 /// Top-level OCSF event enum encompassing all supported event classes.
 ///
 /// Serialization delegates directly to the inner event struct (untagged).
@@ -140,6 +142,25 @@ impl OcsfEvent {
         }
     }
 
+    /// Returns the action the event records (allowed, denied, ...), for the
+    /// classes that carry one. Application lifecycle, config state change and
+    /// base events have no action.
+    #[must_use]
+    pub fn action(&self) -> Option<ActionId> {
+        match self {
+            Self::NetworkActivity(e) => e.action,
+            Self::HttpActivity(e) => e.action,
+            Self::SshActivity(e) => e.action,
+            Self::ProcessActivity(e) => e.action,
+            Self::Authentication(e) => e.action,
+            Self::DetectionFinding(e) => e.action,
+            Self::ApiActivity(e) => e.action,
+            Self::ApplicationLifecycle(_) | Self::DeviceConfigStateChange(_) | Self::Base(_) => {
+                None
+            }
+        }
+    }
+
     /// Returns the base event data common to all event classes.
     #[must_use]
     pub fn base(&self) -> &BaseEventData {
@@ -168,6 +189,30 @@ mod tests {
     };
     use crate::enums::*;
     use crate::objects::*;
+
+    #[test]
+    fn action_reports_the_recorded_action_and_none_for_classes_without_one() {
+        let ctx = test_sandbox_context();
+        let denied = NetworkActivityBuilder::new(&ctx)
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Medium)
+            .dst_endpoint(Endpoint::from_domain("example.com", 443))
+            .build();
+        assert_eq!(denied.action(), Some(ActionId::Denied));
+        let unset = NetworkActivityBuilder::new(&ctx)
+            .activity(ActivityId::Open)
+            .severity(SeverityId::Informational)
+            .dst_endpoint(Endpoint::from_domain("example.com", 443))
+            .build();
+        assert_eq!(unset.action(), None);
+        let config = ConfigStateChangeBuilder::new(&ctx)
+            .severity(SeverityId::Informational)
+            .message("policy loaded")
+            .build();
+        assert_eq!(config.action(), None);
+    }
 
     /// Verify that every event class round-trips through JSON and deserializes
     /// to the correct `OcsfEvent` variant (not silently matching the wrong one).

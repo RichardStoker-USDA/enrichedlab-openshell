@@ -398,6 +398,9 @@ fn log_record(
     record.add_attribute("ocsf.class_uid", i64::from(base.class_uid));
     record.add_attribute("ocsf.activity_id", i64::from(base.activity_id));
     record.add_attribute("ocsf.severity_id", i64::from(base.severity.as_u8()));
+    if let Some(action) = event.action() {
+        record.add_attribute("ocsf.action_id", i64::from(action.as_u8()));
+    }
     if let Some(uid) = &base.metadata.uid {
         record.add_attribute("ocsf.metadata.uid", uid.clone());
     }
@@ -441,7 +444,10 @@ fn severity(severity: SeverityId) -> Severity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_ocsf::{ConfigStateChangeBuilder, EventContext, EventOrigin, ocsf_emit};
+    use openshell_ocsf::{
+        ActionId, ConfigStateChangeBuilder, DispositionId, Endpoint, EventContext, EventOrigin,
+        NetworkActivityBuilder, ocsf_emit,
+    };
     use opentelemetry::Key;
     use opentelemetry::logs::{AnyValue, Severity};
     use opentelemetry_sdk::Resource;
@@ -541,6 +547,20 @@ mod tests {
     }
 
     #[test]
+    fn denied_network_activity_carries_its_action_id() {
+        let event = NetworkActivityBuilder::new(&event_context("sandbox-1"))
+            .activity(openshell_ocsf::ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Medium)
+            .dst_endpoint(Endpoint::from_domain("example.com", 443))
+            .build();
+        let record = record(&event, None);
+        assert_eq!(attribute(&record, "ocsf.action_id"), Some(AnyValue::Int(2)));
+        assert_eq!(native(&event)["action_id"].as_i64(), Some(2));
+    }
+
+    #[test]
     fn attributes_identify_the_event_and_its_sandbox() {
         let event = event("sandbox-1", SeverityId::Medium);
         let native = native(&event);
@@ -556,6 +576,8 @@ mod tests {
             native["activity_id"].as_i64().unwrap()
         );
         assert_eq!(int("ocsf.severity_id"), 3);
+        // A config state change records no action.
+        assert_eq!(attribute(&record, "ocsf.action_id"), None);
         assert_eq!(
             attribute(&record, "ocsf.metadata.uid"),
             Some(AnyValue::String(
