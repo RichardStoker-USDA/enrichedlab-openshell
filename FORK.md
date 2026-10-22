@@ -62,8 +62,11 @@ upstream's version of the pull request's code and keep only the adaptations list
   Kubernetes driver, carried on v0.1.5. Adaptations: supervisors receive their credentials at registration instead
   of in the bootstrap Secret, so the fork's rule that a supervisor sending telemetry elsewhere never receives the
   gateway's collector headers moved from the driver to the gateway (`ComputeDriverFactory::supervisors_use_gateway_collector`);
-  and the run receipt interceptor matches a warm pair's Pods through the pair id the Sandbox object names
-  (`openshell.ai/warm-pair-id`), since their boundary pair label is not the sandbox id.
+  the run receipt interceptor matches a warm pair's Pods through the pair id the Sandbox object names
+  (`openshell.ai/warm-pair-id`), since their boundary pair label is not the sandbox id; and v0.1.5's boundary open
+  check (`isolation_protocol::validate_open`, from the sandbox backend protocol) expects the sandbox the boundary's
+  authenticator bound when the boundary was provisioned without one, which the pull request does for every
+  Kubernetes boundary, cold or warm.
 
 When pushing, the script also disables any upstream workflow GitHub has enabled in the fork. Upstream's workflows
 expect NVIDIA's runners and secrets; the fork runs only its own `enrichedlab-*` workflows.
