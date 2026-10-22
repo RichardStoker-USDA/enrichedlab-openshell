@@ -36,11 +36,16 @@ pub fn negotiate(local: &PeerMetadata, remote: Option<PeerMetadata>) -> Result<(
 /// Check native driver coordinates against the protected runtime bootstrap.
 ///
 /// The caller must first authenticate the bearer against the provisioned
-/// sandbox and generation using `SandboxProtocolAuthenticator`.
+/// sandbox and generation using `SandboxProtocolAuthenticator`, and pass the
+/// sandbox it authenticated. A boundary provisioned for one sandbox names it
+/// in `config.boundary_id`. A prepared, unassigned boundary names none: its
+/// authenticator binds the sandbox of the first gateway-signed credential for
+/// its physical runtime, so the descriptor must name that sandbox.
 /// This only opens a route; attach, confirm, and start retain their authority.
 pub fn validate_open(
     request: &OpenBoundaryRequest,
     config: &BoundaryConfig,
+    authenticated_sandbox: &str,
 ) -> Result<(), tonic::Status> {
     if request.backend_name != crate::BACKEND_NAME
         || request.session_id != config.session_id.to_string()
@@ -52,7 +57,13 @@ pub fn validate_open(
     let descriptor: SandboxRuntimeDescriptor =
         serde_json::from_slice(&request.driver_descriptor)
             .map_err(|_| tonic::Status::invalid_argument("invalid OpenShell runtime descriptor"))?;
-    if descriptor.boundary_id != config.boundary_id
+    let expected_boundary = if config.boundary_id.is_empty() {
+        authenticated_sandbox
+    } else {
+        config.boundary_id.as_str()
+    };
+    if expected_boundary.is_empty()
+        || descriptor.boundary_id != expected_boundary
         || descriptor.generation != config.generation
         || descriptor.session_id != config.session_id
         || descriptor.workload_identity != config.workload_identity
@@ -114,4 +125,123 @@ pub fn response_chunk(
     Ok(ExchangeFrame {
         payload: Some(Payload::Response(response.to_proto()?)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::boundary_protocol::{
+        BoundaryListener, GatewayVerificationKey, SandboxTlsClientConfig, SandboxTlsServerConfig,
+        SandboxTransport,
+    };
+    use std::path::PathBuf;
+
+    const PREPARED_BINDING: [(&str, &str); 2] = [
+        (
+            "kubernetes.sandbox_resource_uid",
+            "11111111-1111-4111-8111-111111111111",
+        ),
+        (
+            "kubernetes.workload_pod_uid",
+            "22222222-2222-4222-8222-222222222222",
+        ),
+    ];
+
+    fn config(boundary_id: &str) -> BoundaryConfig {
+        BoundaryConfig {
+            boundary_id: boundary_id.to_string(),
+            generation: "generation-1".to_string(),
+            session_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
+            session_rotation: openshell_core::jwt::SessionRotation::new(1).unwrap(),
+            auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
+            gateway_id: "test-gateway".to_string(),
+            verification_keys: vec![GatewayVerificationKey {
+                key_id: "test-key".to_string(),
+                public_key_pem: "unused".to_string(),
+            }],
+            listener: BoundaryListener::Unix {
+                socket_path: PathBuf::from("/test/boundary.sock"),
+                tls: SandboxTlsServerConfig {
+                    certificate_chain_path: PathBuf::from("/test/boundary.crt"),
+                    private_key_path: PathBuf::from("/test/boundary.key"),
+                },
+            },
+            resource_claims: PREPARED_BINDING
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            resource_claim_files: std::collections::BTreeMap::new(),
+            workload_identity:
+                openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
+                    1500,
+                    1500,
+                    vec![1500],
+                    "sandbox".to_string(),
+                    "a".repeat(64),
+                )
+                .unwrap(),
+            provisioning_evidence:
+                openshell_isolation_interface::contract::ProvisioningEvidence::from_enforcement_evidence(
+                    "generation-1",
+                    b"test-fence",
+                )
+                .unwrap(),
+            child_env: std::collections::HashMap::new(),
+        }
+    }
+
+    fn open_request(config: &BoundaryConfig, boundary_id: &str) -> OpenBoundaryRequest {
+        let descriptor = SandboxRuntimeDescriptor {
+            boundary_id: boundary_id.to_string(),
+            generation: config.generation.clone(),
+            session_id: config.session_id,
+            workload_identity: config.workload_identity.clone(),
+            transport: SandboxTransport::Unix {
+                socket_path: PathBuf::from("/test/boundary.sock"),
+            },
+            tls: SandboxTlsClientConfig {
+                server_name: "test-boundary".to_string(),
+                trust_anchor_pem: "unused".to_string(),
+            },
+            host_gateway_ip: None,
+            resource_claims: config.resource_claims.clone(),
+            provisioning_evidence: config.provisioning_evidence.clone(),
+        };
+        OpenBoundaryRequest {
+            session_id: config.session_id.to_string(),
+            backend_name: crate::BACKEND_NAME.to_string(),
+            driver_descriptor: serde_json::to_vec(&descriptor).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_provisioned_boundary_opens_only_for_its_own_sandbox() {
+        let config = config("sandbox-a");
+        validate_open(&open_request(&config, "sandbox-a"), &config, "sandbox-a").unwrap();
+        let refused =
+            validate_open(&open_request(&config, "sandbox-b"), &config, "sandbox-a").unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn a_prepared_boundary_opens_for_the_sandbox_its_assignment_bound() {
+        let config = config("");
+        validate_open(&open_request(&config, "sandbox-a"), &config, "sandbox-a").unwrap();
+        for (named, authenticated) in [("sandbox-b", "sandbox-a"), ("", "sandbox-a"), ("", "")] {
+            let refused =
+                validate_open(&open_request(&config, named), &config, authenticated).unwrap_err();
+            assert_eq!(refused.code(), tonic::Code::PermissionDenied, "{named:?}");
+        }
+    }
+
+    #[test]
+    fn a_prepared_boundary_still_checks_every_other_coordinate() {
+        let config = config("");
+        let mut request = open_request(&config, "sandbox-a");
+        let mut descriptor: SandboxRuntimeDescriptor =
+            serde_json::from_slice(&request.driver_descriptor).unwrap();
+        descriptor.generation = "generation-2".to_string();
+        request.driver_descriptor = serde_json::to_vec(&descriptor).unwrap();
+        assert!(validate_open(&request, &config, "sandbox-a").is_err());
+    }
 }

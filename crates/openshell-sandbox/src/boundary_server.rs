@@ -839,6 +839,7 @@ mod linux {
             openshell_sandbox_backend::isolation_protocol::validate_open(
                 &request,
                 &self.runtime.config,
+                principal.session().sandbox_id.as_str(),
             )?;
             self.connection_expiry
                 .update(principal.session().expires_at);
