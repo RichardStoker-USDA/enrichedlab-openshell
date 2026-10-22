@@ -783,7 +783,9 @@ pub struct ComputeRuntime {
         Arc<OnceLock<Option<Arc<crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>>>>,
     restart_notify: Arc<Notify>,
     ssh_identities: Arc<OnceLock<crate::ssh_identity::SshIdentityStore>>,
-    supervisor_ocsf_headers: Arc<OnceLock<openshell_core::jwt::SecretOtlpHeaders>>,
+    /// The gateway's collector headers for supervisor OCSF export: unset until
+    /// configured, `None` once withheld because supervisors export elsewhere.
+    supervisor_ocsf_headers: Arc<OnceLock<Option<openshell_core::jwt::SecretOtlpHeaders>>>,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -919,8 +921,16 @@ impl ComputeRuntime {
         headers: Option<openshell_core::jwt::SecretOtlpHeaders>,
     ) {
         if let Some(headers) = headers {
-            let _ = self.supervisor_ocsf_headers.set(headers);
+            let _ = self.supervisor_ocsf_headers.set(Some(headers));
         }
+    }
+
+    /// Keep the gateway's collector headers out of every supervisor bundle,
+    /// whether the driver writes it at launch or the gateway returns it at
+    /// registration. Called before configuration, so a later configure is a
+    /// no-op.
+    pub(crate) fn withhold_supervisor_ocsf_headers(&self) {
+        let _ = self.supervisor_ocsf_headers.set(None);
     }
 
     pub(crate) async fn prepare_ssh_identity(
@@ -949,7 +959,8 @@ impl ComputeRuntime {
         let mut with_identity = sandbox.clone();
         self.prepare_ssh_identity(&mut with_identity, authentication)
             .await?;
-        authentication.supervisor.ocsf_otlp_headers = self.supervisor_ocsf_headers.get().cloned();
+        authentication.supervisor.ocsf_otlp_headers =
+            self.supervisor_ocsf_headers.get().cloned().flatten();
         Ok(())
     }
 
@@ -13097,6 +13108,38 @@ mod tests {
                 .map(openshell_core::jwt::SecretOtlpHeaders::expose_secret),
             Some("authorization=Bearer%20secret")
         );
+    }
+
+    #[tokio::test]
+    async fn withheld_collector_headers_never_reach_launch_bundles() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        runtime.withhold_supervisor_ocsf_headers();
+        runtime.configure_supervisor_ocsf_headers(Some(
+            openshell_core::jwt::SecretOtlpHeaders::new(
+                "authorization=Bearer%20secret".to_string(),
+            ),
+        ));
+        let sandbox = sandbox_record(
+            "sb-ocsf-withheld",
+            "sandbox-ocsf-withheld",
+            SandboxPhase::Stopped,
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .start_sandbox_authenticated(
+                sandbox.object_workspace(),
+                sandbox.object_name(),
+                Some(&test_session_authority()),
+            )
+            .await
+            .unwrap();
+
+        let authentications = driver.start_authentications();
+        let authentication: openshell_core::jwt::SandboxLaunchAuthentication =
+            serde_json::from_slice(&authentications[0]).unwrap();
+        assert!(authentication.supervisor.ocsf_otlp_headers.is_none());
     }
 
     #[tokio::test]

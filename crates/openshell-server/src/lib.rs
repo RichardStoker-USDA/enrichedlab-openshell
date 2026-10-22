@@ -1336,6 +1336,17 @@ pub trait ComputeDriverFactory: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Whether this driver's supervisors export telemetry to the gateway's own
+    /// collector, and so may receive the gateway's collector headers in their
+    /// credential bundles. A driver that sends supervisor telemetry elsewhere,
+    /// or nowhere, returns `false` so those headers never leave the gateway.
+    fn supervisors_use_gateway_collector(
+        &self,
+        _context: ComputeDriverConfigContext<'_>,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
     async fn build(&self, context: ComputeDriverBuildContext<'_>) -> Result<ComputeDriverInstance>;
 }
 
@@ -1731,6 +1742,18 @@ async fn build_compute_runtime(
         }
     };
     info!(driver = %driver.name(), "Using compute driver");
+    let supervisors_use_gateway_collector = match &driver {
+        ConfiguredComputeDriver::Registered(registration) => registration
+            .factory
+            .supervisors_use_gateway_collector(ComputeDriverConfigContext {
+                driver_name: &registration.name,
+                gateway_name: &config.name,
+                gateway_bind_address: config.bind_address,
+                gateway_log_level: &config.log_level,
+                driver_startup,
+            })?,
+        ConfiguredComputeDriver::Remote { .. } => true,
+    };
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
             let build_context = ComputeDriverBuildContext {
@@ -1807,6 +1830,9 @@ async fn build_compute_runtime(
             runtime.with_image_preparation_timeout(config.image_preparation_timeout_seconds)
         })
         .map_err(Error::config)?;
+    if !supervisors_use_gateway_collector {
+        runtime.withhold_supervisor_ocsf_headers();
+    }
     Ok(runtime.with_telemetry_compute_driver(telemetry_compute_driver))
 }
 
