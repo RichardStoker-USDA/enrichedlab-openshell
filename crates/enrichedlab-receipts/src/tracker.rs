@@ -33,9 +33,10 @@ pub const PENDING_TTL: Duration = Duration::from_hours(1);
 /// it is (or the report expires), so the order Pod, then Sandbox, then deletion keeps the Pod.
 #[derive(Default)]
 pub struct Pending {
-    /// Per sandbox: when its first report was held, and the reports accumulated as an observed record
-    /// would (each Pod's latest view, every image digest reported).
-    held: HashMap<String, (Instant, Observed)>,
+    /// Per sandbox and boundary pair: when its first report was held, and the reports accumulated as
+    /// an observed record would (each Pod's latest view, every image digest reported). Reports are kept
+    /// apart by pair so that only the pair the sandbox's object names joins its record.
+    held: HashMap<(String, String), (Instant, Observed)>,
     /// When (on this process's monotonic clock) the bounds last dropped a report. The dropped report's
     /// sandbox is unknown, so every sandbox established as this gateway's within the hold window after
     /// a drop is flagged, in its own records, as possibly missing a report. One instant cannot fill up,
@@ -50,15 +51,16 @@ impl Pending {
             .retain(|_, (since, _)| now.duration_since(*since) < PENDING_TTL);
     }
 
-    fn hold(&mut self, sandbox_id: &str, pod: PodFacts, at: &str, now: Instant) {
+    fn hold(&mut self, sandbox_id: &str, pair: &str, pod: PodFacts, at: &str, now: Instant) {
         self.purge(now);
-        if !self.held.contains_key(sandbox_id) && self.held.len() >= MAX_PENDING_SANDBOXES {
+        let key = (sandbox_id.to_string(), pair.to_string());
+        if !self.held.contains_key(&key) && self.held.len() >= MAX_PENDING_SANDBOXES {
             self.unheld(now);
             return;
         }
         let (_, held) = self
             .held
-            .entry(sandbox_id.to_string())
+            .entry(key)
             .or_insert_with(|| (now, Observed::new(sandbox_id, at)));
         let known = held.pods.iter().any(|known| known.name == pod.name);
         if !known && held.pods.len() >= crate::receipt::MAX_PODS {
@@ -79,13 +81,23 @@ impl Pending {
             .is_some_and(|dropped| now.saturating_duration_since(dropped) <= PENDING_TTL)
     }
 
-    /// The reports held for a sandbox, left in place until `release` after they are written.
-    fn held_for(&self, sandbox_id: &str) -> Option<Observed> {
-        self.held.get(sandbox_id).map(|(_, held)| held.clone())
+    /// The reports held for a sandbox's Pods of one boundary pair, left in place until `release`
+    /// after they are written.
+    fn held_for(&self, sandbox_id: &str, pair: &str) -> Option<Observed> {
+        self.held
+            .get(&(sandbox_id.to_string(), pair.to_string()))
+            .map(|(_, held)| held.clone())
     }
 
-    fn release(&mut self, sandbox_id: &str) {
-        self.held.remove(sandbox_id);
+    fn release(&mut self, sandbox_id: &str, pair: &str) {
+        self.held
+            .remove(&(sandbox_id.to_string(), pair.to_string()));
+    }
+
+    /// Drops every report held for a sandbox, whatever its pair: once the sandbox's object names its
+    /// pair, reports of any other pair do not belong to it.
+    fn release_all(&mut self, sandbox_id: &str) {
+        self.held.retain(|(id, _), _| id != sandbox_id);
     }
 }
 
@@ -123,14 +135,17 @@ impl Tracker {
         now: &str,
         unheld: bool,
     ) -> Result<(), StoreError> {
-        let Some(held) = pending.held_for(sandbox_id) else {
+        // A committed start names the sandbox but not a warm pair: only Pods of the pair the driver
+        // gives a sandbox it creates directly join now; a warm pair's Pods wait for the object.
+        let pair = sandbox_id.to_ascii_lowercase();
+        let Some(held) = pending.held_for(sandbox_id, &pair) else {
             return Ok(());
         };
         let mut observed = self.load_observed(sandbox_id, now)?;
         observed.absorb(&held);
         observed.pods_unheld |= unheld;
         self.store.write_observed(sandbox_id, &observed)?;
-        pending.release(sandbox_id);
+        pending.release(sandbox_id, &pair);
         Ok(())
     }
 
@@ -194,11 +209,11 @@ impl Tracker {
         }
         observed.last_seen_at = now.to_string();
         observed.sandbox = Some(object.clone());
-        if let Some(held) = pending.held_for(&object.sandbox_id) {
+        if let Some(held) = pending.held_for(&object.sandbox_id, &object.pod_pair()) {
             observed.absorb(&held);
         }
         self.store.write_observed(&object.sandbox_id, &observed)?;
-        pending.release(&object.sandbox_id);
+        pending.release_all(&object.sandbox_id);
         Ok(first)
     }
 
@@ -206,34 +221,49 @@ impl Tracker {
     /// Pods are watched across the namespace and may not name their gateway, so their facts are kept
     /// only for a sandbox this service already tracks: one its gateway-scoped watch saw, or one whose
     /// committed start its gateway sent. Others are ignored; false when ignored.
-    pub fn pod_seen(&self, sandbox_id: &str, pod: PodFacts, now: &str) -> Result<bool, StoreError> {
+    /// `pair` is the Pod's boundary pair label: it must be the one the sandbox's object names (its
+    /// warm pair, or the lowercased sandbox id). Before the object is seen, only a Pod of the directly
+    /// created form joins a committed start; others are held until the object names their pair.
+    pub fn pod_seen(
+        &self,
+        sandbox_id: &str,
+        pair: &str,
+        pod: PodFacts,
+        now: &str,
+    ) -> Result<bool, StoreError> {
         let mut pending = self.guard();
         if self.store.has_receipt(sandbox_id)? {
             return Ok(false);
         }
-        let watched = matches!(
-            self.store.read_observed::<Observed>(sandbox_id),
-            Ok(Some(observed)) if observed.sandbox_id == sandbox_id && observed.sandbox.is_some()
-        );
+        let object = match self.store.read_observed::<Observed>(sandbox_id) {
+            Ok(Some(observed)) if observed.sandbox_id == sandbox_id => observed.sandbox,
+            _ => None,
+        };
+        if let Some(object) = &object
+            && object.pod_pair() != pair
+        {
+            tracing::debug!(sandbox_id = %sandbox_id, "Pod of another pair ignored");
+            return Ok(false);
+        }
         let started = matches!(
             self.store.read_start::<StartRecord>(sandbox_id),
             Ok(Some(start)) if start.sandbox_id == sandbox_id
         );
-        if !watched && !started {
-            pending.hold(sandbox_id, pod, now, Instant::now());
+        if object.is_none() && !(started && pair == sandbox_id.to_ascii_lowercase()) {
+            pending.hold(sandbox_id, pair, pod, now, Instant::now());
             return Ok(false);
         }
         // Held reports are older than this one: merge them first and apply this one on top, in one
         // write, so a stale held view never replaces a newer recorded one.
         let mut observed = self.load_observed(sandbox_id, now)?;
-        let held = pending.held_for(sandbox_id);
+        let held = pending.held_for(sandbox_id, pair);
         if let Some(held) = &held {
             observed.absorb(held);
         }
         observed.record_pod(pod, now);
         self.store.write_observed(sandbox_id, &observed)?;
         if held.is_some() {
-            pending.release(sandbox_id);
+            pending.release(sandbox_id, pair);
         }
         Ok(true)
     }
@@ -471,6 +501,7 @@ mod tests {
             created_at: Some("2026-10-21T10:00:00Z".to_string()),
             deletion_timestamp: None,
             labels: BoundedMap::default(),
+            pair: None,
         }
     }
 
@@ -520,11 +551,17 @@ mod tests {
         assert!(f.tracker.record_start(&start(ID)).unwrap());
         f.tracker.sandbox_seen(object(ID), "t1").unwrap();
         f.tracker
-            .pod_seen(ID, pod("default--run-1", "sandbox", "img@sha256:1"), "t2")
+            .pod_seen(
+                ID,
+                &ID.to_ascii_lowercase(),
+                pod("default--run-1", "sandbox", "img@sha256:1"),
+                "t2",
+            )
             .unwrap();
         f.tracker
             .pod_seen(
                 ID,
+                &ID.to_ascii_lowercase(),
                 pod("os-supervisor-1", "supervisor", "sup@sha256:9"),
                 "t3",
             )
@@ -581,7 +618,12 @@ mod tests {
         f.tracker.record_start(&start(newer)).unwrap();
         assert!(
             f.tracker
-                .pod_seen(newer, pod("p", "sandbox", "img@sha256:1"), "t1")
+                .pod_seen(
+                    newer,
+                    &newer.to_ascii_lowercase(),
+                    pod("p", "sandbox", "img@sha256:1"),
+                    "t1"
+                )
                 .unwrap()
         );
         let present = HashSet::from([other.to_string()]);
@@ -650,7 +692,12 @@ mod tests {
         let f = fixture();
         assert!(
             !f.tracker
-                .pod_seen(ID, pod("p", "sandbox", "img@sha256:1"), "t1")
+                .pod_seen(
+                    ID,
+                    &ID.to_ascii_lowercase(),
+                    pod("p", "sandbox", "img@sha256:1"),
+                    "t1"
+                )
                 .unwrap()
         );
         assert!(
@@ -667,7 +714,12 @@ mod tests {
         );
         assert!(
             f.tracker
-                .pod_seen(ID, pod("p", "sandbox", "img@sha256:1"), "t4")
+                .pod_seen(
+                    ID,
+                    &ID.to_ascii_lowercase(),
+                    pod("p", "sandbox", "img@sha256:1"),
+                    "t4"
+                )
                 .unwrap()
         );
     }
@@ -677,7 +729,12 @@ mod tests {
         let f = fixture();
         assert!(
             !f.tracker
-                .pod_seen(ID, pod("w", "sandbox", "runtime@sha256:1"), "t1")
+                .pod_seen(
+                    ID,
+                    &ID.to_ascii_lowercase(),
+                    pod("w", "sandbox", "runtime@sha256:1"),
+                    "t1"
+                )
                 .unwrap(),
             "held, not yet kept"
         );
@@ -700,12 +757,70 @@ mod tests {
     fn a_pod_held_when_its_sandbox_is_deleted_goes_into_the_receipt() {
         let f = fixture();
         f.tracker
-            .pod_seen(ID, pod("w", "sandbox", "runtime@sha256:1"), "t1")
+            .pod_seen(
+                ID,
+                &ID.to_ascii_lowercase(),
+                pod("w", "sandbox", "runtime@sha256:1"),
+                "t1",
+            )
             .unwrap();
         f.tracker
             .sandbox_ended(ID, Some(object(ID)), Observation::Deleted, "t2")
             .unwrap();
         assert_eq!(receipt(&f, ID).pods.len(), 1);
+    }
+
+    #[test]
+    fn a_warm_pairs_pods_join_once_the_object_names_their_pair() {
+        let f = fixture();
+        let warm = "9f2c4e6a8b0d1f3e5a7c9e1b";
+        // The gateway's committed start alone does not let a warm pair's Pod in: it is held.
+        f.tracker.record_start(&start(ID)).unwrap();
+        assert!(
+            !f.tracker
+                .pod_seen(ID, warm, pod("w", "sandbox", "img@sha256:warm"), "t1")
+                .unwrap()
+        );
+        // A Pod of another pair claiming the same sandbox is held apart and never joins.
+        assert!(
+            !f.tracker
+                .pod_seen(
+                    ID,
+                    "0000000000000000000000ff",
+                    pod("x", "sandbox", "img@sha256:foreign"),
+                    "t1"
+                )
+                .unwrap()
+        );
+        let mut assigned = object(ID);
+        assigned.pair = Some(warm.to_string());
+        f.tracker.sandbox_seen(assigned, "t2").unwrap();
+        let observed: Observed = f.tracker.store().read_observed(ID).unwrap().unwrap();
+        assert_eq!(
+            observed
+                .pods
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["w"]
+        );
+        assert!(observed.images_seen.iter().all(|i| !i.contains("foreign")));
+        // Once the object names the pair, a later Pod of another pair is ignored.
+        assert!(
+            !f.tracker
+                .pod_seen(
+                    ID,
+                    &ID.to_ascii_lowercase(),
+                    pod("cold", "sandbox", "img@sha256:cold"),
+                    "t3"
+                )
+                .unwrap()
+        );
+        assert!(
+            f.tracker
+                .pod_seen(ID, warm, pod("w", "sandbox", "img@sha256:warm"), "t3")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -715,13 +830,19 @@ mod tests {
             f.tracker
                 .pod_seen(
                     &format!("other-{i}"),
+                    &format!("other-{i}"),
                     pod("p", "sandbox", "x@sha256:1"),
                     "t0",
                 )
                 .unwrap();
         }
         f.tracker
-            .pod_seen(ID, pod("w", "sandbox", "runtime@sha256:1"), "t1")
+            .pod_seen(
+                ID,
+                &ID.to_ascii_lowercase(),
+                pod("w", "sandbox", "runtime@sha256:1"),
+                "t1",
+            )
             .unwrap();
         f.tracker.sandbox_seen(object(ID), "t2").unwrap();
         f.tracker
@@ -762,7 +883,12 @@ mod tests {
     fn a_failed_write_keeps_the_held_reports() {
         let f = fixture();
         f.tracker
-            .pod_seen(ID, pod("w", "sandbox", "runtime@sha256:1"), "t1")
+            .pod_seen(
+                ID,
+                &ID.to_ascii_lowercase(),
+                pod("w", "sandbox", "runtime@sha256:1"),
+                "t1",
+            )
             .unwrap();
         let observed = f.root.join("observed");
         fs::set_permissions(
@@ -791,10 +917,20 @@ mod tests {
     fn two_early_reports_of_one_pod_keep_both_digests() {
         let f = fixture();
         f.tracker
-            .pod_seen(ID, pod("w", "sandbox", "runtime@sha256:1"), "t1")
+            .pod_seen(
+                ID,
+                &ID.to_ascii_lowercase(),
+                pod("w", "sandbox", "runtime@sha256:1"),
+                "t1",
+            )
             .unwrap();
         f.tracker
-            .pod_seen(ID, pod("w", "sandbox", "runtime@sha256:2"), "t2")
+            .pod_seen(
+                ID,
+                &ID.to_ascii_lowercase(),
+                pod("w", "sandbox", "runtime@sha256:2"),
+                "t2",
+            )
             .unwrap();
         f.tracker.sandbox_seen(object(ID), "t3").unwrap();
         f.tracker
@@ -813,7 +949,9 @@ mod tests {
         let f = fixture();
         let mut early = pod("w", "sandbox", "runtime@sha256:1");
         early.phase = Some("Pending".to_string());
-        f.tracker.pod_seen(ID, early, "t1").unwrap();
+        f.tracker
+            .pod_seen(ID, &ID.to_ascii_lowercase(), early, "t1")
+            .unwrap();
         let observed = f.root.join("observed");
         fs::set_permissions(
             &observed,
@@ -831,7 +969,11 @@ mod tests {
         .unwrap();
         let mut late = pod("w", "sandbox", "runtime@sha256:2");
         late.phase = Some("Failed".to_string());
-        assert!(f.tracker.pod_seen(ID, late, "t2").unwrap());
+        assert!(
+            f.tracker
+                .pod_seen(ID, &ID.to_ascii_lowercase(), late, "t2")
+                .unwrap()
+        );
         f.tracker
             .sandbox_ended(ID, None, Observation::Deleted, "t3")
             .unwrap();
@@ -852,7 +994,12 @@ mod tests {
         let f = fixture();
         f.tracker.guard().last_unheld = Some(Instant::now());
         f.tracker
-            .pod_seen(ID, pod("s", "supervisor", "sup@sha256:1"), "t1")
+            .pod_seen(
+                ID,
+                &ID.to_ascii_lowercase(),
+                pod("s", "supervisor", "sup@sha256:1"),
+                "t1",
+            )
             .unwrap();
         f.tracker
             .sandbox_ended(ID, Some(object(ID)), Observation::Deleted, "t2")
@@ -869,7 +1016,13 @@ mod tests {
     fn held_reports_expire() {
         let mut pending = Pending::default();
         let then = Instant::now();
-        pending.hold(ID, pod("w", "sandbox", "x@sha256:1"), "t0", then);
+        pending.hold(
+            ID,
+            &ID.to_ascii_lowercase(),
+            pod("w", "sandbox", "x@sha256:1"),
+            "t0",
+            then,
+        );
         pending.purge(then + PENDING_TTL.checked_sub(Duration::from_secs(1)).unwrap());
         assert_eq!(pending.held.len(), 1);
         pending.purge(then + PENDING_TTL);
@@ -890,7 +1043,12 @@ mod tests {
         let other = "0d3c5d0e-6a0f-4c2e-9a51-000000000002";
         f.tracker.sandbox_seen(object(other), "t1").unwrap();
         f.tracker
-            .pod_seen(other, pod("p", "sandbox", "img@sha256:1"), "t2")
+            .pod_seen(
+                other,
+                &other.to_ascii_lowercase(),
+                pod("p", "sandbox", "img@sha256:1"),
+                "t2",
+            )
             .unwrap();
         f.tracker
             .sandbox_ended(other, None, Observation::Deleted, "t3")

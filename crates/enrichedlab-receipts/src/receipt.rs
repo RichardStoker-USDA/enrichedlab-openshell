@@ -208,6 +208,20 @@ pub struct SandboxObject {
     pub created_at: Option<String>,
     pub deletion_timestamp: Option<String>,
     pub labels: BoundedMap,
+    /// The warm pair a warm pool prepared and the gateway assigned to this sandbox: the boundary pair
+    /// label of its Pods. Absent for a sandbox the driver created directly, whose Pods carry the
+    /// lowercased sandbox id instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair: Option<String>,
+}
+
+impl SandboxObject {
+    /// The boundary pair label this sandbox's Pods carry.
+    pub fn pod_pair(&self) -> String {
+        self.pair
+            .clone()
+            .unwrap_or_else(|| self.sandbox_id.to_ascii_lowercase())
+    }
 }
 
 /// What Kubernetes showed about a sandbox while it ran: the last view of its object and of each Pod,
