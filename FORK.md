@@ -52,6 +52,19 @@ conflict is listed here and checked by hand on every merge:
 - Upstream `main` after v0.1.5 creates every supervisor Pod in `create_sandbox_runtime_supervisor`; the fixed
   labels and annotations are applied there (`apply_fixed_pod_metadata`), as on `enrichedlab/next`.
 
+## Carried upstream pull requests
+
+A pull request upstream has not released yet may be carried on `enrichedlab/main` when a site needs it now. It keeps
+the upstream design and interfaces, so the release that contains it replaces the carried commit: on that merge, take
+upstream's version of the pull request's code and keep only the adaptations listed here.
+
+- [NVIDIA/OpenShell#3508](https://github.com/NVIDIA/OpenShell/pull/3508), template-driven warm pooling for the
+  Kubernetes driver, carried on v0.1.5. Adaptations: supervisors receive their credentials at registration instead
+  of in the bootstrap Secret, so the fork's rule that a supervisor sending telemetry elsewhere never receives the
+  gateway's collector headers moved from the driver to the gateway (`ComputeDriverFactory::supervisors_use_gateway_collector`);
+  and the run receipt interceptor matches a warm pair's Pods through the pair id the Sandbox object names
+  (`openshell.ai/warm-pair-id`), since their boundary pair label is not the sandbox id.
+
 When pushing, the script also disables any upstream workflow GitHub has enabled in the fork. Upstream's workflows
 expect NVIDIA's runners and secrets; the fork runs only its own `enrichedlab-*` workflows.
 
