@@ -1010,6 +1010,7 @@ pub(crate) async fn run_server(
         gateway_members::MEMBER_REFRESH_INTERVAL,
         shutdown_rx.clone(),
     );
+    compute::warm_pool::spawn(state.clone(), shutdown_rx.clone());
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_profile_sources::spawn_refresh(state.clone());
