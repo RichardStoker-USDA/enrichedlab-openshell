@@ -13,10 +13,16 @@ release:
   namespace: my-namespace
 
 tests:
-  - it: permits registration to read prepared proxy Secrets in shared mode
+  - it: permits registration to read prepared proxy Secrets by name in shared mode
     template: templates/role.yaml
     asserts:
       - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create", "get", "delete"]
+      - notContains:
           path: rules
           content:
             apiGroups: [""]

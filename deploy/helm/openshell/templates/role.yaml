@@ -64,8 +64,10 @@ rules:
     verbs: ["create", "get"]
   - apiGroups: [""]
     resources: ["secrets"]
-    # Registration and interrupted preparation read bootstrap material.
-    verbs: ["create", "get", "list", "delete"]
+    # Registration and interrupted preparation read bootstrap material by
+    # exact name. Listing Secrets is needed only for managed-mode journal
+    # cleanup, which the managed ClusterRole grants.
+    verbs: ["create", "get", "delete"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get"]
