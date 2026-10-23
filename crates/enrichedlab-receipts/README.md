@@ -82,10 +82,11 @@ OnRootMismatch` so a restart does not rewrite every receipt's ownership. A start
 written to a temporary file, flushed, and hard-linked to its name, so the name never holds a partial record and an
 existing one is never replaced. An existing receipt is checked against its digest file before its sandbox's working
 records are removed; a digest file lost to a crash between the two writes is written again. At most 4,096 start and 4,096 observed
-records are kept at once. The store keeps at most `--max-receipts` receipts (default 20,000): while it holds that many,
-a new sandbox start is refused (the gateway's binding is observe-only, so the sandbox runs without a receipt and the
-start failure is counted), and every receipt already written, or due for a sandbox already tracked, is kept. Receipts
-therefore never exceed the limit by more than the 4,096 tracked sandboxes. Size the limit to the volume. Without
+records are kept at once. The store keeps at most `--max-receipts` receipts (default 20,000): while it holds that many
+it admits no new sandbox by any path (no start record, no first observed record from the watch, no receipt for a
+sandbox it never tracked; the gateway's binding is observe-only, so such a sandbox runs without a receipt and the
+failure is counted), and every receipt already written, or due for a sandbox tracked before it filled, is kept.
+Receipts therefore never exceed the limit by more than the 8,192 tracked sandboxes. Size the limit to the volume. Without
 forwarding, receipts are kept until removed by whatever retention applies to the volume; with forwarding, see below.
 
 ## Metrics
@@ -141,8 +142,10 @@ across gateway restarts. Once the gateway runs, an unavailable service only lose
 With `--evidence-endpoint` set, the service also sends each receipt to an EnrichedLab research record
 (`enrichedlab.evidence.v1.EvidenceAppendService`, generated from the contracts descriptor in `proto/`). Each receipt
 written is queued as an empty marker in `<state>/outbox/`; at start the service also queues every receipt that has no
-outcome in `<state>/forwarded/`, and lists the receipts the record holds; that one listing is bounded by the receipt
-limit and is retried every pass until it succeeds. From then on the queue lives in memory and every write updates it:
+outcome in `<state>/forwarded/`, lists the receipts the record holds, and removes markers whose receipt is gone or
+already answered. That listing reads at most the limit plus 8,192 entries and refuses a store holding more (keeping
+its files until the operator raises the limit); a directory it cannot read fully fails it, and it is retried every
+pass until it succeeds. An outcome it cannot read is skipped: that receipt is neither sent nor removed. From then on the queue lives in memory and every write updates it:
 every 30 seconds the service takes up to 64 receipts from the front of the queue and sends each one's exact bytes and
 SHA-256 as a `sandbox.receipt` record. No pass lists a directory, so its work does not grow with the number of
 receipts kept.

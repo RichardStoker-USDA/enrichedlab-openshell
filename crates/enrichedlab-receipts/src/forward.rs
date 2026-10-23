@@ -424,7 +424,8 @@ pub async fn run(
                 delay = (delay * 2).min(Duration::from_mins(10));
             }
         }
-        if recovered && pruned_at.is_none_or(|at| at.elapsed() >= interval) {
+        // Retention reads only receipts the record is known to hold, so it need not wait for recovery.
+        if pruned_at.is_none_or(|at| at.elapsed() >= interval) {
             pruned_at = Some(std::time::Instant::now());
             let before = std::time::SystemTime::now()
                 .checked_sub(destination.retention)

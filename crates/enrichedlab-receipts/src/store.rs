@@ -34,8 +34,9 @@ use sha2::{Digest, Sha256};
 pub const MAX_TRACKED: usize = 4096;
 /// Receipts kept at once unless the operator sets another limit.
 ///
-/// While the store holds this many, a new sandbox start is refused, so receipts never exceed it by
-/// more than the sandboxes already tracked (`MAX_TRACKED`).
+/// While the store holds this many, no new sandbox is admitted (no start record, no first observed
+/// record, no receipt for a sandbox it never tracked), so receipts exceed it by at most the sandboxes
+/// already tracked: `2 * MAX_TRACKED`.
 pub const DEFAULT_RECEIPT_LIMIT: usize = 20_000;
 /// The largest record read back (a bounded receipt is far smaller).
 const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
@@ -127,7 +128,7 @@ impl Store {
             ensure_private_dir(&root.join(sub))?;
             remove_temporaries(&root.join(sub))?;
         }
-        let receipts = receipt_ids(&root.join("receipts"))?.len();
+        let receipts = receipt_ids(&root.join("receipts"), None)?.len();
         Ok(Self {
             root,
             _lock: Arc::new(lock),
@@ -171,6 +172,21 @@ impl Store {
         self.receipt_limit
     }
 
+    /// The most receipts a store under this limit can hold: the limit and every sandbox tracked when
+    /// it filled. Recovery reads no more than this.
+    fn receipt_bound(&self) -> usize {
+        self.receipt_limit.saturating_add(2 * MAX_TRACKED)
+    }
+
+    fn full(&self) -> bool {
+        self.receipt_count() >= self.receipt_limit
+    }
+
+    /// A sandbox tracked before the store filled: it has a start or an observed record.
+    fn tracked(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.path("starts", id)?.exists() || self.path("observed", id)?.exists())
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -202,7 +218,7 @@ impl Store {
         }
         // A full store refuses new sandboxes rather than any receipt of one already tracked, so no
         // receipt waiting for the record is ever dropped to make room.
-        if self.receipt_count() >= self.receipt_limit {
+        if self.full() {
             return Err(StoreError::Full("receipt"));
         }
         let bytes = serde_json::to_vec_pretty(record).map_err(StoreError::Encode)?;
@@ -241,6 +257,10 @@ impl Store {
         let path = self.path("observed", id)?;
         if !path.exists() && self.count("observed")? >= MAX_TRACKED {
             return Err(StoreError::Full("observed"));
+        }
+        // A sandbox first seen through the watch is admitted like a start: not while the store is full.
+        if !path.exists() && self.full() && !self.path("starts", id)?.exists() {
+            return Err(StoreError::Full("receipt"));
         }
         let bytes = serde_json::to_vec_pretty(record).map_err(StoreError::Encode)?;
         replace_file(&path, &bytes)
@@ -281,6 +301,10 @@ impl Store {
     pub fn write_receipt(&self, id: &str, bytes: &[u8]) -> Result<WrittenReceipt, StoreError> {
         let path = self.path("receipts", id)?;
         let sidecar = path.with_extension("json.sha256");
+        // A full store writes receipts only for sandboxes it tracked before it filled.
+        if !path.exists() && self.full() && !self.tracked(id)? {
+            return Err(StoreError::Full("receipt"));
+        }
         let written = if path.exists() || !publish_new(&path, &format!("{id}.json"), bytes)? {
             existing_receipt(id, path, &sidecar)?
         } else {
@@ -330,20 +354,35 @@ impl Store {
     }
 
     /// Rebuilds the forwarding queue from disk: every receipt with no outcome is queued (its marker
-    /// written again if a crash lost it), oldest first, and every receipt the record holds is listed
-    /// for retention. Lists the receipts and outcomes once, so its work is bounded by the receipt
-    /// limit; the forwarder runs it at start and again each pass until it succeeds.
+    /// written again if a crash lost it), oldest first; every receipt the record holds is listed for
+    /// retention; and every marker whose receipt is gone or already has an outcome is removed.
+    ///
+    /// It reads at most the store's bound of receipts and markers (the receipt limit and the sandboxes
+    /// tracked when it filled) and refuses a store holding more, which keeps its files for the operator
+    /// to raise the limit. A directory that cannot be read fully fails the whole call, so it is run
+    /// again; an outcome that cannot be read is skipped (its receipt is neither sent nor removed) and
+    /// does not hold back the others. The forwarder runs it at start and each pass until it succeeds.
     pub fn recover_outbox(&self) -> Result<usize, StoreError> {
+        let bound = self.receipt_bound();
         let mut pending = Vec::new();
         let mut held = Vec::new();
-        for id in receipt_ids(&self.root.join("receipts"))? {
+        for id in receipt_ids(&self.root.join("receipts"), Some(bound))? {
             let outcome = self.path("forwarded", &id)?;
             match fs::metadata(&outcome) {
                 Ok(metadata) => {
-                    let value: Option<serde_json::Value> = read_record(&outcome)?;
-                    if matches!(value.as_ref().and_then(|v| v.get("record")), Some(record) if !record.is_null())
-                    {
-                        held.push((metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH), id));
+                    // Already answered: never queued again, and its marker (left by a crash between the
+                    // outcome and the marker's removal) goes.
+                    self.dequeue(&id)?;
+                    if let Ok(value) = read_record::<serde_json::Value>(&outcome) {
+                        if matches!(value.as_ref().and_then(|v| v.get("record")), Some(record) if !record.is_null())
+                        {
+                            held.push((metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH), id));
+                        }
+                    } else {
+                        tracing::warn!(
+                            "a forwarding outcome cannot be read; its receipt is kept and not sent"
+                        );
+                        crate::telemetry::failure("forward");
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -360,6 +399,20 @@ impl Store {
                         source: error,
                     });
                 }
+            }
+        }
+        // Markers whose receipt is gone.
+        let outbox = self.root.join("outbox");
+        let mut seen = 0usize;
+        for entry in fs::read_dir(&outbox).map_err(io_error(&outbox))? {
+            let entry = entry.map_err(io_error(&outbox))?;
+            seen += 1;
+            if seen > bound {
+                return Err(StoreError::Full("receipt"));
+            }
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if valid_sandbox_id(&id) && !self.path("receipts", &id)?.exists() {
+                self.dequeue(&id)?;
             }
         }
         pending.sort();
@@ -539,20 +592,21 @@ impl Store {
     }
 }
 
-/// The sandbox ids of the receipts in `dir`.
-fn receipt_ids(dir: &Path) -> Result<Vec<String>, StoreError> {
-    Ok(fs::read_dir(dir)
-        .map_err(io_error(dir))?
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .strip_suffix(".json")
-                .filter(|id| valid_sandbox_id(id))
-                .map(str::to_string)
-        })
-        .collect())
+/// The sandbox ids of the receipts in `dir`, every entry read or the call fails; more than `bound`
+/// receipts is `Full`.
+fn receipt_ids(dir: &Path, bound: Option<usize>) -> Result<Vec<String>, StoreError> {
+    let mut ids = Vec::new();
+    for entry in fs::read_dir(dir).map_err(io_error(dir))? {
+        let entry = entry.map_err(io_error(dir))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(id) = name.strip_suffix(".json").filter(|id| valid_sandbox_id(id)) {
+            ids.push(id.to_string());
+            if bound.is_some_and(|bound| ids.len() > bound) {
+                return Err(StoreError::Full("receipt"));
+            }
+        }
+    }
+    Ok(ids)
 }
 
 fn digest_line(sha256: &str, id: &str) -> String {

@@ -653,6 +653,140 @@ async fn a_full_store_refuses_new_sandboxes_and_keeps_every_receipt() {
 }
 
 #[tokio::test]
+async fn recovery_skips_an_unreadable_outcome_and_clears_stale_markers() {
+    let root = temp_root();
+    {
+        let plain = Store::open(&root).unwrap();
+        for id in ["pending", "answered", "crashed"] {
+            plain
+                .write_receipt(id, &receipt(id, "2026-10-23T12:00:00Z"))
+                .unwrap();
+        }
+        plain
+            .write_forwarded("answered", &serde_json::json!({"record": {"sequence": 1}}))
+            .unwrap();
+        plain
+            .write_forwarded("crashed", &serde_json::json!({"record": {"sequence": 2}}))
+            .unwrap();
+    }
+    // A crash between an outcome and its marker's removal, and a marker whose receipt is gone.
+    fs::write(root.join("outbox/crashed"), b"").unwrap();
+    fs::write(root.join("outbox/vanished"), b"").unwrap();
+    // An outcome that cannot be read.
+    let unreadable = root.join("forwarded/answered.json");
+    fs::set_permissions(
+        &unreadable,
+        std::os::unix::fs::PermissionsExt::from_mode(0o000),
+    )
+    .unwrap();
+    let store = Store::open(&root).unwrap().with_outbox();
+    assert_eq!(store.recover_outbox().unwrap(), 1);
+    assert_eq!(store.next_batch(64), vec!["pending".to_string()]);
+    assert!(!root.join("outbox/crashed").exists());
+    assert!(!root.join("outbox/vanished").exists());
+    assert!(root.join("outbox/pending").exists());
+    // The unreadable outcome's receipt is kept; the readable recorded one is listed for retention.
+    let later = std::time::SystemTime::now() + std::time::Duration::from_hours(24 * 365 * 10);
+    assert_eq!(store.prune_forwarded(later, 1_000).unwrap(), 1);
+    assert!(root.join("receipts/answered.json").exists());
+    assert!(!root.join("receipts/crashed.json").exists());
+    fs::set_permissions(
+        &unreadable,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+    drop(store);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn a_full_store_admits_no_sandbox_by_any_path() {
+    let root = temp_root();
+    let store = Store::open(&root).unwrap().with_receipt_limit(1);
+    // Tracked before the store filled: one by its start, one by the watch.
+    store
+        .write_start("started", &serde_json::json!({"sandbox_id": "started"}))
+        .unwrap();
+    store
+        .write_observed("watched", &serde_json::json!({"sandbox_id": "watched"}))
+        .unwrap();
+    store
+        .write_receipt("filler", &receipt("filler", "2026-10-23T12:00:00Z"))
+        .unwrap();
+    // Full: no new sandbox through the start, the watch, or the deletion of one never seen.
+    for refused in [
+        store
+            .write_start("new-start", &serde_json::json!({"sandbox_id": "new-start"}))
+            .map(|_| ()),
+        store.write_observed("new-watch", &serde_json::json!({"sandbox_id": "new-watch"})),
+        store
+            .write_receipt("never-seen", &receipt("never-seen", "2026-10-23T12:00:00Z"))
+            .map(|_| ()),
+    ] {
+        assert!(matches!(
+            refused,
+            Err(crate::store::StoreError::Full("receipt"))
+        ));
+    }
+    // Repeated create and delete at capacity adds nothing.
+    for i in 0..50 {
+        let id = format!("cycle-{i}");
+        assert!(store.write_observed(&id, &serde_json::json!({})).is_err());
+        assert!(
+            store
+                .write_receipt(&id, &receipt(&id, "2026-10-23T12:00:00Z"))
+                .is_err()
+        );
+    }
+    // The sandboxes admitted before it filled still get their receipts, and updates to them still land.
+    store
+        .write_observed(
+            "watched",
+            &serde_json::json!({"sandbox_id": "watched", "later": true}),
+        )
+        .unwrap();
+    for id in ["started", "watched"] {
+        store
+            .write_receipt(id, &receipt(id, "2026-10-23T12:00:00Z"))
+            .unwrap();
+    }
+    assert_eq!(store.receipt_count(), 3);
+    assert_eq!(fs::read_dir(root.join("receipts")).unwrap().count(), 6);
+    drop(store);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn recovery_refuses_a_store_past_its_bound_and_keeps_every_file() {
+    let root = temp_root();
+    drop(Store::open(&root).unwrap());
+    // A store written before the limit existed, past the limit and every tracked sandbox.
+    let over = 1 + 2 * crate::store::MAX_TRACKED + 1;
+    for i in 0..over {
+        fs::write(root.join(format!("receipts/old-{i}.json")), b"{}").unwrap();
+    }
+    let store = Store::open(&root)
+        .unwrap()
+        .with_outbox()
+        .with_receipt_limit(1);
+    assert!(matches!(
+        store.recover_outbox(),
+        Err(crate::store::StoreError::Full("receipt"))
+    ));
+    assert_eq!(store.outbox_len(), 0);
+    assert_eq!(fs::read_dir(root.join("receipts")).unwrap().count(), over);
+    // Raised to cover it, the same store recovers.
+    drop(store);
+    let store = Store::open(&root)
+        .unwrap()
+        .with_outbox()
+        .with_receipt_limit(over);
+    assert_eq!(store.recover_outbox().unwrap(), over);
+    drop(store);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn forwarded_receipts_leave_the_volume_after_retention_and_refusals_stay() {
     let mut h = harness().await;
     for id in ["sandbox-recorded", "sandbox-recent", "sandbox-refused"] {
