@@ -86,7 +86,9 @@ records are kept at once. The store keeps at most `--max-receipts` receipts (def
 it admits no new sandbox by any path (no start record, no first observed record from the watch, no receipt for a
 sandbox it never tracked; the gateway's binding is observe-only, so such a sandbox runs without a receipt and the
 failure is counted), and every receipt already written, or due for a sandbox tracked before it filled, is kept.
-Receipts therefore never exceed the limit by more than the 8,192 tracked sandboxes. Size the limit to the volume. Without
+Receipts therefore never exceed the limit by more than the 8,192 tracked sandboxes. Size the limit to the volume. At
+start the service counts the receipts already there, reading no more than the limit plus 8,192; a store holding more
+(possible only if the limit was lowered) stops it from starting and keeps every file until the limit is raised. Without
 forwarding, receipts are kept until removed by whatever retention applies to the volume; with forwarding, see below.
 
 ## Metrics

@@ -626,7 +626,7 @@ async fn an_unavailable_record_puts_the_rest_of_the_batch_back_in_order() {
 #[tokio::test]
 async fn a_full_store_refuses_new_sandboxes_and_keeps_every_receipt() {
     let root = temp_root();
-    let store = Store::open(&root).unwrap().with_receipt_limit(2);
+    let store = Store::open_with_limit(&root, 2).unwrap();
     store
         .write_start("tracked", &serde_json::json!({"sandbox_id": "tracked"}))
         .unwrap();
@@ -646,7 +646,7 @@ async fn a_full_store_refuses_new_sandboxes_and_keeps_every_receipt() {
     assert_eq!(store.receipt_count(), 3);
     // A reopened store counts what is there.
     drop(store);
-    let store = Store::open(&root).unwrap().with_receipt_limit(2);
+    let store = Store::open_with_limit(&root, 2).unwrap();
     assert_eq!(store.receipt_count(), 3);
     drop(store);
     let _ = fs::remove_dir_all(&root);
@@ -702,7 +702,7 @@ async fn recovery_skips_an_unreadable_outcome_and_clears_stale_markers() {
 #[tokio::test]
 async fn a_full_store_admits_no_sandbox_by_any_path() {
     let root = temp_root();
-    let store = Store::open(&root).unwrap().with_receipt_limit(1);
+    let store = Store::open_with_limit(&root, 1).unwrap();
     // Tracked before the store filled: one by its start, one by the watch.
     store
         .write_start("started", &serde_json::json!({"sandbox_id": "started"}))
@@ -765,22 +765,14 @@ async fn recovery_refuses_a_store_past_its_bound_and_keeps_every_file() {
     for i in 0..over {
         fs::write(root.join(format!("receipts/old-{i}.json")), b"{}").unwrap();
     }
-    let store = Store::open(&root)
-        .unwrap()
-        .with_outbox()
-        .with_receipt_limit(1);
+    // Opening it under that limit stops counting at the bound and refuses, keeping every file.
     assert!(matches!(
-        store.recover_outbox(),
+        Store::open_with_limit(&root, 1),
         Err(crate::store::StoreError::Full("receipt"))
     ));
-    assert_eq!(store.outbox_len(), 0);
     assert_eq!(fs::read_dir(root.join("receipts")).unwrap().count(), over);
-    // Raised to cover it, the same store recovers.
-    drop(store);
-    let store = Store::open(&root)
-        .unwrap()
-        .with_outbox()
-        .with_receipt_limit(over);
+    // Raised to cover it, the same store opens and recovers.
+    let store = Store::open_with_limit(&root, over).unwrap().with_outbox();
     assert_eq!(store.recover_outbox().unwrap(), over);
     drop(store);
     let _ = fs::remove_dir_all(&root);

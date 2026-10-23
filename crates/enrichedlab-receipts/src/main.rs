@@ -120,8 +120,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     enrichedlab_receipts::telemetry::install(args.metrics_listen)?;
-    let store = Store::open(&args.state_dir)?
-        .with_receipt_limit(usize::try_from(args.max_receipts).unwrap_or(usize::MAX));
+    let store = Store::open_with_limit(
+        &args.state_dir,
+        usize::try_from(args.max_receipts).unwrap_or(usize::MAX),
+    )?;
     enrichedlab_receipts::telemetry::stored(store.receipt_count(), store.receipt_limit());
     // Receipts are queued for the research record only when one is configured.
     let store = if args.evidence_endpoint.is_some() {

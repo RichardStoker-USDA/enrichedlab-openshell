@@ -119,8 +119,18 @@ struct Ledger {
 
 impl Store {
     /// Opens (creating when absent) the store and its subdirectories, refusing a root that others can
-    /// read or write.
+    /// read or write, with the default receipt limit.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        Self::open_with_limit(root, DEFAULT_RECEIPT_LIMIT)
+    }
+
+    /// Opens the store with the operator's receipt limit. Counting the receipts already there reads at
+    /// most the store's bound (the limit and the sandboxes tracked when it filled) and refuses a store
+    /// holding more, keeping its files until the limit is raised.
+    pub fn open_with_limit(
+        root: impl Into<PathBuf>,
+        receipt_limit: usize,
+    ) -> Result<Self, StoreError> {
         let root = root.into();
         ensure_private_dir(&root)?;
         let lock = lock_store(&root)?;
@@ -128,12 +138,15 @@ impl Store {
             ensure_private_dir(&root.join(sub))?;
             remove_temporaries(&root.join(sub))?;
         }
-        let receipts = receipt_ids(&root.join("receipts"), None)?.len();
+        let receipts = count_receipts(
+            &root.join("receipts"),
+            receipt_limit.saturating_add(2 * MAX_TRACKED),
+        )?;
         Ok(Self {
             root,
             _lock: Arc::new(lock),
             outbox: false,
-            receipt_limit: DEFAULT_RECEIPT_LIMIT,
+            receipt_limit,
             ledger: Arc::new(Mutex::new(Ledger {
                 receipts,
                 ..Ledger::default()
@@ -145,14 +158,6 @@ impl Store {
     #[must_use]
     pub fn with_outbox(mut self) -> Self {
         self.outbox = true;
-        self
-    }
-
-    /// Sets how many receipts the store keeps before refusing new sandbox starts. Set before the
-    /// store is shared.
-    #[must_use]
-    pub fn with_receipt_limit(mut self, limit: usize) -> Self {
-        self.receipt_limit = limit;
         self
     }
 
@@ -590,6 +595,27 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// How many receipts `dir` holds, reading every entry (or failing) but no more than `bound` receipts:
+/// more is `Full`. Holds no list in memory.
+fn count_receipts(dir: &Path, bound: usize) -> Result<usize, StoreError> {
+    let mut count = 0usize;
+    for entry in fs::read_dir(dir).map_err(io_error(dir))? {
+        let entry = entry.map_err(io_error(dir))?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .strip_suffix(".json")
+            .is_some_and(valid_sandbox_id)
+        {
+            count += 1;
+            if count > bound {
+                return Err(StoreError::Full("receipt"));
+            }
+        }
+    }
+    Ok(count)
 }
 
 /// The sandbox ids of the receipts in `dir`, every entry read or the call fails; more than `bound`
