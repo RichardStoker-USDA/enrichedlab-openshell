@@ -16,7 +16,7 @@ use crate::forward::pb::evidence_append_service_server::{
     EvidenceAppendService, EvidenceAppendServiceServer,
 };
 use crate::forward::pb::{AppendRequest, AppendResponse, ScopeKind};
-use crate::forward::{Destination, EVENT_TYPE, Pass, idempotency_key, pass};
+use crate::forward::{Destination, EVENT_TYPE, Pass, idempotency_key, jittered, pass};
 use crate::store::Store;
 use crate::store::tests::temp_root;
 
@@ -397,4 +397,19 @@ fn idempotency_keys_fit_the_record_syntax_for_any_sandbox_id() {
         );
     }
     assert_ne!(idempotency_key("one", "a"), idempotency_key("two", "a"));
+}
+
+#[test]
+fn retries_are_spread_between_half_and_all_of_the_delay() {
+    let delay = std::time::Duration::from_mins(1);
+    let waits: Vec<_> = (0..200).map(|_| jittered(delay)).collect();
+    assert!(
+        waits
+            .iter()
+            .all(|wait| *wait >= delay / 2 && *wait <= delay)
+    );
+    assert!(
+        waits.iter().any(|wait| *wait != waits[0]),
+        "every wait was the same"
+    );
 }

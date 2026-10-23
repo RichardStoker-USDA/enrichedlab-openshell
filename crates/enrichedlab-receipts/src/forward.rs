@@ -302,7 +302,16 @@ pub async fn pass(
     })
 }
 
-/// Forwards receipts for the life of the service: a pass every `interval`, backing off to ten
+/// A wait between half of `delay` and all of it, so restarted instances and a recovered record do
+/// not meet every forwarder retrying at the same moment.
+pub fn jittered(delay: Duration) -> Duration {
+    use std::hash::BuildHasher;
+    let random = std::collections::hash_map::RandomState::new().hash_one(std::time::Instant::now());
+    let half = delay / 2;
+    half + half.mul_f64(f64::from(u32::try_from(random % 1_000).unwrap_or(0)) / 1_000.0)
+}
+
+/// Forwards receipts for the life of the service: a pass every `interval` (jittered), backing off to ten
 /// minutes while the record is unavailable.
 pub async fn run(
     store: Store,
@@ -334,6 +343,6 @@ pub async fn run(
         if let Ok(count) = store.unforwarded_count() {
             telemetry::unforwarded(count);
         }
-        tokio::time::sleep(delay).await;
+        tokio::time::sleep(jittered(delay)).await;
     }
 }

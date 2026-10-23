@@ -145,7 +145,8 @@ record's payload digest matches the receipt's `.sha256` file.
   returns the original record.
 - The source time is the receipt's `ending.observed_at`, at microsecond precision.
 - An unavailable, overloaded or unauthorizing record (or an unreadable token) stops the pass; the next one waits
-  twice as long, up to ten minutes, and returns to 30 seconds after a pass that completes.
+  twice as long, up to ten minutes, and returns to 30 seconds after a pass that completes. Every wait is jittered
+  between half and all of its length, so forwarders do not retry in step.
 - A refusal of the receipt itself (an invalid argument or an idempotency conflict) is kept with its reason and the
   receipt is not sent again. So is a receipt larger than the record's 64 KiB payload limit, one without a readable end
   time, or one that no longer matches its digest file; none of these is sent.
