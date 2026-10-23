@@ -9,6 +9,8 @@
 //! <state>/observed/<sandbox id>.json           what Kubernetes showed, replaced atomically
 //! <state>/receipts/<sandbox id>.json           the receipt, written once
 //! <state>/receipts/<sandbox id>.json.sha256    its SHA-256
+//! <state>/outbox/<sandbox id>                  an empty marker: the receipt waits for the research record
+//! <state>/forwarded/<sandbox id>.json          the record's answer, or why the receipt was refused
 //! ```
 //!
 //! A sandbox id names a file only when it is 1 to 128 letters, digits, `-`, `_` or `.` and does not
@@ -87,6 +89,8 @@ pub struct Store {
     root: PathBuf,
     /// Held open, exclusively locked, for the life of every clone: one service instance per store.
     _lock: std::sync::Arc<File>,
+    /// Whether written receipts are queued for forwarding (a marker in `outbox/`).
+    outbox: bool,
 }
 
 impl Store {
@@ -96,14 +100,22 @@ impl Store {
         let root = root.into();
         ensure_private_dir(&root)?;
         let lock = lock_store(&root)?;
-        for sub in ["starts", "observed", "receipts", "forwarded"] {
+        for sub in ["starts", "observed", "receipts", "forwarded", "outbox"] {
             ensure_private_dir(&root.join(sub))?;
             remove_temporaries(&root.join(sub))?;
         }
         Ok(Self {
             root,
             _lock: std::sync::Arc::new(lock),
+            outbox: false,
         })
+    }
+
+    /// Queues every receipt written from now on for forwarding. Set before the store is shared.
+    #[must_use]
+    pub fn with_outbox(mut self) -> Self {
+        self.outbox = true;
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -211,26 +223,53 @@ impl Store {
     pub fn write_receipt(&self, id: &str, bytes: &[u8]) -> Result<WrittenReceipt, StoreError> {
         let path = self.path("receipts", id)?;
         let sidecar = path.with_extension("json.sha256");
-        if path.exists() {
-            return existing_receipt(id, path, &sidecar);
+        let written = if path.exists() || !publish_new(&path, &format!("{id}.json"), bytes)? {
+            existing_receipt(id, path, &sidecar)?
+        } else {
+            let sha256 = hex(&Sha256::digest(bytes));
+            replace_file(&sidecar, digest_line(&sha256, id).as_bytes())?;
+            WrittenReceipt {
+                path,
+                sha256,
+                new: true,
+            }
+        };
+        // Queued after the receipt and its digest exist, and again for a receipt seen after a crash
+        // before its marker: a receipt with no outcome is always queued.
+        if self.outbox && !self.path("forwarded", id)?.exists() {
+            self.enqueue(id)?;
         }
-        if !publish_new(&path, &format!("{id}.json"), bytes)? {
-            return existing_receipt(id, path, &sidecar);
-        }
-        let sha256 = hex(&Sha256::digest(bytes));
-        replace_file(&sidecar, digest_line(&sha256, id).as_bytes())?;
-        Ok(WrittenReceipt {
-            path,
-            sha256,
-            new: true,
-        })
+        Ok(written)
     }
 
-    /// Receipts not yet forwarded to the research record (no outcome in `forwarded/`), oldest
-    /// first by name order of their write time, at most `limit`.
-    pub fn unforwarded(&self, limit: usize) -> Result<Vec<String>, StoreError> {
+    fn outbox_path(&self, id: &str) -> Result<PathBuf, StoreError> {
+        if !valid_sandbox_id(id) {
+            return Err(StoreError::SandboxId(id.to_string()));
+        }
+        Ok(self.root.join("outbox").join(id))
+    }
+
+    fn enqueue(&self, id: &str) -> Result<(), StoreError> {
+        create_new_file(&self.outbox_path(id)?, b"").map(|_| ())
+    }
+
+    fn dequeue(&self, id: &str) -> Result<(), StoreError> {
+        let path = self.outbox_path(id)?;
+        match fs::remove_file(&path) {
+            Ok(()) => sync_dir(path.parent().unwrap_or(&self.root)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(StoreError::Io {
+                path,
+                source: error,
+            }),
+        }
+    }
+
+    /// Queues receipts written before forwarding was turned on (or before a crash wrote their
+    /// marker): every receipt with no outcome. One full listing, at the forwarder's start.
+    pub fn enqueue_unforwarded(&self) -> Result<usize, StoreError> {
         let dir = self.root.join("receipts");
-        let mut pending: Vec<(SystemTime, String)> = Vec::new();
+        let mut queued = 0;
         for entry in fs::read_dir(&dir)
             .map_err(io_error(&dir))?
             .filter_map(Result::ok)
@@ -239,35 +278,155 @@ impl Store {
             let Some(id) = name.strip_suffix(".json") else {
                 continue;
             };
-            if !valid_sandbox_id(id) || self.root.join("forwarded").join(&name).exists() {
+            if valid_sandbox_id(id)
+                && !self.path("forwarded", id)?.exists()
+                && create_new_file(&self.outbox_path(id)?, b"")?
+            {
+                queued += 1;
+            }
+        }
+        Ok(queued)
+    }
+
+    /// The oldest queued receipts, at most `limit`. Reads only the queue, never the receipts already
+    /// forwarded, and holds at most `limit` entries in memory.
+    pub fn outbox(&self, limit: usize) -> Result<Vec<String>, StoreError> {
+        let dir = self.root.join("outbox");
+        let mut oldest: std::collections::BinaryHeap<(SystemTime, String)> =
+            std::collections::BinaryHeap::with_capacity(limit + 1);
+        for entry in fs::read_dir(&dir)
+            .map_err(io_error(&dir))?
+            .filter_map(Result::ok)
+        {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if !valid_sandbox_id(&id) {
                 continue;
             }
             let modified = entry
                 .metadata()
                 .and_then(|metadata| metadata.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
-            pending.push((modified, id.to_string()));
+            oldest.push((modified, id));
+            if oldest.len() > limit {
+                oldest.pop();
+            }
         }
-        pending.sort();
-        Ok(pending.into_iter().take(limit).map(|(_, id)| id).collect())
+        let mut ids = oldest.into_vec();
+        ids.sort();
+        Ok(ids.into_iter().map(|(_, id)| id).collect())
     }
 
-    /// How many receipts have no forwarding outcome yet.
-    pub fn unforwarded_count(&self) -> Result<usize, StoreError> {
-        Ok(self.unforwarded(usize::MAX)?.len())
+    /// How many receipts are queued for forwarding.
+    pub fn outbox_len(&self) -> Result<usize, StoreError> {
+        let dir = self.root.join("outbox");
+        Ok(fs::read_dir(&dir)
+            .map_err(io_error(&dir))?
+            .filter_map(Result::ok)
+            .filter(|entry| valid_sandbox_id(&entry.file_name().to_string_lossy()))
+            .count())
     }
 
-    /// A written receipt's exact bytes and SHA-256, checked against its digest file.
+    /// The size of a written receipt, read without opening it.
+    pub fn receipt_len(&self, id: &str) -> Result<u64, StoreError> {
+        let path = self.path("receipts", id)?;
+        fs::metadata(&path)
+            .map(|m| m.len())
+            .map_err(io_error(&path))
+    }
+
+    /// A written receipt's exact bytes and SHA-256, checked against its digest file. A digest file
+    /// lost to a crash between the two writes is written again from a receipt that still parses, as
+    /// `write_receipt` does; a receipt that does not parse is `Unreadable`.
     pub fn read_receipt(&self, id: &str) -> Result<(Vec<u8>, String), StoreError> {
         let path = self.path("receipts", id)?;
         let bytes = read_bounded(&path)?.ok_or_else(|| StoreError::Unreadable(path.clone()))?;
         let sha256 = hex(&Sha256::digest(&bytes));
         let sidecar = path.with_extension("json.sha256");
-        let recorded = fs::read_to_string(&sidecar).map_err(io_error(&sidecar))?;
+        let recorded = match fs::read_to_string(&sidecar) {
+            Ok(recorded) => recorded,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if serde_json::from_slice::<serde::de::IgnoredAny>(&bytes).is_err() {
+                    return Err(StoreError::Unreadable(path));
+                }
+                replace_file(&sidecar, digest_line(&sha256, id).as_bytes())?;
+                return Ok((bytes, sha256));
+            }
+            Err(error) => {
+                return Err(StoreError::Io {
+                    path: sidecar,
+                    source: error,
+                });
+            }
+        };
         if recorded.split_whitespace().next() != Some(sha256.as_str()) {
             return Err(StoreError::Digest(path));
         }
+        if serde_json::from_slice::<serde::de::IgnoredAny>(&bytes).is_err() {
+            return Err(StoreError::Unreadable(path));
+        }
         Ok((bytes, sha256))
+    }
+
+    /// Drops a queued entry whose receipt no longer exists.
+    pub fn forget_queued(&self, id: &str) -> Result<(), StoreError> {
+        self.dequeue(id)
+    }
+
+    /// Removes receipts the research record holds (an outcome with a record) whose outcome is
+    /// older than `before`, with their digest and outcome, at most `limit` a call. Refusals are kept:
+    /// those receipts are not in the record. Returns how many were removed.
+    pub fn prune_forwarded(&self, before: SystemTime, limit: usize) -> Result<usize, StoreError> {
+        let dir = self.root.join("forwarded");
+        let mut removed = 0;
+        for entry in fs::read_dir(&dir)
+            .map_err(io_error(&dir))?
+            .filter_map(Result::ok)
+        {
+            if removed >= limit {
+                break;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if !valid_sandbox_id(id) {
+                continue;
+            }
+            let old = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|modified| modified < before);
+            if !old {
+                continue;
+            }
+            let outcome: Option<serde_json::Value> = read_record(&entry.path()).unwrap_or(None);
+            let recorded = matches!(
+                outcome.as_ref().and_then(|outcome| outcome.get("record")),
+                Some(record) if !record.is_null()
+            );
+            if !recorded {
+                continue;
+            }
+            let receipt = self.path("receipts", id)?;
+            for path in [receipt.with_extension("json.sha256"), receipt, entry.path()] {
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(StoreError::Io {
+                            path,
+                            source: error,
+                        });
+                    }
+                }
+            }
+            removed += 1;
+        }
+        if removed > 0 {
+            sync_dir(&self.root.join("receipts"))?;
+            sync_dir(&dir)?;
+        }
+        Ok(removed)
     }
 
     /// Keeps the forwarding outcome of a receipt (the research record's receipt, or why it was
@@ -275,7 +434,9 @@ impl Store {
     pub fn write_forwarded<T: Serialize>(&self, id: &str, outcome: &T) -> Result<bool, StoreError> {
         let path = self.path("forwarded", id)?;
         let bytes = serde_json::to_vec(outcome).map_err(StoreError::Encode)?;
-        publish_new(&path, &format!("{id}.json"), &bytes)
+        let new = publish_new(&path, &format!("{id}.json"), &bytes)?;
+        self.dequeue(id)?;
+        Ok(new)
     }
 
     /// Removes a sandbox's working records once its receipt holds them.

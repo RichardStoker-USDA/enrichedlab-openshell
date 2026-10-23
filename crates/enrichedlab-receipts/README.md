@@ -82,7 +82,8 @@ OnRootMismatch` so a restart does not rewrite every receipt's ownership. A start
 written to a temporary file, flushed, and hard-linked to its name, so the name never holds a partial record and an
 existing one is never replaced. An existing receipt is checked against its digest file before its sandbox's working
 records are removed; a digest file lost to a crash between the two writes is written again. At most 4,096 start and 4,096 observed
-records are kept at once. Receipts are kept until removed by whatever retention applies to the volume.
+records are kept at once. Without forwarding, receipts are kept until removed by whatever retention applies to the
+volume; with forwarding, see below.
 
 ## Metrics
 
@@ -135,9 +136,11 @@ across gateway restarts. Once the gateway runs, an unavailable service only lose
 ## Forwarding receipts to a research record
 
 With `--evidence-endpoint` set, the service also sends each receipt to an EnrichedLab research record
-(`enrichedlab.evidence.v1.EvidenceAppendService`, generated from the contracts descriptor in `proto/`). The receipts
-directory is the outbox: every 30 seconds the service takes the oldest receipts with no outcome in
-`<state>/forwarded/` (at most 64 a pass) and sends each one's exact bytes and SHA-256 as a `sandbox.receipt` record.
+(`enrichedlab.evidence.v1.EvidenceAppendService`, generated from the contracts descriptor in `proto/`). Each receipt
+written is queued as an empty marker in `<state>/outbox/`; at start the service also queues every receipt that has no
+outcome in `<state>/forwarded/`. Every 30 seconds it takes the 64 oldest markers and sends each receipt's exact bytes
+and SHA-256 as a `sandbox.receipt` record. A pass reads only the outbox directory and holds at most 64 entries, however
+many receipts the volume keeps.
 The record's answer (record id, chain, sequence, hash, and whether it was a replay) is kept as the outcome, so the
 record's payload digest matches the receipt's `.sha256` file.
 
@@ -148,8 +151,18 @@ record's payload digest matches the receipt's `.sha256` file.
   twice as long, up to ten minutes, and returns to 30 seconds after a pass that completes. Every wait is jittered
   between half and all of its length, so forwarders do not retry in step.
 - A refusal of the receipt itself (an invalid argument or an idempotency conflict) is kept with its reason and the
-  receipt is not sent again. So is a receipt larger than the record's 64 KiB payload limit, one without a readable end
-  time, or one that no longer matches its digest file; none of these is sent.
+  receipt is not sent again. So is a receipt larger than the record's 64 KiB payload limit (checked from its size
+  before it is read), one that does not parse, one without a readable end time, or one that no longer matches its
+  digest file; none of these is sent.
+- A problem with one receipt never holds back the receipts queued after it. A digest file lost to a crash between the
+  receipt and its digest is written again from the receipt; a receipt that cannot be opened now is tried again next
+  pass; a marker whose receipt is gone is dropped.
+- The endpoint must be `https`: the token goes with every call, and TLS settings alone do not upgrade an `http` URI,
+  so the service refuses to start with any other scheme.
+- A receipt the record holds is removed from the volume, with its digest and outcome, once its outcome is older than
+  `--evidence-retention-days` (default 30; up to 1,000 an hour). Refused receipts are kept for an operator, since the
+  record does not have them. Volume use is the receipt rate times the retention, plus any backlog while the record is
+  unavailable; `enrichedlab_receipts_unforwarded` shows that backlog.
 - Every receipt goes to one lab's standalone scope (`--evidence-tenant`, `--evidence-group`). Sandbox labels are set
   by whoever creates the sandbox, so they never choose where a record goes.
 
@@ -161,4 +174,4 @@ in that lab's standalone scope.
 | Series | Labels |
 |---|---|
 | `enrichedlab_receipts_forwarded_total` | `outcome`: `forwarded`, `replayed`, `refused`, `retry` |
-| `enrichedlab_receipts_unforwarded` | none: receipts with no outcome yet |
+| `enrichedlab_receipts_unforwarded` | none: receipts queued in the outbox |

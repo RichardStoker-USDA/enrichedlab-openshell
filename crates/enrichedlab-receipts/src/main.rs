@@ -88,6 +88,9 @@ struct Args {
     /// The lab whose standalone scope holds the receipts.
     #[arg(long, env = "RECEIPTS_EVIDENCE_GROUP", requires = "evidence_endpoint")]
     evidence_group: Option<String>,
+    /// Days a receipt the research record holds is kept on the state volume after it was forwarded.
+    #[arg(long, env = "RECEIPTS_EVIDENCE_RETENTION_DAYS", default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3650))]
+    evidence_retention_days: u64,
 }
 
 async fn shutdown() {
@@ -113,6 +116,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     enrichedlab_receipts::telemetry::install(args.metrics_listen)?;
     let store = Store::open(&args.state_dir)?;
+    // Receipts are queued for the research record only when one is configured.
+    let store = if args.evidence_endpoint.is_some() {
+        store.with_outbox()
+    } else {
+        store
+    };
     let public_key = std::fs::read(&args.gateway_public_key)?;
     let kid = match &args.gateway_key_id_file {
         Some(path) => Some(std::fs::read_to_string(path)?),
@@ -132,6 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tenant: args.evidence_tenant.clone().ok_or_else(missing)?,
                 group: args.evidence_group.clone().ok_or_else(missing)?,
                 token_file: args.evidence_token_file.clone().ok_or_else(missing)?,
+                retention: Duration::from_hours(24 * args.evidence_retention_days),
             };
             Some(tokio::spawn(enrichedlab_receipts::forward::run(
                 store.clone(),

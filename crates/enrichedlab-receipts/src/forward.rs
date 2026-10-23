@@ -63,15 +63,29 @@ pub struct Destination {
     /// A projected `ServiceAccount` token for the record's audience, read again for every call
     /// because the kubelet rotates it.
     pub token_file: PathBuf,
+    /// How long a receipt the record holds is kept here after it was forwarded.
+    pub retention: Duration,
 }
 
-/// The TLS channel to the append service; it connects on first use.
-pub fn channel(
-    endpoint: &str,
-    ca_pem: &[u8],
-    server_name: &str,
-) -> Result<Channel, tonic::transport::Error> {
-    Ok(Endpoint::from_shared(endpoint.to_string())?
+/// Why the forwarding channel was not built.
+#[derive(Debug, thiserror::Error)]
+pub enum ChannelError {
+    #[error(
+        "the append service endpoint must be https; the projected token is never sent in the clear"
+    )]
+    NotHttps,
+    #[error("the append service endpoint is invalid: {0}")]
+    Transport(#[from] tonic::transport::Error),
+}
+
+/// The TLS channel to the append service; it connects on first use. Only an `https` endpoint is
+/// accepted: TLS settings alone do not upgrade an `http` URI, and every call carries the token.
+pub fn channel(endpoint: &str, ca_pem: &[u8], server_name: &str) -> Result<Channel, ChannelError> {
+    let parsed = Endpoint::from_shared(endpoint.to_string())?;
+    if parsed.uri().scheme_str() != Some("https") {
+        return Err(ChannelError::NotHttps);
+    }
+    Ok(parsed
         .tls_config(
             ClientTlsConfig::new()
                 .ca_certificate(Certificate::from_pem(ca_pem))
@@ -195,24 +209,50 @@ pub async fn pass(
     gateway: &str,
 ) -> Result<Pass, StoreError> {
     let (mut forwarded, mut refused_count) = (0, 0);
-    for id in store.unforwarded(BATCH)? {
+    for id in store.outbox(BATCH)? {
+        // Every failure below is this receipt's alone: it is refused and kept, or skipped for this
+        // pass, and the receipts queued after it are still sent.
+        let refuse = |reason: &str| -> Result<(), StoreError> {
+            refused(store, &id, "LOCAL", reason)?;
+            telemetry::forwarded("refused");
+            Ok(())
+        };
+        match store.receipt_len(&id) {
+            Ok(length) if length > MAX_PAYLOAD_BYTES as u64 => {
+                refuse("PAYLOAD_SIZE")?;
+                refused_count += 1;
+                continue;
+            }
+            Ok(_) => {}
+            Err(StoreError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                store.forget_queued(&id)?;
+                continue;
+            }
+            Err(error) => {
+                warn!(error = %error, "a queued receipt cannot be read now; trying it next pass");
+                telemetry::failure("forward");
+                continue;
+            }
+        }
         let (bytes, sha256) = match store.read_receipt(&id) {
             Ok(read) => read,
             Err(StoreError::Digest(_)) => {
                 // A receipt that no longer matches its digest never enters the record.
-                refused(store, &id, "LOCAL", "RECEIPT_DIGEST_MISMATCH")?;
-                telemetry::forwarded("refused");
+                refuse("RECEIPT_DIGEST_MISMATCH")?;
                 refused_count += 1;
                 continue;
             }
-            Err(error) => return Err(error),
+            Err(StoreError::Unreadable(_)) => {
+                refuse("RECEIPT_UNREADABLE")?;
+                refused_count += 1;
+                continue;
+            }
+            Err(error) => {
+                warn!(error = %error, "a queued receipt cannot be read now; trying it next pass");
+                telemetry::failure("forward");
+                continue;
+            }
         };
-        if bytes.len() > MAX_PAYLOAD_BYTES {
-            refused(store, &id, "LOCAL", "PAYLOAD_SIZE")?;
-            telemetry::forwarded("refused");
-            refused_count += 1;
-            continue;
-        }
         let Some(source_time) = source_time(&bytes) else {
             refused(store, &id, "LOCAL", "SOURCE_TIME_INVALID")?;
             telemetry::forwarded("refused");
@@ -311,8 +351,11 @@ pub fn jittered(delay: Duration) -> Duration {
     half + half.mul_f64(f64::from(u32::try_from(random % 1_000).unwrap_or(0)) / 1_000.0)
 }
 
-/// Forwards receipts for the life of the service: a pass every `interval` (jittered), backing off to ten
-/// minutes while the record is unavailable.
+/// Forwards receipts for the life of the service.
+///
+/// A pass runs every `interval` (jittered), backing off to ten minutes while the record is unavailable.
+/// At start it queues any receipt that has no outcome; each hour it removes up to 1,000 receipts the
+/// record has held for longer than the retention.
 pub async fn run(
     store: Store,
     channel: Channel,
@@ -322,6 +365,15 @@ pub async fn run(
 ) {
     let mut client = EvidenceAppendServiceClient::new(channel);
     let mut delay = interval;
+    match store.enqueue_unforwarded() {
+        Ok(queued) if queued > 0 => info!(queued, "receipts queued for the research record"),
+        Ok(_) => {}
+        Err(error) => {
+            warn!(error = %error, "receipts written before forwarding could not be queued");
+            telemetry::failure("forward");
+        }
+    }
+    let mut pruned_at: Option<std::time::Instant> = None;
     loop {
         match pass(&store, &mut client, &destination, &gateway).await {
             Ok(Pass::Done { forwarded, refused }) => {
@@ -340,7 +392,23 @@ pub async fn run(
                 delay = (delay * 2).min(Duration::from_mins(10));
             }
         }
-        if let Ok(count) = store.unforwarded_count() {
+        if pruned_at.is_none_or(|at| at.elapsed() >= Duration::from_hours(1)) {
+            pruned_at = Some(std::time::Instant::now());
+            let before = std::time::SystemTime::now()
+                .checked_sub(destination.retention)
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            match store.prune_forwarded(before, 1_000) {
+                Ok(removed) if removed > 0 => {
+                    info!(removed, "forwarded receipts past retention removed");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(error = %error, "forwarded receipts could not be pruned");
+                    telemetry::failure("forward");
+                }
+            }
+        }
+        if let Ok(count) = store.outbox_len() {
             telemetry::unforwarded(count);
         }
         tokio::time::sleep(jittered(delay)).await;
