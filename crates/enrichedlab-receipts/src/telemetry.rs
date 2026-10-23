@@ -28,11 +28,24 @@ pub fn install(listen: SocketAddr) -> Result<(), String> {
         counter!("enrichedlab_receipts_failures_total", "operation" => operation).absolute(0);
     }
     counter!("enrichedlab_receipts_pods_unheld_total").absolute(0);
+    for outcome in FORWARD_OUTCOMES {
+        counter!("enrichedlab_receipts_forwarded_total", "outcome" => outcome).absolute(0);
+    }
     Ok(())
 }
 
 /// The operations whose failures are counted.
-pub const OPERATIONS: [&str; 5] = ["start", "observe", "receipt", "reconcile", "watch"];
+pub const OPERATIONS: [&str; 6] = [
+    "start",
+    "observe",
+    "receipt",
+    "reconcile",
+    "watch",
+    "forward",
+];
+
+/// The outcomes of sending a receipt to the research record.
+pub const FORWARD_OUTCOMES: [&str; 4] = ["forwarded", "replayed", "refused", "retry"];
 
 const fn observation_label(observation: Observation) -> &'static str {
     match observation {
@@ -72,6 +85,17 @@ pub fn tracked(starts: usize, observed: usize) {
         gauge!("enrichedlab_receipts_tracked", "record" => "start").set(starts as f64);
         gauge!("enrichedlab_receipts_tracked", "record" => "observed").set(observed as f64);
     }
+}
+
+/// A receipt's forwarding outcome; `outcome` is one of [`FORWARD_OUTCOMES`].
+pub fn forwarded(outcome: &'static str) {
+    counter!("enrichedlab_receipts_forwarded_total", "outcome" => outcome).increment(1);
+}
+
+/// Receipts with no forwarding outcome yet.
+pub fn unforwarded(count: usize) {
+    #[allow(clippy::cast_precision_loss)]
+    gauge!("enrichedlab_receipts_unforwarded").set(count as f64);
 }
 
 /// Early Pod reports the service could not hold (its bounds were full); the receipt of an affected

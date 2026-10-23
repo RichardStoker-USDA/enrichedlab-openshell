@@ -61,6 +61,33 @@ struct Args {
     /// The served version of the agent-sandbox `Sandbox` API.
     #[arg(long, env = "RECEIPTS_SANDBOX_API_VERSION", default_value = "v1beta1")]
     sandbox_api_version: String,
+    /// The research record's append service (`https://host:port`); receipts are forwarded only
+    /// when this is set, and the other `evidence` settings are then required.
+    #[arg(long, env = "RECEIPTS_EVIDENCE_ENDPOINT")]
+    evidence_endpoint: Option<String>,
+    /// CA bundle (PEM) that signed the append service's certificate.
+    #[arg(long, env = "RECEIPTS_EVIDENCE_CA", requires = "evidence_endpoint")]
+    evidence_ca: Option<PathBuf>,
+    /// The name the append service's certificate carries.
+    #[arg(
+        long,
+        env = "RECEIPTS_EVIDENCE_SERVER_NAME",
+        requires = "evidence_endpoint"
+    )]
+    evidence_server_name: Option<String>,
+    /// A projected `ServiceAccount` token for the append service's audience.
+    #[arg(
+        long,
+        env = "RECEIPTS_EVIDENCE_TOKEN_FILE",
+        requires = "evidence_endpoint"
+    )]
+    evidence_token_file: Option<PathBuf>,
+    /// The research record's tenant.
+    #[arg(long, env = "RECEIPTS_EVIDENCE_TENANT", requires = "evidence_endpoint")]
+    evidence_tenant: Option<String>,
+    /// The lab whose standalone scope holds the receipts.
+    #[arg(long, env = "RECEIPTS_EVIDENCE_GROUP", requires = "evidence_endpoint")]
+    evidence_group: Option<String>,
 }
 
 async fn shutdown() {
@@ -92,6 +119,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let verifier = TokenVerifier::new(&public_key, kid, &args.gateway_id, &args.audience)?;
+    let forwarder = match &args.evidence_endpoint {
+        Some(endpoint) => {
+            let missing = || "every --evidence-* setting is required with --evidence-endpoint";
+            let ca = std::fs::read(args.evidence_ca.as_ref().ok_or_else(missing)?)?;
+            let channel = enrichedlab_receipts::forward::channel(
+                endpoint,
+                &ca,
+                args.evidence_server_name.as_deref().ok_or_else(missing)?,
+            )?;
+            let destination = enrichedlab_receipts::forward::Destination {
+                tenant: args.evidence_tenant.clone().ok_or_else(missing)?,
+                group: args.evidence_group.clone().ok_or_else(missing)?,
+                token_file: args.evidence_token_file.clone().ok_or_else(missing)?,
+            };
+            Some(tokio::spawn(enrichedlab_receipts::forward::run(
+                store.clone(),
+                channel,
+                destination,
+                args.gateway_id.clone(),
+                Duration::from_secs(30),
+            )))
+        }
+        None => None,
+    };
     let tracker = Arc::new(Tracker::new(store, &args.gateway_id));
     let recorder = Arc::new(StartRecorder::new(tracker.clone(), verifier)?);
     let identity = Identity::from_pem(
@@ -117,7 +168,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.sandbox_api_version,
         args.gateway_id.clone(),
     ));
-    info!(listen = %args.listen, namespace = %args.sandbox_namespace, "serving run receipts");
+    info!(
+        listen = %args.listen,
+        namespace = %args.sandbox_namespace,
+        forwarding = forwarder.is_some(),
+        "serving run receipts"
+    );
     tokio::select! {
         result = server => result?,
         result = watch => {

@@ -35,11 +35,19 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["transport", "tls-aws-lc"] }
+tonic-prost = { workspace = true }
+tonic-types = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+[build-dependencies]
+prost = { workspace = true }
+prost-types = { workspace = true }
+tonic-prost-build = { workspace = true }
+
 [dev-dependencies]
 uuid = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
 
 [lints]
 workspace = true

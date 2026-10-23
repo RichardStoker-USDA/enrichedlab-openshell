@@ -96,7 +96,7 @@ impl Store {
         let root = root.into();
         ensure_private_dir(&root)?;
         let lock = lock_store(&root)?;
-        for sub in ["starts", "observed", "receipts"] {
+        for sub in ["starts", "observed", "receipts", "forwarded"] {
             ensure_private_dir(&root.join(sub))?;
             remove_temporaries(&root.join(sub))?;
         }
@@ -224,6 +224,58 @@ impl Store {
             sha256,
             new: true,
         })
+    }
+
+    /// Receipts not yet forwarded to the research record (no outcome in `forwarded/`), oldest
+    /// first by name order of their write time, at most `limit`.
+    pub fn unforwarded(&self, limit: usize) -> Result<Vec<String>, StoreError> {
+        let dir = self.root.join("receipts");
+        let mut pending: Vec<(SystemTime, String)> = Vec::new();
+        for entry in fs::read_dir(&dir)
+            .map_err(io_error(&dir))?
+            .filter_map(Result::ok)
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if !valid_sandbox_id(id) || self.root.join("forwarded").join(&name).exists() {
+                continue;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            pending.push((modified, id.to_string()));
+        }
+        pending.sort();
+        Ok(pending.into_iter().take(limit).map(|(_, id)| id).collect())
+    }
+
+    /// How many receipts have no forwarding outcome yet.
+    pub fn unforwarded_count(&self) -> Result<usize, StoreError> {
+        Ok(self.unforwarded(usize::MAX)?.len())
+    }
+
+    /// A written receipt's exact bytes and SHA-256, checked against its digest file.
+    pub fn read_receipt(&self, id: &str) -> Result<(Vec<u8>, String), StoreError> {
+        let path = self.path("receipts", id)?;
+        let bytes = read_bounded(&path)?.ok_or_else(|| StoreError::Unreadable(path.clone()))?;
+        let sha256 = hex(&Sha256::digest(&bytes));
+        let sidecar = path.with_extension("json.sha256");
+        let recorded = fs::read_to_string(&sidecar).map_err(io_error(&sidecar))?;
+        if recorded.split_whitespace().next() != Some(sha256.as_str()) {
+            return Err(StoreError::Digest(path));
+        }
+        Ok((bytes, sha256))
+    }
+
+    /// Keeps the forwarding outcome of a receipt (the research record's receipt, or why it was
+    /// refused); the first one is kept, and a receipt with an outcome is not forwarded again.
+    pub fn write_forwarded<T: Serialize>(&self, id: &str, outcome: &T) -> Result<bool, StoreError> {
+        let path = self.path("forwarded", id)?;
+        let bytes = serde_json::to_vec(outcome).map_err(StoreError::Encode)?;
+        publish_new(&path, &format!("{id}.json"), &bytes)
     }
 
     /// Removes a sandbox's working records once its receipt holds them.

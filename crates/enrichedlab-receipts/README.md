@@ -71,6 +71,7 @@ while the service was down, with its create unseen, gets no receipt; alert on th
 <state>/observed/<sandbox id>.json          what Kubernetes showed, replaced atomically
 <state>/receipts/<sandbox id>.json          the receipt, written once
 <state>/receipts/<sandbox id>.json.sha256   its SHA-256
+<state>/forwarded/<sandbox id>.json         the research record's answer, or why it refused (when forwarding)
 ```
 
 A sandbox id names a file only when it is 1 to 128 letters, digits, `-`, `_` or `.` and does not start with a dot.
@@ -90,7 +91,7 @@ records are kept at once. Receipts are kept until removed by whatever retention 
 | Series | Labels |
 |---|---|
 | `enrichedlab_receipts_written_total` | `observation`: new receipts by how the end was observed |
-| `enrichedlab_receipts_failures_total` | `operation`: `start`, `observe`, `receipt`, `reconcile`, `watch` |
+| `enrichedlab_receipts_failures_total` | `operation`: `start`, `observe`, `receipt`, `reconcile`, `watch`, `forward` |
 | `enrichedlab_receipts_starts_total` | `outcome`: the committed start's result (`recorded`, `kept`, `not recorded` and so on) |
 | `enrichedlab_receipts_listings_total` | `resource`: complete listings of `sandboxes` or `pods` |
 | `enrichedlab_receipts_tracked` | `record`: start and observed records held, at each sweep |
@@ -130,3 +131,33 @@ Registration is static: restart the gateway after adding it. The gateway calls `
 start while the service is unreachable or declares another audience, so start the service first and keep it running
 across gateway restarts. Once the gateway runs, an unavailable service only loses starts: the binding is
 `fail_open`.
+
+## Forwarding receipts to a research record
+
+With `--evidence-endpoint` set, the service also sends each receipt to an EnrichedLab research record
+(`enrichedlab.evidence.v1.EvidenceAppendService`, generated from the contracts descriptor in `proto/`). The receipts
+directory is the outbox: every 30 seconds the service takes the oldest receipts with no outcome in
+`<state>/forwarded/` (at most 64 a pass) and sends each one's exact bytes and SHA-256 as a `sandbox.receipt` record.
+The record's answer (record id, chain, sequence, hash, and whether it was a replay) is kept as the outcome, so the
+record's payload digest matches the receipt's `.sha256` file.
+
+- The idempotency key is derived from the gateway and sandbox ids, so a receipt sent again after a lost answer
+  returns the original record.
+- The source time is the receipt's `ending.observed_at`, at microsecond precision.
+- An unavailable, overloaded or unauthorizing record (or an unreadable token) stops the pass; the next one waits
+  twice as long, up to ten minutes, and returns to 30 seconds after a pass that completes.
+- A refusal of the receipt itself (an invalid argument or an idempotency conflict) is kept with its reason and the
+  receipt is not sent again. So is a receipt larger than the record's 64 KiB payload limit, one without a readable end
+  time, or one that no longer matches its digest file; none of these is sent.
+- Every receipt goes to one lab's standalone scope (`--evidence-tenant`, `--evidence-group`). Sandbox labels are set
+  by whoever creates the sandbox, so they never choose where a record goes.
+
+It needs the append service's CA (`--evidence-ca`) and certificate name (`--evidence-server-name`), and a projected
+ServiceAccount token for the record's audience (`--evidence-token-file`), read again for every call because the
+kubelet rotates it. The record maps that ServiceAccount to its producer and must grant the producer `sandbox.receipt`
+in that lab's standalone scope.
+
+| Series | Labels |
+|---|---|
+| `enrichedlab_receipts_forwarded_total` | `outcome`: `forwarded`, `replayed`, `refused`, `retry` |
+| `enrichedlab_receipts_unforwarded` | none: receipts with no outcome yet |
