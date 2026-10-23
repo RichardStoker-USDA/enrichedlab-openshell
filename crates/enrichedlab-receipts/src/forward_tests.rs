@@ -771,6 +771,21 @@ async fn recovery_refuses_a_store_past_its_bound_and_keeps_every_file() {
         Err(crate::store::StoreError::Full("receipt"))
     ));
     assert_eq!(fs::read_dir(root.join("receipts")).unwrap().count(), over);
+    // A directory holding more entries than any store under the limit can (here the outbox) is refused
+    // after reading only its budget, before the receipts are counted.
+    // Under a limit that covers the receipts, only the outbox's budget can refuse it.
+    drop(Store::open_with_limit(&root, over).unwrap());
+    let marker_budget = over + 2 * crate::store::MAX_TRACKED + 256;
+    for i in 0..=marker_budget {
+        fs::write(root.join(format!("outbox/stray-{i}")), b"").unwrap();
+    }
+    assert!(matches!(
+        Store::open_with_limit(&root, over),
+        Err(crate::store::StoreError::Full("receipt"))
+    ));
+    for i in 0..=marker_budget {
+        fs::remove_file(root.join(format!("outbox/stray-{i}"))).unwrap();
+    }
     // Raised to cover it, the same store opens and recovers.
     let store = Store::open_with_limit(&root, over).unwrap().with_outbox();
     assert_eq!(store.recover_outbox().unwrap(), over);

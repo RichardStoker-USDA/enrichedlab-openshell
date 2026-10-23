@@ -42,6 +42,8 @@ pub const DEFAULT_RECEIPT_LIMIT: usize = 20_000;
 const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 /// The suffix of temporary files.
 const TEMPORARY: &str = ".tmp";
+/// Leftover temporary files a directory may hold beyond its records after crashes.
+const TEMPORARY_SLACK: usize = 256;
 
 /// Where a receipt is and the SHA-256 of its bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,9 +136,19 @@ impl Store {
         let root = root.into();
         ensure_private_dir(&root)?;
         let lock = lock_store(&root)?;
-        for sub in ["starts", "observed", "receipts", "forwarded", "outbox"] {
+        // Every directory is read with a budget from the limit: what a store under it can hold (a receipt and
+        // its digest, an outcome, a marker per receipt; the tracked working records) and a few leftover
+        // temporaries. A store past it is refused before more is read.
+        let bound = receipt_limit.saturating_add(2 * MAX_TRACKED);
+        for (sub, budget) in [
+            ("starts", MAX_TRACKED),
+            ("observed", MAX_TRACKED),
+            ("receipts", bound.saturating_mul(2)),
+            ("forwarded", bound),
+            ("outbox", bound),
+        ] {
             ensure_private_dir(&root.join(sub))?;
-            remove_temporaries(&root.join(sub))?;
+            remove_temporaries(&root.join(sub), budget.saturating_add(TEMPORARY_SLACK))?;
         }
         let receipts = count_receipts(
             &root.join("receipts"),
@@ -838,11 +850,16 @@ fn lock_store(root: &Path) -> Result<File, StoreError> {
 }
 
 /// Removes temporary files a crash left behind.
-fn remove_temporaries(dir: &Path) -> Result<(), StoreError> {
-    for entry in fs::read_dir(dir)
+/// Removes leftover temporary files, reading at most `budget` entries: more is `Full`.
+fn remove_temporaries(dir: &Path, budget: usize) -> Result<(), StoreError> {
+    for (visited, entry) in fs::read_dir(dir)
         .map_err(io_error(dir))?
         .filter_map(Result::ok)
+        .enumerate()
     {
+        if visited >= budget {
+            return Err(StoreError::Full("receipt"));
+        }
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') && name.ends_with(TEMPORARY) {
             let _ = fs::remove_file(entry.path());
