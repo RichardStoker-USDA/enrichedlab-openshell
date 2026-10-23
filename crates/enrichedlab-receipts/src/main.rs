@@ -88,6 +88,11 @@ struct Args {
     /// The lab whose standalone scope holds the receipts.
     #[arg(long, env = "RECEIPTS_EVIDENCE_GROUP", requires = "evidence_endpoint")]
     evidence_group: Option<String>,
+    /// Receipts the state volume keeps at most; while it holds this many, new sandbox starts are
+    /// refused (the gateway's binding then lets the sandbox run without a receipt) and no receipt is
+    /// dropped. Size it to the volume: receipts are a few kilobytes each.
+    #[arg(long, env = "RECEIPTS_MAX_RECEIPTS", default_value_t = enrichedlab_receipts::store::DEFAULT_RECEIPT_LIMIT as u64, value_parser = clap::value_parser!(u64).range(1..=1_000_000))]
+    max_receipts: u64,
     /// Days a receipt the research record holds is kept on the state volume after it was forwarded.
     #[arg(long, env = "RECEIPTS_EVIDENCE_RETENTION_DAYS", default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3650))]
     evidence_retention_days: u64,
@@ -115,7 +120,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     enrichedlab_receipts::telemetry::install(args.metrics_listen)?;
-    let store = Store::open(&args.state_dir)?;
+    let store = Store::open(&args.state_dir)?
+        .with_receipt_limit(usize::try_from(args.max_receipts).unwrap_or(usize::MAX));
+    enrichedlab_receipts::telemetry::stored(store.receipt_count(), store.receipt_limit());
     // Receipts are queued for the research record only when one is configured.
     let store = if args.evidence_endpoint.is_some() {
         store.with_outbox()

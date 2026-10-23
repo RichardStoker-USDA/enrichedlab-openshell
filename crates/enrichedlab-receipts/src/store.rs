@@ -19,10 +19,12 @@
 //! Every file is mode 0600, every directory 0700, and every write is flushed and its directory synced
 //! before it is reported.
 
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 
 use serde::{Serialize, de::DeserializeOwned};
@@ -30,6 +32,11 @@ use sha2::{Digest, Sha256};
 
 /// Working records of one kind kept at once.
 pub const MAX_TRACKED: usize = 4096;
+/// Receipts kept at once unless the operator sets another limit.
+///
+/// While the store holds this many, a new sandbox start is refused, so receipts never exceed it by
+/// more than the sandboxes already tracked (`MAX_TRACKED`).
+pub const DEFAULT_RECEIPT_LIMIT: usize = 20_000;
 /// The largest record read back (a bounded receipt is far smaller).
 const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 /// The suffix of temporary files.
@@ -88,9 +95,25 @@ pub fn valid_sandbox_id(id: &str) -> bool {
 pub struct Store {
     root: PathBuf,
     /// Held open, exclusively locked, for the life of every clone: one service instance per store.
-    _lock: std::sync::Arc<File>,
+    _lock: Arc<File>,
     /// Whether written receipts are queued for forwarding (a marker in `outbox/`).
     outbox: bool,
+    /// Receipts kept at most before new sandbox starts are refused.
+    receipt_limit: usize,
+    ledger: Arc<Mutex<Ledger>>,
+}
+
+/// What the store holds, kept in memory so no forwarding pass lists a directory: built from disk once
+/// at start (`Store::open` and `Store::recover_outbox`) and updated by every write.
+#[derive(Debug, Default)]
+struct Ledger {
+    /// Receipt files in the store.
+    receipts: usize,
+    /// Receipts waiting for the research record, in sending order; each id at most once.
+    queue: VecDeque<String>,
+    queued: HashSet<String>,
+    /// Receipts the record holds, by the time their outcome was written: the only ones retention removes.
+    held: BTreeSet<(SystemTime, String)>,
 }
 
 impl Store {
@@ -104,10 +127,16 @@ impl Store {
             ensure_private_dir(&root.join(sub))?;
             remove_temporaries(&root.join(sub))?;
         }
+        let receipts = receipt_ids(&root.join("receipts"))?.len();
         Ok(Self {
             root,
-            _lock: std::sync::Arc::new(lock),
+            _lock: Arc::new(lock),
             outbox: false,
+            receipt_limit: DEFAULT_RECEIPT_LIMIT,
+            ledger: Arc::new(Mutex::new(Ledger {
+                receipts,
+                ..Ledger::default()
+            })),
         })
     }
 
@@ -116,6 +145,30 @@ impl Store {
     pub fn with_outbox(mut self) -> Self {
         self.outbox = true;
         self
+    }
+
+    /// Sets how many receipts the store keeps before refusing new sandbox starts. Set before the
+    /// store is shared.
+    #[must_use]
+    pub fn with_receipt_limit(mut self, limit: usize) -> Self {
+        self.receipt_limit = limit;
+        self
+    }
+
+    fn ledger(&self) -> MutexGuard<'_, Ledger> {
+        self.ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Receipt files in the store now.
+    pub fn receipt_count(&self) -> usize {
+        self.ledger().receipts
+    }
+
+    /// The operator's receipt limit.
+    pub fn receipt_limit(&self) -> usize {
+        self.receipt_limit
     }
 
     pub fn root(&self) -> &Path {
@@ -146,6 +199,11 @@ impl Store {
         }
         if self.count("starts")? >= MAX_TRACKED {
             return Err(StoreError::Full("start"));
+        }
+        // A full store refuses new sandboxes rather than any receipt of one already tracked, so no
+        // receipt waiting for the record is ever dropped to make room.
+        if self.receipt_count() >= self.receipt_limit {
+            return Err(StoreError::Full("receipt"));
         }
         let bytes = serde_json::to_vec_pretty(record).map_err(StoreError::Encode)?;
         publish_new(&path, &format!("{id}.json"), &bytes)
@@ -227,6 +285,7 @@ impl Store {
             existing_receipt(id, path, &sidecar)?
         } else {
             let sha256 = hex(&Sha256::digest(bytes));
+            self.ledger().receipts += 1;
             replace_file(&sidecar, digest_line(&sha256, id).as_bytes())?;
             WrittenReceipt {
                 path,
@@ -250,7 +309,12 @@ impl Store {
     }
 
     fn enqueue(&self, id: &str) -> Result<(), StoreError> {
-        create_new_file(&self.outbox_path(id)?, b"").map(|_| ())
+        create_new_file(&self.outbox_path(id)?, b"")?;
+        let mut ledger = self.ledger();
+        if ledger.queued.insert(id.to_string()) {
+            ledger.queue.push_back(id.to_string());
+        }
+        Ok(())
     }
 
     fn dequeue(&self, id: &str) -> Result<(), StoreError> {
@@ -265,65 +329,89 @@ impl Store {
         }
     }
 
-    /// Queues receipts written before forwarding was turned on (or before a crash wrote their
-    /// marker): every receipt with no outcome. One full listing, at the forwarder's start.
-    pub fn enqueue_unforwarded(&self) -> Result<usize, StoreError> {
-        let dir = self.root.join("receipts");
+    /// Rebuilds the forwarding queue from disk: every receipt with no outcome is queued (its marker
+    /// written again if a crash lost it), oldest first, and every receipt the record holds is listed
+    /// for retention. Lists the receipts and outcomes once, so its work is bounded by the receipt
+    /// limit; the forwarder runs it at start and again each pass until it succeeds.
+    pub fn recover_outbox(&self) -> Result<usize, StoreError> {
+        let mut pending = Vec::new();
+        let mut held = Vec::new();
+        for id in receipt_ids(&self.root.join("receipts"))? {
+            let outcome = self.path("forwarded", &id)?;
+            match fs::metadata(&outcome) {
+                Ok(metadata) => {
+                    let value: Option<serde_json::Value> = read_record(&outcome)?;
+                    if matches!(value.as_ref().and_then(|v| v.get("record")), Some(record) if !record.is_null())
+                    {
+                        held.push((metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH), id));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let receipt = self.path("receipts", &id)?;
+                    let written = fs::metadata(&receipt)
+                        .and_then(|metadata| metadata.modified())
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    create_new_file(&self.outbox_path(&id)?, b"")?;
+                    pending.push((written, id));
+                }
+                Err(error) => {
+                    return Err(StoreError::Io {
+                        path: outcome,
+                        source: error,
+                    });
+                }
+            }
+        }
+        pending.sort();
+        let mut ledger = self.ledger();
         let mut queued = 0;
-        for entry in fs::read_dir(&dir)
-            .map_err(io_error(&dir))?
-            .filter_map(Result::ok)
-        {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(id) = name.strip_suffix(".json") else {
-                continue;
-            };
-            if valid_sandbox_id(id)
-                && !self.path("forwarded", id)?.exists()
-                && create_new_file(&self.outbox_path(id)?, b"")?
-            {
+        for (_, id) in pending {
+            if ledger.queued.insert(id.clone()) {
+                ledger.queue.push_back(id);
                 queued += 1;
             }
         }
+        ledger.held.extend(held);
         Ok(queued)
     }
 
-    /// The oldest queued receipts, at most `limit`. Reads only the queue, never the receipts already
-    /// forwarded, and holds at most `limit` entries in memory.
-    pub fn outbox(&self, limit: usize) -> Result<Vec<String>, StoreError> {
-        let dir = self.root.join("outbox");
-        let mut oldest: std::collections::BinaryHeap<(SystemTime, String)> =
-            std::collections::BinaryHeap::with_capacity(limit + 1);
-        for entry in fs::read_dir(&dir)
-            .map_err(io_error(&dir))?
-            .filter_map(Result::ok)
-        {
-            let id = entry.file_name().to_string_lossy().into_owned();
-            if !valid_sandbox_id(&id) {
-                continue;
-            }
-            let modified = entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            oldest.push((modified, id));
-            if oldest.len() > limit {
-                oldest.pop();
-            }
-        }
-        let mut ids = oldest.into_vec();
-        ids.sort();
-        Ok(ids.into_iter().map(|(_, id)| id).collect())
+    /// Takes up to `limit` receipts from the front of the queue. Each stays marked as queued until
+    /// it has an outcome, is put back, or is forgotten.
+    pub fn next_batch(&self, limit: usize) -> Vec<String> {
+        let mut ledger = self.ledger();
+        let count = limit.min(ledger.queue.len());
+        ledger.queue.drain(..count).collect()
     }
 
-    /// How many receipts are queued for forwarding.
-    pub fn outbox_len(&self) -> Result<usize, StoreError> {
-        let dir = self.root.join("outbox");
-        Ok(fs::read_dir(&dir)
-            .map_err(io_error(&dir))?
-            .filter_map(Result::ok)
-            .filter(|entry| valid_sandbox_id(&entry.file_name().to_string_lossy()))
-            .count())
+    /// Puts a receipt that could not be read now at the back of the queue, so the receipts behind it
+    /// are sent first and it is tried again later.
+    pub fn defer(&self, id: &str) {
+        let mut ledger = self.ledger();
+        if ledger.queued.contains(id) {
+            ledger.queue.push_back(id.to_string());
+        }
+    }
+
+    /// Puts receipts a pass did not reach back at the front of the queue, in their order.
+    pub fn put_back(&self, ids: Vec<String>) {
+        let mut ledger = self.ledger();
+        for id in ids.into_iter().rev() {
+            if ledger.queued.contains(&id) {
+                ledger.queue.push_front(id);
+            }
+        }
+    }
+
+    /// How many receipts wait for the research record.
+    pub fn outbox_len(&self) -> usize {
+        self.ledger().queued.len()
+    }
+
+    /// Lists a receipt the record now holds for retention.
+    pub fn hold(&self, id: &str) {
+        self.ledger()
+            .held
+            .insert((SystemTime::now(), id.to_string()));
     }
 
     /// The size of a written receipt, read without opening it.
@@ -369,50 +457,38 @@ impl Store {
 
     /// Drops a queued entry whose receipt no longer exists.
     pub fn forget_queued(&self, id: &str) -> Result<(), StoreError> {
-        self.dequeue(id)
+        self.dequeue(id)?;
+        self.ledger().queued.remove(id);
+        Ok(())
     }
 
-    /// Removes receipts the research record holds (an outcome with a record) whose outcome is
-    /// older than `before`, with their digest and outcome, at most `limit` a call. Refusals are kept:
-    /// those receipts are not in the record. Returns how many were removed.
+    /// Removes receipts the research record holds whose outcome is older than `before`, with their
+    /// digest and outcome, at most `limit` a call. It reads only the in-memory list of held receipts,
+    /// oldest first, so it examines at most one entry beyond those it removes. Refusals are kept: those
+    /// receipts are not in the record. Returns how many were removed.
     pub fn prune_forwarded(&self, before: SystemTime, limit: usize) -> Result<usize, StoreError> {
-        let dir = self.root.join("forwarded");
         let mut removed = 0;
-        for entry in fs::read_dir(&dir)
-            .map_err(io_error(&dir))?
-            .filter_map(Result::ok)
-        {
-            if removed >= limit {
-                break;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(id) = name.strip_suffix(".json") else {
-                continue;
+        while removed < limit {
+            let next = {
+                let mut ledger = self.ledger();
+                match ledger.held.first() {
+                    Some((at, _)) if *at < before => ledger.held.pop_first(),
+                    _ => None,
+                }
             };
-            if !valid_sandbox_id(id) {
-                continue;
-            }
-            let old = entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .is_ok_and(|modified| modified < before);
-            if !old {
-                continue;
-            }
-            let outcome: Option<serde_json::Value> = read_record(&entry.path()).unwrap_or(None);
-            let recorded = matches!(
-                outcome.as_ref().and_then(|outcome| outcome.get("record")),
-                Some(record) if !record.is_null()
-            );
-            if !recorded {
-                continue;
-            }
-            let receipt = self.path("receipts", id)?;
-            for path in [receipt.with_extension("json.sha256"), receipt, entry.path()] {
+            let Some((at, id)) = next else { break };
+            let receipt = self.path("receipts", &id)?;
+            let mut existed = false;
+            for path in [
+                receipt.with_extension("json.sha256"),
+                receipt.clone(),
+                self.path("forwarded", &id)?,
+            ] {
                 match fs::remove_file(&path) {
-                    Ok(()) => {}
+                    Ok(()) => existed |= path == receipt,
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => {
+                        self.ledger().held.insert((at, id));
                         return Err(StoreError::Io {
                             path,
                             source: error,
@@ -420,11 +496,15 @@ impl Store {
                     }
                 }
             }
+            if existed {
+                let mut ledger = self.ledger();
+                ledger.receipts = ledger.receipts.saturating_sub(1);
+            }
             removed += 1;
         }
         if removed > 0 {
             sync_dir(&self.root.join("receipts"))?;
-            sync_dir(&dir)?;
+            sync_dir(&self.root.join("forwarded"))?;
         }
         Ok(removed)
     }
@@ -436,6 +516,7 @@ impl Store {
         let bytes = serde_json::to_vec(outcome).map_err(StoreError::Encode)?;
         let new = publish_new(&path, &format!("{id}.json"), &bytes)?;
         self.dequeue(id)?;
+        self.ledger().queued.remove(id);
         Ok(new)
     }
 
@@ -456,6 +537,22 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// The sandbox ids of the receipts in `dir`.
+fn receipt_ids(dir: &Path) -> Result<Vec<String>, StoreError> {
+    Ok(fs::read_dir(dir)
+        .map_err(io_error(dir))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .strip_suffix(".json")
+                .filter(|id| valid_sandbox_id(id))
+                .map(str::to_string)
+        })
+        .collect())
 }
 
 fn digest_line(sha256: &str, id: &str) -> String {

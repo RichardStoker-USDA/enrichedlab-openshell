@@ -229,7 +229,7 @@ async fn forwards_each_receipt_once_as_its_exact_bytes() {
         "{outcome}"
     );
     assert!(outcome.get("refused").is_none());
-    assert_eq!(h.store.outbox_len().unwrap(), 0);
+    assert_eq!(h.store.outbox_len(), 0);
 
     // Nothing is sent again.
     assert_eq!(
@@ -262,7 +262,7 @@ async fn an_unavailable_record_stops_the_pass_and_keeps_receipts_pending() {
             },
             "{code:?}"
         );
-        assert_eq!(h.store.outbox_len().unwrap(), 2, "{code:?}");
+        assert_eq!(h.store.outbox_len(), 2, "{code:?}");
     }
     // The token is read again for every call, so a rotated token is used at once.
     fs::write(h.destination.token_file.clone(), "second-token").unwrap();
@@ -296,7 +296,7 @@ async fn a_retry_after_a_lost_answer_returns_the_original_record() {
             refused: 0
         }
     );
-    assert_eq!(h.store.outbox_len().unwrap(), 1);
+    assert_eq!(h.store.outbox_len(), 1);
     h.write("sandbox-b");
     assert_eq!(
         h.pass().await,
@@ -407,7 +407,7 @@ async fn an_unreadable_token_sends_nothing() {
         }
     );
     assert!(h.sent().is_empty());
-    assert_eq!(h.store.outbox_len().unwrap(), 1);
+    assert_eq!(h.store.outbox_len(), 1);
 }
 
 #[test]
@@ -493,10 +493,8 @@ async fn a_receipt_that_cannot_be_sent_never_holds_back_the_ones_after_it() {
         "PAYLOAD_SIZE"
     );
     assert!(!h.root.join("outbox/sandbox-5-gone").exists());
-    assert_eq!(
-        h.store.outbox(64).unwrap(),
-        vec!["sandbox-4-locked".to_string()]
-    );
+    assert_eq!(h.store.outbox_len(), 1);
+    assert!(h.root.join("outbox/sandbox-4-locked").exists());
 
     fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     assert_eq!(
@@ -506,15 +504,15 @@ async fn a_receipt_that_cannot_be_sent_never_holds_back_the_ones_after_it() {
             refused: 0
         }
     );
-    assert_eq!(h.store.outbox_len().unwrap(), 0);
+    assert_eq!(h.store.outbox_len(), 0);
 }
 
 #[tokio::test]
-async fn receipts_written_before_forwarding_are_queued_once_at_start() {
+async fn receipts_written_before_forwarding_are_queued_and_a_failed_recovery_can_run_again() {
     let root = temp_root();
     {
         let plain = Store::open(&root).unwrap();
-        for id in ["early-a", "early-b"] {
+        for id in ["early-a", "early-b", "early-c"] {
             plain
                 .write_receipt(id, &receipt(id, "2026-10-23T12:00:00Z"))
                 .unwrap();
@@ -522,68 +520,162 @@ async fn receipts_written_before_forwarding_are_queued_once_at_start() {
         plain
             .write_forwarded("early-b", &serde_json::json!({"record": {"sequence": 9}}))
             .unwrap();
-        assert_eq!(plain.outbox_len().unwrap(), 0);
+        plain
+            .write_forwarded("early-c", &serde_json::json!({"refused": {"reason": "X"}}))
+            .unwrap();
+        assert_eq!(plain.outbox_len(), 0);
     }
     let store = Store::open(&root).unwrap().with_outbox();
-    assert_eq!(store.enqueue_unforwarded().unwrap(), 1);
-    assert_eq!(store.enqueue_unforwarded().unwrap(), 0);
-    assert_eq!(store.outbox(64).unwrap(), vec!["early-a".to_string()]);
+    // A storage error during recovery leaves nothing half-queued, and the next attempt succeeds.
+    let receipts = root.join("receipts");
+    fs::set_permissions(
+        &receipts,
+        std::os::unix::fs::PermissionsExt::from_mode(0o000),
+    )
+    .unwrap();
+    assert!(store.recover_outbox().is_err());
+    assert_eq!(store.outbox_len(), 0);
+    fs::set_permissions(
+        &receipts,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    assert_eq!(store.recover_outbox().unwrap(), 1);
+    assert_eq!(store.recover_outbox().unwrap(), 0);
+    assert_eq!(store.outbox_len(), 1);
+    assert_eq!(store.next_batch(64), vec!["early-a".to_string()]);
+    // Only the recorded receipt is listed for retention; the refusal stays.
+    let later = std::time::SystemTime::now() + std::time::Duration::from_hours(24 * 365 * 10);
+    assert_eq!(store.prune_forwarded(later, 1_000).unwrap(), 1);
+    assert!(!root.join("receipts/early-b.json").exists());
+    assert!(root.join("receipts/early-c.json").exists());
     drop(store);
     let _ = fs::remove_dir_all(&root);
 }
 
 #[tokio::test]
-async fn a_listing_holds_only_the_oldest_queued_receipts() {
-    let h = harness().await;
-    for i in 0..10 {
-        h.write(&format!("sandbox-{i:02}"));
-        let marker = h.root.join(format!("outbox/sandbox-{i:02}"));
-        let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + i);
-        fs::File::options()
-            .write(true)
-            .open(&marker)
-            .unwrap()
-            .set_modified(at)
-            .unwrap();
+async fn sixty_four_unreadable_receipts_never_hold_back_the_next_one() {
+    let mut h = harness().await;
+    let mut locked = Vec::new();
+    for i in 0..64 {
+        let id = format!("sandbox-locked-{i:02}");
+        h.write(&id);
+        let path = h.root.join(format!("receipts/{id}.json"));
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+        locked.push(path);
+    }
+    h.write("sandbox-valid");
+    // The first pass takes the 64 unreadable receipts and sends them to the back; the next takes the
+    // valid one first.
+    assert_eq!(
+        h.pass().await,
+        Pass::Done {
+            forwarded: 0,
+            refused: 0
+        }
+    );
+    assert_eq!(
+        h.pass().await,
+        Pass::Done {
+            forwarded: 1,
+            refused: 0
+        }
+    );
+    assert!(
+        h.sent().iter().any(
+            |(_, request)| request.idempotency_key == idempotency_key(GATEWAY, "sandbox-valid")
+        )
+    );
+    assert_eq!(h.store.outbox_len(), 64);
+    for path in locked {
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     }
     assert_eq!(
-        h.store.outbox(3).unwrap(),
-        vec!["sandbox-00", "sandbox-01", "sandbox-02"]
+        h.pass().await,
+        Pass::Done {
+            forwarded: 64,
+            refused: 0
+        }
     );
-    assert_eq!(h.store.outbox_len().unwrap(), 10);
+    assert_eq!(h.store.outbox_len(), 0);
+}
+
+#[tokio::test]
+async fn an_unavailable_record_puts_the_rest_of_the_batch_back_in_order() {
+    let mut h = harness().await;
+    for id in ["sandbox-a", "sandbox-b", "sandbox-c"] {
+        h.write(id);
+    }
+    h.script(&[
+        Answer::Accept,
+        Answer::Refuse(Code::Unavailable, "RECORD_UNAVAILABLE"),
+    ]);
+    assert_eq!(
+        h.pass().await,
+        Pass::Later {
+            forwarded: 1,
+            refused: 0
+        }
+    );
+    assert_eq!(
+        h.store.next_batch(64),
+        vec!["sandbox-b".to_string(), "sandbox-c".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn a_full_store_refuses_new_sandboxes_and_keeps_every_receipt() {
+    let root = temp_root();
+    let store = Store::open(&root).unwrap().with_receipt_limit(2);
+    store
+        .write_start("tracked", &serde_json::json!({"sandbox_id": "tracked"}))
+        .unwrap();
+    for id in ["first", "second"] {
+        store
+            .write_receipt(id, &receipt(id, "2026-10-23T12:00:00Z"))
+            .unwrap();
+    }
+    assert!(matches!(
+        store.write_start("new", &serde_json::json!({"sandbox_id": "new"})),
+        Err(crate::store::StoreError::Full("receipt"))
+    ));
+    // A sandbox tracked before the store filled still gets its receipt.
+    store
+        .write_receipt("tracked", &receipt("tracked", "2026-10-23T12:00:00Z"))
+        .unwrap();
+    assert_eq!(store.receipt_count(), 3);
+    // A reopened store counts what is there.
+    drop(store);
+    let store = Store::open(&root).unwrap().with_receipt_limit(2);
+    assert_eq!(store.receipt_count(), 3);
+    drop(store);
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[tokio::test]
 async fn forwarded_receipts_leave_the_volume_after_retention_and_refusals_stay() {
     let mut h = harness().await;
-    h.write("sandbox-recorded");
-    h.write("sandbox-recent");
-    h.write("sandbox-refused");
+    for id in ["sandbox-recorded", "sandbox-recent", "sandbox-refused"] {
+        h.write(id);
+    }
+    h.script(&[
+        Answer::Accept,
+        Answer::Accept,
+        Answer::Refuse(Code::InvalidArgument, "PAYLOAD_NOT_JSON"),
+    ]);
     assert_eq!(
         h.pass().await,
         Pass::Done {
-            forwarded: 3,
-            refused: 0
+            forwarded: 2,
+            refused: 1
         }
     );
-    // Stands in for a receipt the record refused.
-    fs::write(
-        h.root.join("forwarded/sandbox-refused.json"),
-        serde_json::to_vec(&serde_json::json!({"refused": {"reason": "PAYLOAD_NOT_JSON"}}))
-            .unwrap(),
-    )
-    .unwrap();
-    let old = std::time::SystemTime::now() - std::time::Duration::from_hours(24 * 40);
-    for id in ["sandbox-recorded", "sandbox-refused"] {
-        fs::File::options()
-            .write(true)
-            .open(h.root.join(format!("forwarded/{id}.json")))
-            .unwrap()
-            .set_modified(old)
-            .unwrap();
-    }
-    let before = std::time::SystemTime::now() - h.destination.retention;
-    assert_eq!(h.store.prune_forwarded(before, 1_000).unwrap(), 1);
+    // Nothing the record holds is past a retention that ends before it was forwarded.
+    let earlier = std::time::SystemTime::now() - h.destination.retention;
+    assert_eq!(h.store.prune_forwarded(earlier, 1_000).unwrap(), 0);
+    // Past retention, removal takes the oldest first and stops at its limit.
+    let later = std::time::SystemTime::now() + h.destination.retention;
+    assert_eq!(h.store.prune_forwarded(later, 1).unwrap(), 1);
     for gone in [
         "receipts/sandbox-recorded.json",
         "receipts/sandbox-recorded.json.sha256",
@@ -591,13 +683,17 @@ async fn forwarded_receipts_leave_the_volume_after_retention_and_refusals_stay()
     ] {
         assert!(!h.root.join(gone).exists(), "{gone}");
     }
+    assert!(h.root.join("receipts/sandbox-recent.json").exists());
+    assert_eq!(h.store.prune_forwarded(later, 1_000).unwrap(), 1);
+    // The refused receipt is never removed: the record does not have it.
+    assert_eq!(h.store.prune_forwarded(later, 1_000).unwrap(), 0);
     for kept in [
-        "receipts/sandbox-recent.json",
         "receipts/sandbox-refused.json",
         "forwarded/sandbox-refused.json",
     ] {
         assert!(h.root.join(kept).exists(), "{kept}");
     }
+    assert_eq!(h.store.receipt_count(), 1);
 }
 
 #[test]

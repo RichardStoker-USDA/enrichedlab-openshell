@@ -98,6 +98,15 @@ pub fn unforwarded(count: usize) {
     gauge!("enrichedlab_receipts_unforwarded").set(count as f64);
 }
 
+/// Receipts in the store and the operator's limit; at the limit new sandbox starts are refused.
+pub fn stored(count: usize, limit: usize) {
+    #[allow(clippy::cast_precision_loss)]
+    {
+        gauge!("enrichedlab_receipts_stored").set(count as f64);
+        gauge!("enrichedlab_receipts_store_limit").set(limit as f64);
+    }
+}
+
 /// Early Pod reports the service could not hold (its bounds were full); the receipt of an affected
 /// sandbox says so.
 pub fn pods_unheld(count: u64) {

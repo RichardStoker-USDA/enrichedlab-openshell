@@ -82,8 +82,11 @@ OnRootMismatch` so a restart does not rewrite every receipt's ownership. A start
 written to a temporary file, flushed, and hard-linked to its name, so the name never holds a partial record and an
 existing one is never replaced. An existing receipt is checked against its digest file before its sandbox's working
 records are removed; a digest file lost to a crash between the two writes is written again. At most 4,096 start and 4,096 observed
-records are kept at once. Without forwarding, receipts are kept until removed by whatever retention applies to the
-volume; with forwarding, see below.
+records are kept at once. The store keeps at most `--max-receipts` receipts (default 20,000): while it holds that many,
+a new sandbox start is refused (the gateway's binding is observe-only, so the sandbox runs without a receipt and the
+start failure is counted), and every receipt already written, or due for a sandbox already tracked, is kept. Receipts
+therefore never exceed the limit by more than the 4,096 tracked sandboxes. Size the limit to the volume. Without
+forwarding, receipts are kept until removed by whatever retention applies to the volume; with forwarding, see below.
 
 ## Metrics
 
@@ -138,9 +141,11 @@ across gateway restarts. Once the gateway runs, an unavailable service only lose
 With `--evidence-endpoint` set, the service also sends each receipt to an EnrichedLab research record
 (`enrichedlab.evidence.v1.EvidenceAppendService`, generated from the contracts descriptor in `proto/`). Each receipt
 written is queued as an empty marker in `<state>/outbox/`; at start the service also queues every receipt that has no
-outcome in `<state>/forwarded/`. Every 30 seconds it takes the 64 oldest markers and sends each receipt's exact bytes
-and SHA-256 as a `sandbox.receipt` record. A pass reads only the outbox directory and holds at most 64 entries, however
-many receipts the volume keeps.
+outcome in `<state>/forwarded/`, and lists the receipts the record holds; that one listing is bounded by the receipt
+limit and is retried every pass until it succeeds. From then on the queue lives in memory and every write updates it:
+every 30 seconds the service takes up to 64 receipts from the front of the queue and sends each one's exact bytes and
+SHA-256 as a `sandbox.receipt` record. No pass lists a directory, so its work does not grow with the number of
+receipts kept.
 The record's answer (record id, chain, sequence, hash, and whether it was a replay) is kept as the outcome, so the
 record's payload digest matches the receipt's `.sha256` file.
 
@@ -155,14 +160,17 @@ record's payload digest matches the receipt's `.sha256` file.
   before it is read), one that does not parse, one without a readable end time, or one that no longer matches its
   digest file; none of these is sent.
 - A problem with one receipt never holds back the receipts queued after it. A digest file lost to a crash between the
-  receipt and its digest is written again from the receipt; a receipt that cannot be opened now is tried again next
-  pass; a marker whose receipt is gone is dropped.
+  receipt and its digest is written again from the receipt; a receipt that cannot be opened now goes to the back of the
+  queue and is tried again after the others; a marker whose receipt is gone is dropped. When the record is unavailable
+  the receipts the pass did not reach go back to the front in their order.
 - The endpoint must be `https`: the token goes with every call, and TLS settings alone do not upgrade an `http` URI,
   so the service refuses to start with any other scheme.
 - A receipt the record holds is removed from the volume, with its digest and outcome, once its outcome is older than
-  `--evidence-retention-days` (default 30; up to 1,000 an hour). Refused receipts are kept for an operator, since the
-  record does not have them. Volume use is the receipt rate times the retention, plus any backlog while the record is
-  unavailable; `enrichedlab_receipts_unforwarded` shows that backlog.
+  `--evidence-retention-days` (default 30). Removal runs after every pass, up to 1,000 receipts a pass, oldest first,
+  from an in-memory list of the receipts the record holds, so it never examines a receipt it cannot remove. Refused
+  receipts are kept for an operator, since the record does not have them; they count toward the receipt limit.
+  `enrichedlab_receipts_unforwarded` shows the backlog and `enrichedlab_receipts_stored` against
+  `enrichedlab_receipts_store_limit` how full the store is.
 - Every receipt goes to one lab's standalone scope (`--evidence-tenant`, `--evidence-group`). Sandbox labels are set
   by whoever creates the sandbox, so they never choose where a record goes.
 
@@ -175,3 +183,4 @@ in that lab's standalone scope.
 |---|---|
 | `enrichedlab_receipts_forwarded_total` | `outcome`: `forwarded`, `replayed`, `refused`, `retry` |
 | `enrichedlab_receipts_unforwarded` | none: receipts queued in the outbox |
+| `enrichedlab_receipts_stored`, `enrichedlab_receipts_store_limit` | none: receipts in the store and the limit |

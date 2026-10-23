@@ -50,6 +50,9 @@ pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_TOKEN_BYTES: u64 = 16 * 1024;
 /// Receipts sent in one pass.
 const BATCH: usize = 64;
+/// Receipts past retention removed in one pass. At one pass every 30 seconds this is far above any
+/// sandbox rate the gateway admits, so removal keeps pace with forwarding.
+const PRUNE_BATCH: usize = 1_000;
 /// The event type of a forwarded receipt.
 pub const EVENT_TYPE: &str = "sandbox.receipt";
 const OUTCOME_SCHEMA: &str = "enrichedlab.receipts.forwarded/v1";
@@ -201,138 +204,36 @@ fn refused(store: &Store, id: &str, code: &str, reason: &str) -> Result<(), Stor
         .map(|_| ())
 }
 
-/// Sends the oldest pending receipts once.
+/// Sends the receipts at the front of the queue once, at most [`BATCH`].
+///
+/// A receipt that cannot be read now goes to the back of the queue, so it never holds back the
+/// receipts behind it. When the record is unavailable, or the store cannot be written, the receipts
+/// the pass did not finish go back to the front in their order.
 pub async fn pass(
     store: &Store,
     client: &mut EvidenceAppendServiceClient<Channel>,
     destination: &Destination,
     gateway: &str,
 ) -> Result<Pass, StoreError> {
+    let mut batch: std::collections::VecDeque<String> = store.next_batch(BATCH).into();
     let (mut forwarded, mut refused_count) = (0, 0);
-    for id in store.outbox(BATCH)? {
-        // Every failure below is this receipt's alone: it is refused and kept, or skipped for this
-        // pass, and the receipts queued after it are still sent.
-        let refuse = |reason: &str| -> Result<(), StoreError> {
-            refused(store, &id, "LOCAL", reason)?;
-            telemetry::forwarded("refused");
-            Ok(())
-        };
-        match store.receipt_len(&id) {
-            Ok(length) if length > MAX_PAYLOAD_BYTES as u64 => {
-                refuse("PAYLOAD_SIZE")?;
-                refused_count += 1;
-                continue;
-            }
-            Ok(_) => {}
-            Err(StoreError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-                store.forget_queued(&id)?;
-                continue;
-            }
-            Err(error) => {
-                warn!(error = %error, "a queued receipt cannot be read now; trying it next pass");
-                telemetry::failure("forward");
-                continue;
-            }
-        }
-        let (bytes, sha256) = match store.read_receipt(&id) {
-            Ok(read) => read,
-            Err(StoreError::Digest(_)) => {
-                // A receipt that no longer matches its digest never enters the record.
-                refuse("RECEIPT_DIGEST_MISMATCH")?;
-                refused_count += 1;
-                continue;
-            }
-            Err(StoreError::Unreadable(_)) => {
-                refuse("RECEIPT_UNREADABLE")?;
-                refused_count += 1;
-                continue;
-            }
-            Err(error) => {
-                warn!(error = %error, "a queued receipt cannot be read now; trying it next pass");
-                telemetry::failure("forward");
-                continue;
-            }
-        };
-        let Some(source_time) = source_time(&bytes) else {
-            refused(store, &id, "LOCAL", "SOURCE_TIME_INVALID")?;
-            telemetry::forwarded("refused");
-            refused_count += 1;
-            continue;
-        };
-        let Some(token) = read_token(&destination.token_file) else {
-            warn!("the projected token for the research record cannot be read");
-            telemetry::forwarded("retry");
-            return Ok(Pass::Later {
-                forwarded,
-                refused: refused_count,
-            });
-        };
-        let mut request = Request::new(AppendRequest {
-            tenant_id: destination.tenant.clone(),
-            group_key: destination.group.clone(),
-            scope_kind: ScopeKind::Standalone as i32,
-            project_id: String::new(),
-            run_id: String::new(),
-            event_type: EVENT_TYPE.to_string(),
-            idempotency_key: idempotency_key(gateway, &id),
-            source_time: Some(source_time),
-            payload: bytes,
-            payload_sha256: sha256,
-        });
-        let Ok(value) = format!("Bearer {token}").parse() else {
-            telemetry::forwarded("retry");
-            return Ok(Pass::Later {
-                forwarded,
-                refused: refused_count,
-            });
-        };
-        request.metadata_mut().insert("authorization", value);
-        match client.append(request).await {
-            Ok(response) => {
-                let answer = response.into_inner();
-                store.write_forwarded(
-                    &id,
-                    &Outcome {
-                        schema: OUTCOME_SCHEMA,
-                        at: now(),
-                        record: Some(Recorded {
-                            record_id: answer.record_id,
-                            stream_id: answer.stream_id,
-                            sequence: answer.sequence,
-                            record_hash: answer.record_hash,
-                            replayed: answer.replayed,
-                        }),
-                        refused: None,
-                    },
-                )?;
-                telemetry::forwarded(if answer.replayed {
-                    "replayed"
-                } else {
-                    "forwarded"
-                });
-                forwarded += 1;
-            }
-            Err(status) if refuses_the_receipt(&status) => {
-                let reason = status
-                    .get_details_error_info()
-                    .map(|info| info.reason)
-                    .unwrap_or_default();
-                warn!(code = ?status.code(), reason = %reason, "the research record refused a receipt");
-                refused(store, &id, &format!("{:?}", status.code()), &reason)?;
-                telemetry::forwarded("refused");
-                refused_count += 1;
-            }
-            Err(status) => {
-                let reason = status
-                    .get_details_error_info()
-                    .map(|info| info.reason)
-                    .unwrap_or_default();
-                warn!(code = ?status.code(), reason = %reason, "the research record is unavailable; retrying later");
-                telemetry::forwarded("retry");
+    while let Some(id) = batch.pop_front() {
+        match send(store, client, destination, gateway, &id).await {
+            Ok(Sent::Forwarded) => forwarded += 1,
+            Ok(Sent::Refused) => refused_count += 1,
+            Ok(Sent::Deferred) => store.defer(&id),
+            Ok(Sent::Later) => {
+                batch.push_front(id);
+                store.put_back(batch.into());
                 return Ok(Pass::Later {
                     forwarded,
                     refused: refused_count,
                 });
+            }
+            Err(error) => {
+                batch.push_front(id);
+                store.put_back(batch.into());
+                return Err(error);
             }
         }
     }
@@ -340,6 +241,127 @@ pub async fn pass(
         forwarded,
         refused: refused_count,
     })
+}
+
+/// What happened to one receipt in a pass.
+enum Sent {
+    /// The record holds it.
+    Forwarded,
+    /// It is kept with its refusal and not sent again.
+    Refused,
+    /// It could not be read now; it is tried again after the rest of the queue.
+    Deferred,
+    /// The record (or its token) is unavailable; the pass stops.
+    Later,
+}
+
+async fn send(
+    store: &Store,
+    client: &mut EvidenceAppendServiceClient<Channel>,
+    destination: &Destination,
+    gateway: &str,
+    id: &str,
+) -> Result<Sent, StoreError> {
+    let refuse = |reason: &str| -> Result<Sent, StoreError> {
+        refused(store, id, "LOCAL", reason)?;
+        telemetry::forwarded("refused");
+        Ok(Sent::Refused)
+    };
+    match store.receipt_len(id) {
+        Ok(length) if length > MAX_PAYLOAD_BYTES as u64 => return refuse("PAYLOAD_SIZE"),
+        Ok(_) => {}
+        Err(StoreError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            store.forget_queued(id)?;
+            return Ok(Sent::Deferred);
+        }
+        Err(error) => {
+            warn!(error = %error, "a queued receipt cannot be read now; trying it after the rest");
+            telemetry::failure("forward");
+            return Ok(Sent::Deferred);
+        }
+    }
+    let (bytes, sha256) = match store.read_receipt(id) {
+        Ok(read) => read,
+        // A receipt that no longer matches its digest never enters the record.
+        Err(StoreError::Digest(_)) => return refuse("RECEIPT_DIGEST_MISMATCH"),
+        Err(StoreError::Unreadable(_)) => return refuse("RECEIPT_UNREADABLE"),
+        Err(error) => {
+            warn!(error = %error, "a queued receipt cannot be read now; trying it after the rest");
+            telemetry::failure("forward");
+            return Ok(Sent::Deferred);
+        }
+    };
+    let Some(source_time) = source_time(&bytes) else {
+        return refuse("SOURCE_TIME_INVALID");
+    };
+    let Some(token) = read_token(&destination.token_file) else {
+        warn!("the projected token for the research record cannot be read");
+        telemetry::forwarded("retry");
+        return Ok(Sent::Later);
+    };
+    let mut request = Request::new(AppendRequest {
+        tenant_id: destination.tenant.clone(),
+        group_key: destination.group.clone(),
+        scope_kind: ScopeKind::Standalone as i32,
+        project_id: String::new(),
+        run_id: String::new(),
+        event_type: EVENT_TYPE.to_string(),
+        idempotency_key: idempotency_key(gateway, id),
+        source_time: Some(source_time),
+        payload: bytes,
+        payload_sha256: sha256,
+    });
+    let Ok(value) = format!("Bearer {token}").parse() else {
+        telemetry::forwarded("retry");
+        return Ok(Sent::Later);
+    };
+    request.metadata_mut().insert("authorization", value);
+    match client.append(request).await {
+        Ok(response) => {
+            let answer = response.into_inner();
+            store.write_forwarded(
+                id,
+                &Outcome {
+                    schema: OUTCOME_SCHEMA,
+                    at: now(),
+                    record: Some(Recorded {
+                        record_id: answer.record_id,
+                        stream_id: answer.stream_id,
+                        sequence: answer.sequence,
+                        record_hash: answer.record_hash,
+                        replayed: answer.replayed,
+                    }),
+                    refused: None,
+                },
+            )?;
+            store.hold(id);
+            telemetry::forwarded(if answer.replayed {
+                "replayed"
+            } else {
+                "forwarded"
+            });
+            Ok(Sent::Forwarded)
+        }
+        Err(status) if refuses_the_receipt(&status) => {
+            let reason = status
+                .get_details_error_info()
+                .map(|info| info.reason)
+                .unwrap_or_default();
+            warn!(code = ?status.code(), reason = %reason, "the research record refused a receipt");
+            refused(store, id, &format!("{:?}", status.code()), &reason)?;
+            telemetry::forwarded("refused");
+            Ok(Sent::Refused)
+        }
+        Err(status) => {
+            let reason = status
+                .get_details_error_info()
+                .map(|info| info.reason)
+                .unwrap_or_default();
+            warn!(code = ?status.code(), reason = %reason, "the research record is unavailable; retrying later");
+            telemetry::forwarded("retry");
+            Ok(Sent::Later)
+        }
+    }
 }
 
 /// A wait between half of `delay` and all of it, so restarted instances and a recovered record do
@@ -354,8 +376,9 @@ pub fn jittered(delay: Duration) -> Duration {
 /// Forwards receipts for the life of the service.
 ///
 /// A pass runs every `interval` (jittered), backing off to ten minutes while the record is unavailable.
-/// At start it queues any receipt that has no outcome; each hour it removes up to 1,000 receipts the
-/// record has held for longer than the retention.
+/// Before its first pass it rebuilds the queue from disk (retried each pass until it succeeds); after
+/// every pass it removes up to [`PRUNE_BATCH`] receipts the record has held for longer than the
+/// retention.
 pub async fn run(
     store: Store,
     channel: Channel,
@@ -365,16 +388,25 @@ pub async fn run(
 ) {
     let mut client = EvidenceAppendServiceClient::new(channel);
     let mut delay = interval;
-    match store.enqueue_unforwarded() {
-        Ok(queued) if queued > 0 => info!(queued, "receipts queued for the research record"),
-        Ok(_) => {}
-        Err(error) => {
-            warn!(error = %error, "receipts written before forwarding could not be queued");
-            telemetry::failure("forward");
-        }
-    }
+    let mut recovered = false;
     let mut pruned_at: Option<std::time::Instant> = None;
     loop {
+        // Receipts written before forwarding started, or whose marker a crash lost, join the queue
+        // once; a failed recovery (a storage error) is tried again each pass until it succeeds.
+        if !recovered {
+            match store.recover_outbox() {
+                Ok(queued) => {
+                    recovered = true;
+                    if queued > 0 {
+                        info!(queued, "receipts queued for the research record");
+                    }
+                }
+                Err(error) => {
+                    warn!(error = %error, "the receipt queue could not be rebuilt; trying again next pass");
+                    telemetry::failure("forward");
+                }
+            }
+        }
         match pass(&store, &mut client, &destination, &gateway).await {
             Ok(Pass::Done { forwarded, refused }) => {
                 if forwarded + refused > 0 {
@@ -387,17 +419,17 @@ pub async fn run(
             }
             Ok(Pass::Later { .. }) => delay = (delay * 2).min(Duration::from_mins(10)),
             Err(error) => {
-                warn!(error = %error, "the receipt outbox cannot be read");
+                warn!(error = %error, "the receipt store cannot be written");
                 telemetry::failure("forward");
                 delay = (delay * 2).min(Duration::from_mins(10));
             }
         }
-        if pruned_at.is_none_or(|at| at.elapsed() >= Duration::from_hours(1)) {
+        if recovered && pruned_at.is_none_or(|at| at.elapsed() >= interval) {
             pruned_at = Some(std::time::Instant::now());
             let before = std::time::SystemTime::now()
                 .checked_sub(destination.retention)
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            match store.prune_forwarded(before, 1_000) {
+            match store.prune_forwarded(before, PRUNE_BATCH) {
                 Ok(removed) if removed > 0 => {
                     info!(removed, "forwarded receipts past retention removed");
                 }
@@ -408,9 +440,8 @@ pub async fn run(
                 }
             }
         }
-        if let Ok(count) = store.outbox_len() {
-            telemetry::unforwarded(count);
-        }
+        telemetry::unforwarded(store.outbox_len());
+        telemetry::stored(store.receipt_count(), store.receipt_limit());
         tokio::time::sleep(jittered(delay)).await;
     }
 }
