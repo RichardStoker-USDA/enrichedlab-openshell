@@ -21,9 +21,9 @@ use openshell_core::proto::compute::v1::{
     DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverSandbox, EnsureWorkspaceRequest,
     EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
     GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
-    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_server::ComputeDriver,
+    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, SuspendSandboxRequest,
+    SuspendSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
+    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_server::ComputeDriver,
 };
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -305,23 +305,6 @@ impl Stream for UnixIncoming {
 
 #[tonic::async_trait]
 impl ComputeDriver for FakeComputeDriver {
-    async fn select_warm_pair(
-        &self,
-        request: Request<openshell_core::proto::compute::v1::SelectWarmPairRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::SelectWarmPairResponse>, Status> {
-        let _ = &request;
-        Err(Status::unimplemented(
-            "warm pair allocation is not supported",
-        ))
-    }
-
-    async fn sync_warm_pools(
-        &self,
-        _request: Request<openshell_core::proto::compute::v1::SyncWarmPoolsRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::SyncWarmPoolsResponse>, Status> {
-        Err(Status::unimplemented("warm pools are not supported"))
-    }
-
     async fn authenticate_sandbox(
         &self,
         _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
@@ -385,7 +368,6 @@ impl ComputeDriver for FakeComputeDriver {
         let sandbox = sandbox.ok_or_else(|| Status::not_found("sandbox not found"))?;
         Ok(Response::new(GetSandboxResponse {
             sandbox: Some(sandbox),
-            runtime_identity: String::new(),
         }))
     }
 
@@ -417,6 +399,15 @@ impl ComputeDriver for FakeComputeDriver {
                 .push(FakeComputeDriverCall::CreateSandbox { sandbox });
         });
         Ok(Response::new(CreateSandboxResponse::default()))
+    }
+
+    async fn suspend_sandbox(
+        &self,
+        _request: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SuspendSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "the test compute driver does not support sandbox suspend",
+        ))
     }
 
     async fn stop_sandbox(

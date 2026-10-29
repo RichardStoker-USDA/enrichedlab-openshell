@@ -2754,8 +2754,22 @@ async fn resolve_sandbox_by_name_for_principal(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
 
     match principal {
-        Principal::Sandbox(_) => {
+        Principal::Sandbox(caller) => {
             let Some(sandbox) = sandbox else {
+                // A supervisor only ever names its own sandbox. When its own
+                // record is gone too, the sandbox was deleted, which is not
+                // misuse.
+                let caller_exists = store
+                    .get_message::<Sandbox>(&caller.sandbox_id)
+                    .await
+                    .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+                    .is_some();
+                if caller_exists {
+                    crate::auth::audit::emit_authorization_denial(
+                        principal,
+                        crate::auth::audit::AuthzDenial::CrossSandboxName { name },
+                    );
+                }
                 return Err(Status::permission_denied(
                     "sandbox not found or not owned by caller",
                 ));
@@ -2774,8 +2788,8 @@ async fn resolve_sandbox_by_name_for_principal(
         Principal::User(_) | Principal::Operator(_) => {
             sandbox.ok_or_else(|| Status::not_found("sandbox not found"))
         }
-        Principal::Peer(_) => Err(Status::permission_denied(
-            "gateway peer principals may not resolve sandbox configuration",
+        Principal::Peer(_) | Principal::Supervisor(_) => Err(Status::permission_denied(
+            "gateway peer and supervisor principals may not resolve sandbox configuration",
         )),
         Principal::Anonymous => Err(Status::unauthenticated(
             "sandbox-scoped methods require an authenticated caller",
@@ -4168,7 +4182,6 @@ async fn handle_update_config_inner(
     let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     validate_caller_annotations(&req.annotations, "annotations")?;
-    crate::compute::warm_pool::validate_user_annotations(&req.annotations)?;
     let sandbox = if req.global {
         if !req.sandbox.is_empty() || req.workspace_scope.is_some() {
             return Err(Status::invalid_argument(
@@ -4199,7 +4212,12 @@ async fn handle_update_config_inner(
         sandbox.object_workspace().to_string()
     });
     if sandbox_caller {
-        validate_sandbox_caller_update(&req)?;
+        validate_sandbox_caller_update(&req).inspect_err(|_| {
+            crate::auth::audit::emit_authorization_denial(
+                principal,
+                crate::auth::audit::AuthzDenial::MethodNotPermitted,
+            );
+        })?;
     }
     let key = req.setting_key.trim();
     let has_policy = req.policy.is_some();
@@ -5450,6 +5468,9 @@ async fn ensure_log_stream_sandbox_scope(
     sandbox_id: &str,
     validated_sandbox_id: &mut Option<String>,
 ) -> Result<(), Status> {
+    // Guard every batch, so switching to another sandbox mid-stream is
+    // recorded like any other cross-sandbox attempt.
+    crate::auth::guard::ensure_sandbox_scope(principal, sandbox_id)?;
     if let Some(validated) = validated_sandbox_id.as_deref() {
         if sandbox_id != validated {
             return Err(Status::permission_denied(
@@ -5459,7 +5480,6 @@ async fn ensure_log_stream_sandbox_scope(
         return Ok(());
     }
 
-    crate::auth::guard::ensure_sandbox_scope(principal, sandbox_id)?;
     state
         .store
         .get_message::<Sandbox>(sandbox_id)
@@ -8201,10 +8221,9 @@ fn materialize_global_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::audit::test_support::assert_boundary_finding;
     use crate::auth::identity::{Identity, IdentityProvider};
-    use crate::auth::principal::{
-        Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
-    };
+    use crate::auth::principal::{Principal, UserPrincipal};
     use crate::grpc::test_support::{authed_request, test_server_state};
 
     /// An in-memory store with the example profiles imported at platform scope.
@@ -8433,13 +8452,7 @@ mod tests {
     pub(super) fn with_sandbox<T>(mut request: Request<T>, sandbox_id: &str) -> Request<T> {
         request
             .extensions_mut()
-            .insert(Principal::Sandbox(SandboxPrincipal {
-                sandbox_id: sandbox_id.to_string(),
-                source: SandboxIdentitySource::BootstrapJwt {
-                    issuer: "openshell-gateway:test".to_string(),
-                },
-                trust_domain: Some("openshell".to_string()),
-            }));
+            .insert(crate::auth::principal::test_support::sandbox(sandbox_id));
         request
     }
 
@@ -10442,6 +10455,7 @@ mod tests {
                 sandbox_id: "test-sandbox".to_string(),
                 source: SandboxIdentitySource::BootstrapJwt {
                     issuer: "openshell-gateway:test".to_string(),
+                    auth_epoch: None,
                 },
                 trust_domain: None,
             }));
@@ -11659,6 +11673,8 @@ mod tests {
     #[tokio::test]
     async fn sandbox_submit_policy_analysis_missing_name_returns_permission_denied() {
         let state = test_server_state().await;
+        let own = test_sandbox("sb-a", "own", ProtoSandboxPolicy::default(), vec![]);
+        state.store.put_message(&own).await.unwrap();
         let req = with_sandbox(
             Request::new(SubmitPolicyAnalysisRequest {
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
@@ -11668,10 +11684,43 @@ mod tests {
             "sb-a",
         );
 
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+
         let err = handle_submit_policy_analysis(&state, req)
             .await
             .expect_err("missing name must not leak existence to sandbox callers");
         assert_eq!(err.code(), Code::PermissionDenied);
+        let events = capture.json_events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["status_detail"], "cross_sandbox");
+        assert_eq!(
+            events[0]["resources"],
+            serde_json::json!([{"name": "missing-sandbox", "type": "sandbox"}])
+        );
+        assert_boundary_finding(&events[0], &events[1]);
+    }
+
+    #[tokio::test]
+    async fn sandbox_whose_own_record_is_gone_is_denied_without_a_finding() {
+        let state = test_server_state().await;
+        let req = with_sandbox(
+            Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: "own".to_string(),
+                ..Default::default()
+            }),
+            "sb-a",
+        );
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+
+        let err = handle_submit_policy_analysis(&state, req)
+            .await
+            .expect_err("a deleted sandbox must be refused");
+
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert!(capture.events().is_empty(), "deletion is not misuse");
     }
 
     #[tokio::test]
@@ -11739,15 +11788,22 @@ mod tests {
         let req = with_sandbox(Request::new(()), "sb-a");
         let principal = req.extensions().get::<Principal>().unwrap().clone();
         let mut validated = None;
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
 
         ensure_log_stream_sandbox_scope(&state, &principal, "sb-a", &mut validated)
             .await
             .expect("first frame should validate");
+        assert!(capture.events().is_empty(), "own sandbox is not a denial");
         let err = ensure_log_stream_sandbox_scope(&state, &principal, "sb-b", &mut validated)
             .await
             .expect_err("later frame must not switch sandbox ids");
 
         assert_eq!(err.code(), Code::PermissionDenied);
+        let events = capture.json_events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["status_detail"], "cross_sandbox");
+        assert_boundary_finding(&events[0], &events[1]);
     }
 
     #[tokio::test]
@@ -23096,19 +23152,34 @@ mod tests {
 
     #[test]
     fn config_revision_changes_when_supervisor_middleware_services_change() {
+        use openshell_core::proto::{
+            SupervisorMiddlewareBinding, SupervisorMiddlewareBindingPolicy,
+        };
+
         let policy = ProtoSandboxPolicy::default();
         let settings = HashMap::new();
-        let service = openshell_core::proto::SupervisorMiddlewareService {
+        let mut service = openshell_core::proto::SupervisorMiddlewareService {
             name: "local-guard".into(),
             grpc_endpoint: "http://127.0.0.1:50051".into(),
             max_payload_bytes: 1024,
             ..Default::default()
         };
 
-        let without = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[]);
-        let with =
-            compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[service]);
-        assert_ne!(without, with);
+        let revision = |services: &[openshell_core::proto::SupervisorMiddlewareService]| {
+            compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, services)
+        };
+        let without = revision(&[]);
+        let dynamic = revision(std::slice::from_ref(&service));
+        assert_ne!(without, dynamic);
+
+        service.binding_policy = SupervisorMiddlewareBindingPolicy::Allowlist.into();
+        service.bindings = vec![SupervisorMiddlewareBinding::HttpRequestPreCredentials.into()];
+        let request = revision(std::slice::from_ref(&service));
+        assert_ne!(dynamic, request);
+        service
+            .bindings
+            .push(SupervisorMiddlewareBinding::HttpResponsePreReturn.into());
+        assert_ne!(request, revision(&[service]));
     }
 
     #[test]

@@ -236,6 +236,8 @@ mock_gateway! {
         delete_sandbox(proto::DeleteSandboxRequest) -> proto::DeleteSandboxResponse;
         stop_sandbox(proto::StopSandboxRequest) -> proto::SandboxResponse;
         start_sandbox(proto::StartSandboxRequest) -> proto::SandboxResponse;
+        suspend_sandbox(proto::SuspendSandboxRequest) -> proto::SandboxResponse;
+        resume_sandbox(proto::ResumeSandboxRequest) -> proto::SandboxResponse;
         create_ssh_session(proto::CreateSshSessionRequest) -> proto::CreateSshSessionResponse;
         expose_service(proto::ExposeServiceRequest) -> proto::ServiceEndpointResponse;
         get_service(proto::GetServiceRequest) -> proto::ServiceEndpointResponse;
@@ -270,7 +272,6 @@ mock_gateway! {
         get_sandbox_provider_environment(proto::GetSandboxProviderEnvironmentRequest) -> proto::GetSandboxProviderEnvironmentResponse;
         exchange_provider_subject_token(proto::ExchangeProviderSubjectTokenRequest) -> proto::ExchangeProviderSubjectTokenResponse;
         get_sandbox_logs(proto::GetSandboxLogsRequest) -> proto::GetSandboxLogsResponse;
-        register_supervisor(proto::RegisterSupervisorRequest) -> proto::RegisterSupervisorResponse;
         report_main_process_exit(proto::ReportMainProcessExitRequest) -> proto::ReportMainProcessExitResponse;
         finalize_main_process_exit(proto::FinalizeMainProcessExitRequest) -> proto::FinalizeMainProcessExitResponse;
         peer_report_provider_readiness(proto::ReportProviderReadinessRequest) -> proto::ReportProviderReadinessResponse;

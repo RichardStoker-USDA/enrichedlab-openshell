@@ -86,14 +86,6 @@ impl ComputeDriverRpc {
 pub mod rpc {
     use super::ComputeDriverRpc;
 
-    pub const SELECT_WARM_PAIR: ComputeDriverRpc = ComputeDriverRpc::new(
-        "SelectWarmPair",
-        "openshell.compute.v1.ComputeDriver/SelectWarmPair",
-    );
-    pub const SYNC_WARM_POOLS: ComputeDriverRpc = ComputeDriverRpc::new(
-        "SyncWarmPools",
-        "openshell.compute.v1.ComputeDriver/SyncWarmPools",
-    );
     pub const AUTHENTICATE_SANDBOX: ComputeDriverRpc = ComputeDriverRpc::new(
         "AuthenticateSandbox",
         "openshell.compute.v1.ComputeDriver/AuthenticateSandbox",
@@ -125,6 +117,10 @@ pub mod rpc {
     pub const START_SANDBOX: ComputeDriverRpc = ComputeDriverRpc::new(
         "StartSandbox",
         "openshell.compute.v1.ComputeDriver/StartSandbox",
+    );
+    pub const SUSPEND_SANDBOX: ComputeDriverRpc = ComputeDriverRpc::new(
+        "SuspendSandbox",
+        "openshell.compute.v1.ComputeDriver/SuspendSandbox",
     );
     pub const DELETE_SANDBOX: ComputeDriverRpc = ComputeDriverRpc::new(
         "DeleteSandbox",
@@ -194,8 +190,6 @@ impl<B> MakeSpan<B> for ComputeDriverRpcSpan {
 /// Maps the generated compute-driver RPC schema to low-cardinality span names.
 pub fn compute_driver_rpc_operation(path: &str) -> Option<ComputeDriverRpc> {
     match path.rsplit('/').next() {
-        Some("SelectWarmPair") => Some(rpc::SELECT_WARM_PAIR),
-        Some("SyncWarmPools") => Some(rpc::SYNC_WARM_POOLS),
         Some("AuthenticateSandbox") => Some(rpc::AUTHENTICATE_SANDBOX),
         Some("GetCapabilities") => Some(rpc::GET_CAPABILITIES),
         Some("ValidateSandboxCreate") => Some(rpc::VALIDATE_SANDBOX_CREATE),
@@ -204,6 +198,7 @@ pub fn compute_driver_rpc_operation(path: &str) -> Option<ComputeDriverRpc> {
         Some("ListSandboxes") => Some(rpc::LIST_SANDBOXES),
         Some("StopSandbox") => Some(rpc::STOP_SANDBOX),
         Some("StartSandbox") => Some(rpc::START_SANDBOX),
+        Some("SuspendSandbox") => Some(rpc::SUSPEND_SANDBOX),
         Some("DeleteSandbox") => Some(rpc::DELETE_SANDBOX),
         Some("WatchSandboxes") => Some(rpc::WATCH_SANDBOXES),
         Some("EnsureWorkspace") => Some(rpc::ENSURE_WORKSPACE),
@@ -318,8 +313,6 @@ mod tests {
     #[test]
     fn compute_driver_rpc_names_are_explicitly_mapped_and_schema_bounded() {
         for rpc in [
-            rpc::SELECT_WARM_PAIR,
-            rpc::SYNC_WARM_POOLS,
             rpc::AUTHENTICATE_SANDBOX,
             rpc::GET_CAPABILITIES,
             rpc::VALIDATE_SANDBOX_CREATE,
@@ -328,6 +321,7 @@ mod tests {
             rpc::LIST_SANDBOXES,
             rpc::STOP_SANDBOX,
             rpc::START_SANDBOX,
+            rpc::SUSPEND_SANDBOX,
             rpc::DELETE_SANDBOX,
             rpc::WATCH_SANDBOXES,
             rpc::ENSURE_WORKSPACE,

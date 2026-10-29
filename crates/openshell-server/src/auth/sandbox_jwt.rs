@@ -4,9 +4,11 @@
 //! Gateway-minted session and extension JWTs.
 //!
 //! [`SandboxSessionJwtAuthority`] mints and verifies generation-bound sandbox
-//! session tokens. [`ExtensionJwtIssuer`] mints explicitly typed credentials
-//! for supervisor middleware and gateway interceptors and publishes the
-//! corresponding JWKS metadata.
+//! session tokens, and with the same key the shared supervisor's token for
+//! the private assignment stream (its own `typ` and claims, see
+//! [`super::supervisor_token`]). [`ExtensionJwtIssuer`] mints explicitly
+//! typed credentials for supervisor middleware and gateway interceptors and
+//! publishes the corresponding JWKS metadata.
 //!
 //! Algorithm: `EdDSA` (Ed25519). Pinned via `Validation::algorithms` to
 //! prevent algorithm-confusion attacks.
@@ -35,12 +37,17 @@ use x509_parser::{oid_registry::OID_SIG_ED25519, prelude::FromDer, x509::Subject
 
 use openshell_core::SandboxSessionId;
 use openshell_core::jwt::{
-    AuthenticatedSandboxSession, CredentialEpoch, GATEWAY_SESSION_JWT_TYPE, SandboxId,
-    SandboxLaunchAuthentication, SandboxRuntimeIdentity, SessionJwtError, SessionJwtIssuer,
-    SessionJwtVerifier, SessionTokenProfile, SessionVerificationKey, SupervisorAuthBundle,
+    AuthenticatedSandboxSession, AuthenticatedSupervisor, CredentialEpoch,
+    GATEWAY_SESSION_JWT_TYPE, MintedSessionToken, SandboxId, SandboxLaunchAuthentication,
+    SandboxRuntimeIdentity, SessionJwtError, SessionJwtIssuer, SessionJwtVerifier,
+    SessionTokenProfile, SessionVerificationKey, SupervisorAuthBundle, SupervisorJwtVerifier,
     SystemJwtClock,
 };
 use openshell_core::sandbox_generation::SandboxGenerationId;
+
+/// The method on which a sandbox renews its gateway JWT, and the only one that
+/// accepts a just-consumed bearer.
+pub const REFRESH_SANDBOX_TOKEN_PATH: &str = "/openshell.v1.OpenShell/RefreshSandboxToken";
 
 /// SPIFFE-shaped subject prefix. Embedded in the `sub` claim of every
 /// minted token so a future migration to per-sandbox certs or SPIRE can
@@ -98,6 +105,7 @@ pub struct MintedToken {
 pub struct SandboxSessionJwtAuthority {
     issuer: SessionJwtIssuer,
     gateway_verifier: SessionJwtVerifier,
+    supervisor_verifier: SupervisorJwtVerifier,
     gateway_id: String,
     verification_keys: Vec<SessionVerificationKey>,
 }
@@ -144,12 +152,16 @@ impl SandboxSessionJwtAuthority {
             gateway_id,
             SessionTokenProfile::Gateway,
             verification_keys.clone(),
-            clock,
+            clock.clone(),
         )
         .map_err(|error| error.to_string())?;
+        let supervisor_verifier =
+            SupervisorJwtVerifier::new(gateway_id, verification_keys.clone(), clock)
+                .map_err(|error| error.to_string())?;
         Ok(Self {
             issuer,
             gateway_verifier,
+            supervisor_verifier,
             gateway_id: gateway_id.to_string(),
             verification_keys,
         })
@@ -260,14 +272,6 @@ impl SandboxSessionJwtAuthority {
         })
     }
 
-    pub(crate) fn preparation_trust(&self) -> Result<(String, Vec<u8>), Status> {
-        Ok((
-            self.gateway_id.clone(),
-            serde_json::to_vec(&self.verification_keys)
-                .map_err(|_| Status::internal("encode preparation trust"))?,
-        ))
-    }
-
     pub fn verify_gateway_token(
         &self,
         token: &str,
@@ -281,37 +285,43 @@ impl SandboxSessionJwtAuthority {
         })
     }
 
-    /// Mint initial assignment without reviving a superseded credential lineage.
-    pub fn mint_registration(
+    /// Mint the shared supervisor's token for the assignment stream. Its
+    /// lifetime is bounded on its own; the session lifetime may be
+    /// non-expiring.
+    pub fn mint_supervisor_token(
         &self,
-        sandbox_id: &str,
-        identity: &crate::auth::sandbox_session::PersistedSandboxIdentity,
-        session_id: SandboxSessionId,
-        resource_binding: std::collections::BTreeMap<String, String>,
-    ) -> Result<SandboxLaunchAuthentication, Status> {
-        if identity.refresh_replay.is_some() {
-            return Err(Status::failed_precondition(
-                "runtime has already refreshed; use the cold-path restart lifecycle",
-            ));
-        }
-        let mut authentication = self.mint_persisted_launch(sandbox_id, identity)?;
-        let token = self
-            .issuer
-            .mint_bound_sandbox_token(
-                &SandboxRuntimeIdentity {
-                    sandbox_id: SandboxId::parse(sandbox_id)
-                        .map_err(|_| Status::invalid_argument("invalid sandbox ID"))?,
-                    runtime_generation: identity.runtime_generation.clone(),
-                    auth_epoch: identity.auth_epoch,
-                },
-                resource_binding,
+        ttl: Duration,
+    ) -> Result<MintedSessionToken, SessionJwtError> {
+        self.issuer.mint_supervisor_token(ttl)
+    }
+
+    /// Mint the takeover grant of one supervisor term of a shared pool
+    /// instance. The caller has already advanced the sandbox's persisted
+    /// credential epoch to the grant's.
+    pub fn mint_supervisor_takeover(
+        &self,
+        takeover: &openshell_core::jwt::SupervisorTakeover,
+        ttl: Duration,
+    ) -> Result<MintedSessionToken, SessionJwtError> {
+        self.issuer.mint_supervisor_takeover(takeover, ttl)
+    }
+
+    /// Verify a presented supervisor token.
+    pub fn verify_supervisor_token(
+        &self,
+        token: &str,
+    ) -> Result<AuthenticatedSupervisor, AuthRejection> {
+        self.supervisor_verifier.verify(token).map_err(|error| {
+            let reason = match error {
+                SessionJwtError::SubjectMismatch => AuthFailureReason::AudienceOrIssuerMismatch,
+                ref other => session_failure_reason(other),
+            };
+            AuthRejection::new(
+                AuthMechanism::SupervisorToken,
+                reason,
+                Status::unauthenticated(format!("invalid supervisor token: {error}")),
             )
-            .map_err(|_| Status::internal("assignment signing failed"))?;
-        let bundle = &mut authentication.supervisor;
-        bundle.session_id = session_id;
-        bundle.sandbox_token = token.token;
-        bundle.sandbox_expires_at = token.expires_at;
-        Ok(authentication)
+        })
     }
 }
 
@@ -359,7 +369,7 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
         // Refresh performs its own lineage check so the immediately consumed
         // bearer can recover an already-committed successor after a lost
         // response. Every other RPC accepts only the current bearer.
-        if path != "/openshell.v1.OpenShell/RefreshSandboxToken" {
+        if path != REFRESH_SANDBOX_TOKEN_PATH {
             crate::auth::sandbox_session::authorize_persisted(&self.store, &authenticated).await?;
         }
         Ok(Authentication::Accepted(Principal::Sandbox(
@@ -367,6 +377,7 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
                 sandbox_id: authenticated.sandbox_id.to_string(),
                 source: SandboxIdentitySource::BootstrapJwt {
                     issuer: "launch-session".to_string(),
+                    auth_epoch: Some(authenticated.auth_epoch),
                 },
                 trust_domain: Some("openshell".to_string()),
             },

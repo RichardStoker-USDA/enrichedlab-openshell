@@ -49,24 +49,35 @@ git push origin enrichedlab/main
 rerere replays conflicting hunks only. A fork change that has to move to new upstream code without a textual
 conflict is listed here and checked by hand on every merge:
 
-- Upstream `main` after v0.1.5 creates every supervisor Pod in `create_sandbox_runtime_supervisor`; the fixed
-  labels and annotations are applied there (`apply_fixed_pod_metadata`), as on `enrichedlab/next`.
+- Since v0.1.6 upstream creates every dedicated supervisor Pod in `create_sandbox_runtime_supervisor`; the fixed
+  labels and annotations are applied there (`apply_fixed_pod_metadata`). A shared supervisor (`supervisor_topology =
+  "gateway"`) is deployed by Helm, not per sandbox, so the fixed metadata does not reach it.
+- The restart patch is built by `restart_running_patch`, which carries upstream's bootstrap annotations (including
+  the control connection and supervisor topology keys added in v0.1.6) and then the operator's fixed metadata.
+- Upstream writes the supervisor's auth bundle into its bootstrap Secret in `install_sandbox_runtime_generation`; the
+  fork writes it through `supervisor_auth_json`, so a supervisor whose telemetry goes elsewhere never receives the
+  gateway's collector headers.
+- A shared supervisor gets its credentials from the gateway's launch bundle at registration, not from that Secret. The
+  gateway therefore withholds the collector headers itself: the compute driver factory reports whether supervisors use
+  the gateway's collector (`supervisors_use_gateway_collector`), and when they do not, no launch or registration bundle
+  carries the headers (`withhold_supervisor_ocsf_headers`).
+- Stored launch material never carries headers the gateway withholds: when supervisors export elsewhere, the
+  supervisor pool removes them as it records, places or loads material (`launch_material_without_collector_headers`),
+  and the Kubernetes driver removes them from a recovered shared generation's Secret. Material without headers is
+  kept byte for byte, so a launch and its replay keep one admission fingerprint. While supervisors use the gateway's
+  collector, stored material keeps the headers it was launched with until the next launch.
+- Driver start validates both upstream's supervisor topology and the fork's fixed metadata.
 
 ## Carried upstream pull requests
 
-A pull request upstream has not released yet may be carried on `enrichedlab/main` when a site needs it now. It keeps
-the upstream design and interfaces, so the release that contains it replaces the carried commit: on that merge, take
-upstream's version of the pull request's code and keep only the adaptations listed here.
-
-- [NVIDIA/OpenShell#3508](https://github.com/NVIDIA/OpenShell/pull/3508), template-driven warm pooling for the
-  Kubernetes driver, carried on v0.1.5. Adaptations: supervisors receive their credentials at registration instead
-  of in the bootstrap Secret, so the fork's rule that a supervisor sending telemetry elsewhere never receives the
-  gateway's collector headers moved from the driver to the gateway (`ComputeDriverFactory::supervisors_use_gateway_collector`);
-  the run receipt interceptor matches a warm pair's Pods through the pair id the Sandbox object names
-  (`openshell.ai/warm-pair-id`), since their boundary pair label is not the sandbox id; and v0.1.5's boundary open
-  check (`isolation_protocol::validate_open`, from the sandbox backend protocol) expects the sandbox the boundary's
-  authenticator bound when the boundary was provisioned without one, which the pull request does for every
-  Kubernetes boundary, cold or warm.
+None on the v0.1.6 line. [NVIDIA/OpenShell#3508](https://github.com/NVIDIA/OpenShell/pull/3508) (template-driven warm
+pooling for the Kubernetes driver) was carried on v0.1.5 with three adaptations. v0.1.6 changed the supervisor's
+gateway credentials to per-instance credentials for shared supervisors, and the pull request's registration path
+depends on the earlier process-wide token, so carrying it is a port of its design, not a merge; its author is
+rebasing it upstream. Until a version that applies to the current release exists, the v0.1.6 line has no warm pools:
+v0.1.6's shared supervisor (`supervisor_topology = "gateway"`) is the measured alternative for start latency, and a
+site that needs warm pools keeps the v0.1.5 line. The run receipt interceptor still matches a warm pair's Pods through
+the pair id the Sandbox object names (`openshell.ai/warm-pair-id`); without warm pools that path is unused.
 
 When pushing, the script also disables any upstream workflow GitHub has enabled in the fork. Upstream's workflows
 expect NVIDIA's runners and secrets; the fork runs only its own `enrichedlab-*` workflows.

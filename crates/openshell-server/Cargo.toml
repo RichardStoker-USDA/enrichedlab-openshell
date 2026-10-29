@@ -25,6 +25,7 @@ openshell-policy = { path = "../openshell-policy" }
 openshell-prover = { path = "../openshell-prover" }
 openshell-providers = { path = "../openshell-providers" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
+openshell-supervisor-control = { path = "../openshell-supervisor-control" }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 
 # Kubernetes client used by ServiceAccount bootstrap authentication and the
@@ -106,7 +107,7 @@ async-trait = "0.1"
 url = { workspace = true }
 glob = { workspace = true }
 hex = "0.4"
-russh = "0.63.1"
+russh = "0.64.1"
 rand = { workspace = true }
 rand-ssh = { package = "rand", version = "0.10" }
 petname = "2"

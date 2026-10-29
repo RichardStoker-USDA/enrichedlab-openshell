@@ -14,9 +14,9 @@ use openshell_core::proto::compute::v1::{
     DeleteWorkspaceResponse, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
     ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
-    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_server::ComputeDriver,
+    StopSandboxRequest, StopSandboxResponse, SuspendSandboxRequest, SuspendSandboxResponse,
+    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
+    WatchSandboxesRequest, compute_driver_server::ComputeDriver,
 };
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
@@ -34,23 +34,6 @@ impl ComputeDriverService {
 
 #[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
-    async fn select_warm_pair(
-        &self,
-        request: Request<openshell_core::proto::compute::v1::SelectWarmPairRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::SelectWarmPairResponse>, Status> {
-        let _ = &request;
-        Err(Status::unimplemented(
-            "warm pair allocation is not supported",
-        ))
-    }
-
-    async fn sync_warm_pools(
-        &self,
-        _request: Request<openshell_core::proto::compute::v1::SyncWarmPoolsRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::SyncWarmPoolsResponse>, Status> {
-        Err(Status::unimplemented("warm pools are not supported"))
-    }
-
     async fn get_capabilities(
         &self,
         request: Request<GetCapabilitiesRequest>,
@@ -107,7 +90,6 @@ impl ComputeDriver for ComputeDriverService {
         }
         Ok(Response::new(GetSandboxResponse {
             sandbox: Some(sandbox),
-            runtime_identity: String::new(),
         }))
     }
 
@@ -129,6 +111,15 @@ impl ComputeDriver for ComputeDriverService {
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.backend.create_sandbox(&sandbox).await?;
         Ok(Response::new(CreateSandboxResponse::default()))
+    }
+
+    async fn suspend_sandbox(
+        &self,
+        _request: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SuspendSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "the MXC compute driver does not support sandbox suspend",
+        ))
     }
 
     async fn stop_sandbox(

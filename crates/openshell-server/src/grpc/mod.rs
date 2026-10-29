@@ -9,8 +9,8 @@ pub mod policy;
 pub mod provider;
 mod provider_credentials;
 pub mod provider_readiness;
-pub mod sandbox;
-mod supervisor_registration;
+mod sandbox;
+pub mod supervisor_host;
 pub use sandbox::mint_persisted_authentication;
 mod service;
 mod validation;
@@ -60,14 +60,14 @@ use openshell_core::proto::{
     RemoveWorkspaceMemberResponse, ReportEndpointStatusRequest, ReportEndpointStatusResponse,
     ReportMainProcessExitRequest, ReportMainProcessExitResponse, ReportPolicyStatusRequest,
     ReportPolicyStatusResponse, ReportProviderReadinessRequest, ReportProviderReadinessResponse,
-    ResourceCapabilities, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    ResourceCapabilities, ResumeSandboxRequest, RevokeSshSessionRequest, RevokeSshSessionResponse,
     RotateProviderCredentialRequest, RotateProviderCredentialResponse, SandboxResponse,
     SandboxTemplateResponse, ServiceEndpointResponse, ServiceStatus, StartSandboxRequest,
     StopSandboxRequest, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
-    SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse,
-    UpdateConfigRequest, UpdateConfigResponse, UpdateProviderProfilesRequest,
-    UpdateProviderProfilesResponse, UpdateProviderRequest, WatchSandboxRequest,
-    open_shell_server::OpenShell,
+    SupervisorMessage, SuspendSandboxRequest, TcpForwardFrame, UndoDraftChunkRequest,
+    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
+    WatchSandboxRequest, open_shell_server::OpenShell,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -436,6 +436,20 @@ impl OpenShell for OpenShellService {
         mutation_replay::run(&self.state, request).await
     }
 
+    async fn suspend_sandbox(
+        &self,
+        request: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        sandbox::handle_suspend_sandbox(&self.state, request).await
+    }
+
+    async fn resume_sandbox(
+        &self,
+        request: Request<ResumeSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        sandbox::handle_resume_sandbox(&self.state, request).await
+    }
+
     // --- Exec ---
 
     type ExecSandboxStream = ReceiverStream<Result<ExecSandboxEvent, Status>>;
@@ -779,13 +793,6 @@ impl OpenShell for OpenShellService {
 
     // --- Sandbox identity ---
 
-    async fn register_supervisor(
-        &self,
-        request: Request<openshell_core::proto::RegisterSupervisorRequest>,
-    ) -> Result<Response<openshell_core::proto::RegisterSupervisorResponse>, Status> {
-        supervisor_registration::register(&self.state, request).await
-    }
-
     async fn issue_sandbox_token(
         &self,
         request: Request<IssueSandboxTokenRequest>,
@@ -1065,6 +1072,7 @@ pub mod test_support {
             sandbox_id: sandbox_id.to_string(),
             source: SandboxIdentitySource::BootstrapJwt {
                 issuer: "openshell-gateway:test".to_string(),
+                auth_epoch: None,
             },
             trust_domain: Some("openshell".to_string()),
         });

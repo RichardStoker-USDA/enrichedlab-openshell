@@ -174,24 +174,6 @@ struct Args {
     )]
     sandbox_runtime_boundary_port: u16,
 
-    /// Prepare unassigned workload/proxy pairs for eligible templates.
-    #[arg(long, env = "OPENSHELL_K8S_WARM_POOL_ENABLED", default_value_t = false)]
-    warm_pool_enabled: bool,
-    #[arg(long, env = "OPENSHELL_K8S_WARM_POOL_MAX_PAIRS", default_value_t = 10)]
-    warm_pool_max_pairs: u32,
-    #[arg(
-        long,
-        env = "OPENSHELL_K8S_WARM_POOL_PREPARATION_TIMEOUT_SECONDS",
-        default_value_t = 300
-    )]
-    warm_pool_preparation_timeout_seconds: u64,
-    #[arg(
-        long,
-        env = "OPENSHELL_K8S_WARM_POOL_MAX_IDLE_SECONDS",
-        default_value_t = 3600
-    )]
-    warm_pool_max_idle_seconds: u64,
-
     /// Corporate HTTP forward proxy for policy-approved TLS CONNECT egress.
     #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY")]
     https_proxy: Option<String>,
@@ -295,6 +277,8 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let driver = KubernetesComputeDriver::new(
         KubernetesComputeConfig {
+            supervisor_topology: None,
+            shared_supervisor: None,
             allow_driver_config: args.admission_config_json.allow_driver_config,
             resource_admission: args.admission_config_json.resource_admission.clone(),
             workspace_mode: args.workspace_mode,
@@ -319,12 +303,6 @@ async fn main() -> Result<()> {
                 .supervisor_image
                 .unwrap_or_else(openshell_core::config::default_supervisor_image),
             supervisor_image_pull_policy: args.supervisor_image_pull_policy,
-            warm_pool: openshell_driver_kubernetes::config::WarmPoolConfig {
-                enabled: args.warm_pool_enabled,
-                max_pairs: args.warm_pool_max_pairs,
-                preparation_timeout_seconds: args.warm_pool_preparation_timeout_seconds,
-                max_idle_seconds: args.warm_pool_max_idle_seconds,
-            },
             sandbox_runtime: KubernetesSandboxRuntimeConfig {
                 boundary_port: args.sandbox_runtime_boundary_port,
             },

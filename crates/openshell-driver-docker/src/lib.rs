@@ -49,10 +49,10 @@ use openshell_core::proto::compute::v1::{
     GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse, GpuResourceCapabilities,
     GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse,
     MemoryResourceCapabilities, ResourceCapabilities, StartSandboxRequest, StartSandboxResponse,
-    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
-    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
-    compute_driver_server::ComputeDriver, watch_sandboxes_event,
+    StopSandboxRequest, StopSandboxResponse, SuspendSandboxRequest, SuspendSandboxResponse,
+    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
+    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesRequest,
+    WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
@@ -94,7 +94,10 @@ const WATCH_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 // request a bounded opportunity to mark the control exit intentional before
 // publishing a fail-closed runtime error.
 const SUPERVISOR_INTENTIONAL_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
-const SUPERVISOR_HEALTH_INTERVAL_NS: i64 = 250_000_000;
+const SUPERVISOR_HEALTH_INTERVAL_NS: i64 = 30_000_000_000;
+// Docker probes at this interval only before the first healthy result and
+// within the start period.
+const SUPERVISOR_HEALTH_START_INTERVAL_NS: i64 = 250_000_000;
 const SUPERVISOR_HEALTH_TIMEOUT_NS: i64 = 2_000_000_000;
 const SUPERVISOR_HEALTH_START_PERIOD_NS: i64 = 60_000_000_000;
 const HOST_GATEWAY_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -107,7 +110,8 @@ const SUPERVISOR_UID: u32 = 65_534;
 const SUPERVISOR_GID: u32 = 65_534;
 const BOUNDARY_MOUNT_PATH: &str = "/.openshell/channel";
 const BOUNDARY_CONFIG_MOUNT_PATH: &str = "/.openshell/channel/sandbox/bootstrap.json";
-const BOUNDARY_SOCKET_MOUNT_PATH: &str = "/.openshell/channel/sandbox/control.sock";
+const BOUNDARY_CONTROL_MOUNT_PATH: &str = "/.openshell/channel/control";
+const BOUNDARY_SOCKET_MOUNT_PATH: &str = "/.openshell/channel/control/supervisor/control.sock";
 const BOUNDARY_CERTIFICATE_MOUNT_PATH: &str = "/.openshell/channel/sandbox/server.crt";
 const BOUNDARY_PRIVATE_KEY_MOUNT_PATH: &str = "/.openshell/channel/sandbox/server.key";
 const SUPERVISOR_STATE_MOUNT_PATH: &str = "/.openshell/supervisor";
@@ -1309,7 +1313,9 @@ impl DockerComputeDriver {
                             Status::unavailable("volume admission lookup failed")
                         }
                     })?;
-                    if name == docker_channel_volume_name_by_id(sandbox_id, &self.config) {
+                    if name == docker_channel_volume_name_by_id(sandbox_id, &self.config)
+                        || name == docker_control_volume_name_by_id(sandbox_id, &self.config)
+                    {
                         if volume.driver != "local"
                             || !volume.options.is_empty()
                             || volume.labels.get(LABEL_SANDBOX_ID) != Some(sandbox_id)
@@ -3111,23 +3117,6 @@ fn validate_docker_outer_fence(
 }
 #[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
-    async fn select_warm_pair(
-        &self,
-        request: Request<openshell_core::proto::compute::v1::SelectWarmPairRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::SelectWarmPairResponse>, Status> {
-        let _ = &request;
-        Err(Status::unimplemented(
-            "warm pair allocation is not supported",
-        ))
-    }
-
-    async fn sync_warm_pools(
-        &self,
-        _request: Request<openshell_core::proto::compute::v1::SyncWarmPoolsRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::SyncWarmPoolsResponse>, Status> {
-        Err(Status::unimplemented("warm pools are not supported"))
-    }
-
     type WatchSandboxesStream = WatchStream;
 
     async fn authenticate_sandbox(
@@ -3201,6 +3190,15 @@ impl ComputeDriver for ComputeDriverService {
                 ComputeDriver::create_sandbox(&self.driver, request),
             )
             .await
+    }
+
+    async fn suspend_sandbox(
+        &self,
+        _request: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SuspendSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "the Docker compute driver does not support sandbox suspend",
+        ))
     }
 
     async fn stop_sandbox(
@@ -3281,23 +3279,6 @@ impl ComputeDriver for ComputeDriverService {
 
 #[tonic::async_trait]
 impl ComputeDriver for DockerComputeDriver {
-    async fn select_warm_pair(
-        &self,
-        request: Request<openshell_core::proto::compute::v1::SelectWarmPairRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::SelectWarmPairResponse>, Status> {
-        let _ = &request;
-        Err(Status::unimplemented(
-            "warm pair allocation is not supported",
-        ))
-    }
-
-    async fn sync_warm_pools(
-        &self,
-        _request: Request<openshell_core::proto::compute::v1::SyncWarmPoolsRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::SyncWarmPoolsResponse>, Status> {
-        Err(Status::unimplemented("warm pools are not supported"))
-    }
-
     async fn authenticate_sandbox(
         &self,
         _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
@@ -3366,7 +3347,6 @@ impl ComputeDriver for DockerComputeDriver {
 
         Ok(Response::new(GetSandboxResponse {
             sandbox: Some(sandbox),
-            runtime_identity: String::new(),
         }))
     }
 
@@ -3400,6 +3380,15 @@ impl ComputeDriver for DockerComputeDriver {
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.create_sandbox_inner(&sandbox).await?;
         span_status.finish(Ok(Response::new(CreateSandboxResponse::default())))
+    }
+
+    async fn suspend_sandbox(
+        &self,
+        _request: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SuspendSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "the Docker compute driver does not support sandbox suspend",
+        ))
     }
 
     #[tracing::instrument(
@@ -4161,28 +4150,36 @@ fn docker_supervisor_volume_name_by_id(
     format!("openshell-supervisor-{}", &digest[..32])
 }
 
+fn docker_control_volume_name_by_id(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> String {
+    docker_channel_volume_name_by_id(sandbox_id, config).replacen(
+        "openshell-channel-",
+        "openshell-control-",
+        1,
+    )
+}
+
 async fn create_docker_channel_volume(
     docker: &Docker,
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
 ) -> Result<(), Status> {
-    create_docker_runtime_volume(
-        docker,
-        sandbox,
-        config,
+    let names = [
         docker_channel_volume_name(sandbox, config),
-    )
-    .await?;
-    if let Err(error) = create_docker_runtime_volume(
-        docker,
-        sandbox,
-        config,
         docker_supervisor_volume_name(sandbox, config),
-    )
-    .await
-    {
-        let _ = remove_docker_volume(docker, &docker_channel_volume_name(sandbox, config)).await;
-        return Err(error);
+        docker_control_volume_name_by_id(&sandbox.id, config),
+    ];
+    for (index, name) in names.iter().enumerate() {
+        if let Err(error) =
+            create_docker_runtime_volume(docker, sandbox, config, name.clone()).await
+        {
+            for created in &names[..index] {
+                let _ = remove_docker_volume(docker, created).await;
+            }
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -4247,6 +4244,11 @@ async fn remove_docker_channel_volume_by_id(
     remove_docker_volume(
         docker,
         &docker_supervisor_volume_name_by_id(sandbox_id, config),
+    )
+    .await?;
+    remove_docker_volume(
+        docker,
+        &docker_control_volume_name_by_id(sandbox_id, config),
     )
     .await
 }
@@ -4507,6 +4509,8 @@ fn docker_sandbox_bundle_archive(
         identity.uid,
         identity.gid,
     )?;
+    // The control volume is read-only in the runtime container; the
+    // supervisor stager initializes it.
     append_docker_archive_file(
         &mut archive,
         ".openshell/runtime/openshell-sandbox",
@@ -4586,7 +4590,8 @@ async fn stage_docker_sandbox_bundle(
             bollard::body_full(Bytes::from(archive)),
         )
         .await
-        .map_err(|error| Status::internal(format!("stage Docker sandbox bundle: {error}")))
+        .map_err(|error| Status::internal(format!("stage Docker sandbox bundle: {error}")))?;
+    Ok(())
 }
 
 fn decode_docker_launch_authentication(
@@ -4999,6 +5004,32 @@ async fn stage_docker_supervisor_bundle(
             Some(RemoveContainerOptionsBuilder::default().force(true).build()),
         )
         .await;
+    let runtime_initiated = read_docker_runtime_descriptor(&sandbox.id, config).await?
+        .is_some_and(|descriptor| matches!(descriptor.transport, openshell_sandbox_backend::boundary_protocol::SandboxTransport::RuntimeInitiatedUnix { .. }));
+    let mut mounts = vec![Mount {
+        target: Some(SUPERVISOR_STATE_MOUNT_PATH.to_string()),
+        source: Some(docker_supervisor_volume_name(sandbox, config)),
+        typ: Some(MountTypeEnum::VOLUME),
+        read_only: Some(false),
+        volume_options: Some(MountVolumeOptions {
+            no_copy: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    if runtime_initiated {
+        mounts.push(Mount {
+            target: Some(BOUNDARY_CONTROL_MOUNT_PATH.to_string()),
+            source: Some(docker_control_volume_name_by_id(&sandbox.id, config)),
+            typ: Some(MountTypeEnum::VOLUME),
+            read_only: Some(false),
+            volume_options: Some(MountVolumeOptions {
+                no_copy: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
     let created = docker
         .create_container(
             Some(
@@ -5020,17 +5051,7 @@ async fn stage_docker_supervisor_bundle(
                 )),
                 host_config: Some(HostConfig {
                     network_mode: Some("none".to_string()),
-                    mounts: Some(vec![Mount {
-                        target: Some(SUPERVISOR_STATE_MOUNT_PATH.to_string()),
-                        source: Some(docker_supervisor_volume_name(sandbox, config)),
-                        typ: Some(MountTypeEnum::VOLUME),
-                        read_only: Some(false),
-                        volume_options: Some(MountVolumeOptions {
-                            no_copy: Some(true),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }]),
+                    mounts: Some(mounts),
                     cap_drop: Some(vec!["ALL".to_string()]),
                     security_opt: Some(vec!["no-new-privileges:true".to_string()]),
                     ..Default::default()
@@ -5048,14 +5069,50 @@ async fn stage_docker_supervisor_bundle(
         .path(SUPERVISOR_STATE_MOUNT_PATH)
         .copy_uidgid("true")
         .build();
-    let result = docker
-        .upload_to_container(
-            &created.id,
-            Some(options),
-            bollard::body_full(Bytes::from(archive)),
-        )
-        .await
-        .map_err(|error| Status::internal(format!("stage Docker supervisor bundle: {error}")));
+    let result: Result<(), Status> = async {
+        docker
+            .upload_to_container(
+                &created.id,
+                Some(options),
+                bollard::body_full(Bytes::from(archive)),
+            )
+            .await
+            .map_err(|error| {
+                Status::internal(format!("stage Docker supervisor bundle: {error}"))
+            })?;
+        if runtime_initiated {
+            // Initialize the socket volume using the supervisor's staging user.
+            // Docker preserves the existing volume root's ownership, so use
+            // a child directory created by the supervisor's staging user.
+            let mut archive = tar::Builder::new(Vec::new());
+            append_docker_archive_directory(
+                &mut archive,
+                "supervisor",
+                0o711,
+                SUPERVISOR_UID,
+                SUPERVISOR_GID,
+            )?;
+            let bytes = archive.into_inner().map_err(|error| {
+                Status::internal(format!("finish control socket archive: {error}"))
+            })?;
+            let options = UploadToContainerOptionsBuilder::default()
+                .path(BOUNDARY_CONTROL_MOUNT_PATH)
+                .copy_uidgid("true")
+                .build();
+            docker
+                .upload_to_container(
+                    &created.id,
+                    Some(options),
+                    bollard::body_full(Bytes::from(bytes)),
+                )
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("stage Docker control socket volume: {error}"))
+                })?;
+        }
+        Ok(())
+    }
+    .await;
     let cleanup = docker
         .remove_container(
             &created.id,
@@ -5089,6 +5146,23 @@ fn docker_auxiliary_container_labels(
         ),
         (LABEL_ISOLATION_ROLE.to_string(), role.to_string()),
     ])
+}
+
+fn docker_supervisor_healthcheck() -> HealthConfig {
+    HealthConfig {
+        test: Some(vec![
+            "CMD".to_string(),
+            SUPERVISOR_IMAGE_CONTROL_BINARY_PATH.to_string(),
+            "health".to_string(),
+            "--socket".to_string(),
+            SUPERVISOR_HEALTH_SOCKET_PATH.to_string(),
+        ]),
+        interval: Some(SUPERVISOR_HEALTH_INTERVAL_NS),
+        timeout: Some(SUPERVISOR_HEALTH_TIMEOUT_NS),
+        retries: Some(3),
+        start_period: Some(SUPERVISOR_HEALTH_START_PERIOD_NS),
+        start_interval: Some(SUPERVISOR_HEALTH_START_INTERVAL_NS),
+    }
 }
 
 fn docker_supervisor_host_config(
@@ -5280,6 +5354,8 @@ async fn spawn_docker_control_process(
         &config.upstream_proxy,
         config.proxy_ca_bundle.is_some(),
     ));
+    let runtime_initiated = read_docker_runtime_descriptor(&sandbox.id, config).await?
+        .is_some_and(|descriptor| matches!(descriptor.transport, openshell_sandbox_backend::boundary_protocol::SandboxTransport::RuntimeInitiatedUnix { .. }));
     let mut supervisor_mounts = vec![
         Mount {
             target: Some(BOUNDARY_MOUNT_PATH.to_string()),
@@ -5304,6 +5380,20 @@ async fn spawn_docker_control_process(
             ..Default::default()
         },
     ];
+    if runtime_initiated {
+        supervisor_mounts.push(Mount {
+            target: Some(BOUNDARY_CONTROL_MOUNT_PATH.to_string()),
+            source: Some(docker_control_volume_name_by_id(&sandbox.id, config)),
+            typ: Some(MountTypeEnum::VOLUME),
+            read_only: Some(false),
+            volume_options: Some(MountVolumeOptions {
+                no_copy: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+
     if let Some(socket) = config.provider_spiffe_workload_api_socket.as_ref() {
         let parent = socket.parent().ok_or_else(|| {
             Status::failed_precondition("provider SPIFFE socket has no parent directory")
@@ -5323,20 +5413,7 @@ async fn spawn_docker_control_process(
         cmd: Some(command),
         env: Some(environment),
         labels: Some(labels),
-        healthcheck: Some(HealthConfig {
-            test: Some(vec![
-                "CMD".to_string(),
-                SUPERVISOR_IMAGE_CONTROL_BINARY_PATH.to_string(),
-                "health".to_string(),
-                "--socket".to_string(),
-                SUPERVISOR_HEALTH_SOCKET_PATH.to_string(),
-            ]),
-            interval: Some(SUPERVISOR_HEALTH_INTERVAL_NS),
-            timeout: Some(SUPERVISOR_HEALTH_TIMEOUT_NS),
-            retries: Some(3),
-            start_period: Some(SUPERVISOR_HEALTH_START_PERIOD_NS),
-            start_interval: Some(SUPERVISOR_HEALTH_INTERVAL_NS),
-        }),
+        healthcheck: Some(docker_supervisor_healthcheck()),
         host_config: Some(docker_supervisor_host_config(
             supervisor_mounts,
             &supervisor_endpoint,
@@ -5966,6 +6043,19 @@ fn build_container_create_body_for_image(
         }),
         ..Default::default()
     });
+    // The runtime only dials the supervisor-owned socket; it never writes here.
+    user_mounts.push(Mount {
+        target: Some(BOUNDARY_CONTROL_MOUNT_PATH.to_string()),
+        source: Some(docker_control_volume_name_by_id(&sandbox.id, config)),
+        typ: Some(MountTypeEnum::VOLUME),
+        read_only: Some(true),
+        volume_options: Some(MountVolumeOptions {
+            no_copy: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+
     let user_bind_strings = docker_driver_bind_strings(driver_config)?;
     let device_requests = gpu_device_ids.map(|device_ids| {
         vec![DeviceRequest {

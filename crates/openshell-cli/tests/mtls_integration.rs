@@ -137,6 +137,20 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("unused"))
     }
 
+    async fn suspend_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::SuspendSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn resume_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ResumeSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn get_sandbox(
         &self,
         _request: tonic::Request<openshell_core::proto::GetSandboxRequest>,
@@ -561,13 +575,6 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::GetDraftHistoryRequest>,
     ) -> Result<Response<openshell_core::proto::GetDraftHistoryResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn register_supervisor(
-        &self,
-        _request: tonic::Request<openshell_core::proto::RegisterSupervisorRequest>,
-    ) -> Result<Response<openshell_core::proto::RegisterSupervisorResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 

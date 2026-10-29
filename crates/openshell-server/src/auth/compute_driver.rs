@@ -10,10 +10,8 @@ use crate::compute::ComputeRuntime;
 use async_trait::async_trait;
 use tonic::{Code, Status};
 
-/// Legacy token exchange endpoint accepting driver-native credentials.
+/// The only public gateway method on which driver-native credentials apply.
 pub const ISSUE_SANDBOX_TOKEN_PATH: &str = "/openshell.v1.OpenShell/IssueSandboxToken";
-/// Runtime assignment endpoint accepting driver-native credentials.
-pub const REGISTER_SUPERVISOR_PATH: &str = "/openshell.v1.OpenShell/RegisterSupervisor";
 
 #[derive(Clone, Debug)]
 pub struct ComputeDriverAuthenticator {
@@ -33,7 +31,7 @@ impl Authenticator for ComputeDriverAuthenticator {
         headers: &http::HeaderMap,
         path: &str,
     ) -> Result<Authentication, AuthRejection> {
-        if path != ISSUE_SANDBOX_TOKEN_PATH && path != REGISTER_SUPERVISOR_PATH {
+        if path != ISSUE_SANDBOX_TOKEN_PATH {
             return Ok(Authentication::NotApplicable);
         }
 
@@ -41,28 +39,6 @@ impl Authenticator for ComputeDriverAuthenticator {
             return Ok(Authentication::NotApplicable);
         };
 
-        if path == REGISTER_SUPERVISOR_PATH {
-            let response = self
-                .compute
-                .authenticate_supervisor(credential)
-                .await
-                .map_err(|status| reject(driver_failure_reason(status.code()), status))?;
-            let registration = response.registration.ok_or_else(|| {
-                reject(
-                    AuthFailureReason::UnknownIdentity,
-                    Status::permission_denied("missing registration identity"),
-                )
-            })?;
-            return Ok(Authentication::Accepted(Principal::Sandbox(
-                SandboxPrincipal {
-                    sandbox_id: response.sandbox_id,
-                    source: SandboxIdentitySource::SupervisorRegistration {
-                        registration: Box::new(registration),
-                    },
-                    trust_domain: Some("openshell".to_string()),
-                },
-            )));
-        }
         let authenticated = self
             .compute
             .authenticate_sandbox(credential)

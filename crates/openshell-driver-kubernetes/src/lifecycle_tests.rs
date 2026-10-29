@@ -36,8 +36,7 @@ mod lifecycle_reconciliation {
             lifecycle_gates: Arc::default(),
             config: KubernetesComputeConfig::default(),
             operator_allowlist: None,
-            pool_targets: Arc::default(),
-            pool_reconcile_cursor: Arc::default(),
+            shared_supervisor: None,
         };
         (driver, steps, Arc::default())
     }
@@ -174,19 +173,26 @@ mod lifecycle_reconciliation {
             )
         };
         vec![
-            (
-                http::Method::GET,
-                "/api/v1/namespaces/openshell/pods",
-                kube_test_response(
-                    http::StatusCode::OK,
-                    serde_json::json!({
-                        "apiVersion": "v1", "kind": "PodList", "items": []
-                    }),
-                ),
-            ),
             workload(),
             supervisor(),
             workload(),
+            // The recorded mode (none: supervisor-initiated) must still match
+            // the role the boundary Service selects.
+            (
+                http::Method::GET,
+                "/api/v1/namespaces/openshell/services/os-boundary-sandbox-1",
+                kube_test_response(
+                    http::StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "v1", "kind": "Service",
+                        "metadata": {"name": "os-boundary-sandbox-1"},
+                        "spec": {"selector": {
+                            BOUNDARY_PAIR_LABEL: "sandbox-1",
+                            BOUNDARY_ROLE_LABEL: "workload"
+                        }}
+                    }),
+                ),
+            ),
             (
                 http::Method::GET,
                 "/api/v1/namespaces/openshell/pods/os-supervisor-sandbox-1",

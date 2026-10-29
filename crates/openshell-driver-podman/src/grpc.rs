@@ -9,9 +9,9 @@ use openshell_core::proto::compute::v1::{
     DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
     EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
     GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
-    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_server::ComputeDriver,
+    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, SuspendSandboxRequest,
+    SuspendSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
+    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_server::ComputeDriver,
 };
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
@@ -50,23 +50,6 @@ impl ComputeDriverService {
 
 #[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
-    async fn select_warm_pair(
-        &self,
-        request: Request<openshell_core::proto::compute::v1::SelectWarmPairRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::SelectWarmPairResponse>, Status> {
-        let _ = &request;
-        Err(Status::unimplemented(
-            "warm pair allocation is not supported",
-        ))
-    }
-
-    async fn sync_warm_pools(
-        &self,
-        _request: Request<openshell_core::proto::compute::v1::SyncWarmPoolsRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::SyncWarmPoolsResponse>, Status> {
-        Err(Status::unimplemented("warm pools are not supported"))
-    }
-
     async fn authenticate_sandbox(
         &self,
         _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
@@ -137,7 +120,6 @@ impl ComputeDriver for ComputeDriverService {
                     .ok_or_else(|| Status::not_found("sandbox not found"))?;
                 Ok(Response::new(GetSandboxResponse {
                     sandbox: Some(sandbox),
-                    runtime_identity: String::new(),
                 }))
             })
             .await
@@ -171,6 +153,15 @@ impl ComputeDriver for ComputeDriverService {
                 Ok(Response::new(CreateSandboxResponse::default()))
             })
             .await
+    }
+
+    async fn suspend_sandbox(
+        &self,
+        _request: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SuspendSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "the Podman compute driver does not support sandbox suspend",
+        ))
     }
 
     async fn stop_sandbox(
@@ -681,7 +672,6 @@ mod tests {
             Request::new(DeleteSandboxRequest {
                 sandbox_id: String::new(),
                 name: "demo".to_string(),
-                ..Default::default()
             }),
         )
         .await
@@ -702,6 +692,7 @@ mod tests {
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // channel
                 // list_containers returns empty (container already gone)
                 StubResponse::new(StatusCode::OK, "[]"),
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // control volume
                 // remove_volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
@@ -713,7 +704,6 @@ mod tests {
             Request::new(DeleteSandboxRequest {
                 sandbox_id: sandbox_id.to_string(),
                 name: "demo".to_string(),
-                ..Default::default()
             }),
         )
         .await
@@ -731,7 +721,7 @@ mod tests {
             .clone();
         assert!(requests[2].contains("/libpod/containers/json"));
         assert_eq!(
-            requests[3],
+            requests[4],
             format!(
                 "DELETE {}",
                 api_path(&format!("/libpod/volumes/{volume_name}"))

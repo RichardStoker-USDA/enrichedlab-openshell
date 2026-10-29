@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
-    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error,
-    map_migrate_error,
+    AtomicWrite, DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
+    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, atomic_write_order,
+    current_time_ms, map_db_error, map_migrate_error,
 };
 use crate::policy_store::{
     AtomicPolicyRevisionWrite, apply_draft_chunk_evaluation, draft_chunk_evaluation_inputs_match,
@@ -203,93 +203,6 @@ async fn pool_journal_settings(pool: &SqlitePool) -> PersistenceResult<(String, 
 }
 
 impl SqliteStore {
-    pub(crate) async fn allocation_conflicts(
-        &self,
-        claim: &super::AllocationClaim,
-    ) -> PersistenceResult<bool> {
-        let owner = sqlx::query("SELECT sandbox_id, attempt_id, runtime_generation FROM allocation_claims WHERE target = ?1")
-            .bind(&claim.target).fetch_optional(&self.pool).await.map_err(|e| map_db_error(&e))?;
-        Ok(owner.is_some_and(|owner| {
-            owner.get::<String, _>("sandbox_id") != claim.sandbox_id
-                || owner.get::<String, _>("attempt_id") != claim.attempt_id
-                || owner.get::<String, _>("runtime_generation") != claim.runtime_generation
-        }))
-    }
-
-    pub(crate) async fn put_sandbox_allocation(
-        &self,
-        sandbox: &Sandbox,
-        claim: Option<&super::AllocationClaim>,
-        condition: WriteCondition,
-    ) -> PersistenceResult<WriteResult> {
-        use openshell_core::{ObjectId, ObjectLabels, ObjectName, ObjectWorkspace};
-        let now_ms = current_time_ms();
-        let labels = serde_json::to_string(&sandbox.object_labels().unwrap_or_default())
-            .map_err(|error| PersistenceError::Encode(error.to_string()))?;
-        let payload = sandbox.encode_to_vec();
-        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
-        let row = match condition {
-            WriteCondition::MustCreate => sqlx::query(
-                "INSERT INTO objects (object_type, id, name, workspace, payload, labels, created_at_ms, updated_at_ms, resource_version)
-                 VALUES ('sandbox', ?1, ?2, ?3, ?4, ?5, ?6, ?6, 1)
-                 RETURNING resource_version, created_at_ms, updated_at_ms"
-            )
-            .bind(sandbox.object_id()).bind(sandbox.object_name()).bind(sandbox.object_workspace())
-            .bind(&payload).bind(&labels).bind(now_ms)
-            .fetch_optional(&mut *tx).await.map_err(|e| map_db_error(&e))?,
-            WriteCondition::MatchResourceVersion(version) => sqlx::query(
-                "UPDATE objects SET payload = ?1, labels = ?2, updated_at_ms = ?3, resource_version = resource_version + 1
-                 WHERE object_type = 'sandbox' AND id = ?4 AND resource_version = ?5
-                 RETURNING resource_version, created_at_ms, updated_at_ms"
-            )
-            .bind(&payload).bind(&labels).bind(now_ms).bind(sandbox.object_id())
-            .bind(i64::try_from(version).unwrap_or(i64::MAX))
-            .fetch_optional(&mut *tx).await.map_err(|e| map_db_error(&e))?,
-            WriteCondition::Unconditional => return Err(PersistenceError::Config("allocation intent requires a conditional write".into())),
-        }.ok_or(PersistenceError::Conflict { current_resource_version: None })?;
-        if let Some(claim) = claim {
-            sqlx::query(
-                "INSERT INTO allocation_claims (target, sandbox_id, attempt_id, runtime_generation)
-                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT (target) DO NOTHING",
-            )
-            .bind(&claim.target)
-            .bind(&claim.sandbox_id)
-            .bind(&claim.attempt_id)
-            .bind(&claim.runtime_generation)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| map_db_error(&e))?;
-            let owner = sqlx::query("SELECT sandbox_id, attempt_id, runtime_generation FROM allocation_claims WHERE target = ?1")
-                .bind(&claim.target).fetch_one(&mut *tx).await.map_err(|e| map_db_error(&e))?;
-            if owner.get::<String, _>("sandbox_id") != claim.sandbox_id
-                || owner.get::<String, _>("attempt_id") != claim.attempt_id
-                || owner.get::<String, _>("runtime_generation") != claim.runtime_generation
-            {
-                return Err(PersistenceError::AllocationTargetReserved);
-            }
-        }
-        let version: i64 = row.get("resource_version");
-        let result = WriteResult {
-            resource_version: version.max(1).cast_unsigned(),
-            created_at_ms: row.get("created_at_ms"),
-            updated_at_ms: row.get("updated_at_ms"),
-        };
-        tx.commit().await.map_err(|e| map_db_error(&e))?;
-        Ok(result)
-    }
-
-    pub(crate) async fn release_allocation(
-        &self,
-        claim: &super::AllocationClaim,
-    ) -> PersistenceResult<()> {
-        sqlx::query(
-            "DELETE FROM allocation_claims WHERE target = ?1 AND sandbox_id = ?2 AND attempt_id = ?3 AND runtime_generation = ?4"
-        )
-        .bind(&claim.target).bind(&claim.sandbox_id).bind(&claim.attempt_id).bind(&claim.runtime_generation)
-        .execute(&self.pool).await.map_err(|e| map_db_error(&e))?;
-        Ok(())
-    }
-
     /// Closes the connection pool.
     #[cfg(test)]
     pub(crate) async fn close_for_test(&self) {
@@ -613,6 +526,104 @@ RETURNING "resource_version", "created_at_ms", "updated_at_ms"
                 Ok(write_result_from_row(&row))
             }
         }
+    }
+
+    pub async fn write_atomically(
+        &self,
+        writes: &[AtomicWrite],
+    ) -> PersistenceResult<Vec<Option<WriteResult>>> {
+        let now_ms = current_time_ms();
+        let mut results = vec![None; writes.len()];
+        // Dropping the transaction on an early return rolls every write back.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        for index in atomic_write_order(writes) {
+            match &writes[index] {
+                AtomicWrite::Create {
+                    object_type,
+                    id,
+                    name,
+                    workspace,
+                    payload,
+                } => {
+                    sqlx::query(
+                        r#"
+INSERT INTO "objects" ("object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, '{}', 1)
+"#,
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(name)
+                    .bind(workspace)
+                    .bind(payload)
+                    .bind(now_ms)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+                    results[index] = Some(WriteResult {
+                        resource_version: 1,
+                        created_at_ms: now_ms,
+                        updated_at_ms: now_ms,
+                    });
+                }
+                AtomicWrite::Update {
+                    object_type,
+                    id,
+                    payload,
+                    expected_version,
+                } => {
+                    let row = sqlx::query(
+                        r#"
+UPDATE "objects"
+SET "payload" = ?4, "updated_at_ms" = ?5, "resource_version" = "resource_version" + 1
+WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
+RETURNING "resource_version", "created_at_ms", "updated_at_ms"
+"#,
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(i64::try_from(*expected_version).unwrap_or(i64::MAX))
+                    .bind(payload)
+                    .bind(now_ms)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?
+                    .ok_or(PersistenceError::Conflict {
+                        current_resource_version: None,
+                    })?;
+                    results[index] = Some(write_result_from_row(&row));
+                }
+                AtomicWrite::Delete {
+                    object_type,
+                    id,
+                    expected_version,
+                } => {
+                    let deleted = sqlx::query(
+                        r#"
+DELETE FROM "objects"
+WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
+"#,
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(i64::try_from(*expected_version).unwrap_or(i64::MAX))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+                    if deleted.rows_affected() == 0 {
+                        return Err(PersistenceError::Conflict {
+                            current_resource_version: None,
+                        });
+                    }
+                }
+            }
+        }
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(results)
     }
 
     pub async fn delete_if(

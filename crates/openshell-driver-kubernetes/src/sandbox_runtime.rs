@@ -19,9 +19,14 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::core::ObjectMeta;
 use rcgen::{CertificateParams, DnType, IsCa, KeyUsagePurpose};
 
+use k8s_openapi::api::networking::v1::NetworkPolicy;
+
+use crate::config::KubernetesControlConnection;
+#[cfg(test)]
+use crate::isolation::BOUNDARY_ROLE_LABEL;
 use crate::isolation::{
-    BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesSandboxRuntimeNetworkFence,
-    KubernetesSandboxRuntimeNetworkFenceSpec,
+    KubernetesSandboxRuntimeNetworkFence, KubernetesSandboxRuntimeNetworkFenceSpec,
+    boundary_service_role, runtime_control_policy,
 };
 
 pub const SANDBOX_SECRET_COMPONENT: &str = "sandbox-bootstrap";
@@ -31,18 +36,22 @@ pub const BOUNDARY_CONFIG_KEY: &str = "boundary.json";
 pub const BACKEND_DESCRIPTOR_KEY: &str = "runtime-descriptor.json";
 pub const BOUNDARY_CERTIFICATE_KEY: &str = "tls.crt";
 pub const BOUNDARY_PRIVATE_KEY: &str = "tls.key";
+pub const SUPERVISOR_AUTH_BUNDLE_KEY: &str = "auth.json";
 pub const PROXY_CA_CERTIFICATE_KEY: &str = "proxy-ca.crt";
 pub const PROXY_CA_PRIVATE_KEY: &str = "proxy-ca.key";
 /// Optional bootstrap-Secret key holding the operator's corporate proxy CA
 /// bundle (`proxy_ca_bundle`). Distinct from [`PROXY_CA_CERTIFICATE_KEY`],
 /// which is the sandbox's own generated TLS-interception CA.
 pub const UPSTREAM_PROXY_CA_BUNDLE_KEY: &str = "upstream-proxy-ca.pem";
+/// JSON sandbox instance registration of a generation on the shared supervisor.
+pub const SHARED_INSTANCE_KEY: &str = "instance.json";
 pub const CLIENT_TLS_CA_KEY: &str = "client-ca.crt";
 pub const SANDBOX_BOOTSTRAP_INPUT_PATH: &str = "/.openshell/bootstrap-input";
 pub const BOUNDARY_CONFIG_PATH: &str = "/.openshell/state/bootstrap/boundary.json";
 pub const BOUNDARY_CERTIFICATE_PATH: &str = "/.openshell/state/bootstrap/tls.crt";
 pub const BOUNDARY_PRIVATE_KEY_PATH: &str = "/.openshell/state/bootstrap/tls.key";
 pub const BACKEND_DESCRIPTOR_PATH: &str = "/.openshell/supervisor/runtime-descriptor.json";
+pub const SUPERVISOR_AUTH_BUNDLE_PATH: &str = "/.openshell/supervisor/auth.json";
 pub const PROXY_CA_CERTIFICATE_PATH: &str = "/.openshell/supervisor/proxy-ca.crt";
 pub const PROXY_CA_PRIVATE_KEY_PATH: &str = "/.openshell/supervisor/proxy-ca.key";
 /// Where [`UPSTREAM_PROXY_CA_BUNDLE_KEY`] lands in the supervisor container.
@@ -108,6 +117,11 @@ pub struct SandboxRuntimeNames {
     pub sandbox_secret: String,
     pub supervisor_secret: String,
     pub boundary_service: String,
+    pub supervisor_service: String,
+    /// Per-sandbox egress allowance used only by runtime-initiated control.
+    pub control_policy: String,
+    /// Per-sandbox egress allowance to the gateway's shared supervisor.
+    pub shared_control_policy: String,
     pub supervisor_pod: String,
     pub workload_policy: String,
     pub supervisor_policy: String,
@@ -122,10 +136,24 @@ impl SandboxRuntimeNames {
             sandbox_secret: format!("os-sandbox-{suffix}"),
             supervisor_secret: format!("os-supervisor-{suffix}"),
             boundary_service: format!("os-boundary-{suffix}"),
+            supervisor_service: format!("os-supervisor-{suffix}"),
+            control_policy: format!("os-control-{suffix}"),
+            shared_control_policy: format!("os-shared-control-{suffix}"),
             supervisor_pod: format!("os-supervisor-{suffix}"),
             workload_policy: NAMESPACE_WORKLOAD_POLICY_NAME.to_string(),
             supervisor_policy: NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME.to_string(),
             image_pull_secret_prefix: format!("os-pull-{suffix}"),
+        }
+    }
+
+    /// The legacy boundary Service always selects the workload. New runtimes
+    /// dial a separate supervisor Service, so old gateways can still restart
+    /// the pair without understanding runtime-initiated control.
+    #[must_use]
+    pub fn control_service(&self, mode: KubernetesControlConnection) -> &str {
+        match mode {
+            KubernetesControlConnection::SupervisorInitiated => &self.boundary_service,
+            KubernetesControlConnection::RuntimeInitiated => &self.supervisor_service,
         }
     }
 
@@ -176,24 +204,28 @@ pub fn workload_fence(
     .provision()
 }
 
+/// Per-sandbox Sandbox Protocol endpoint. Its stable `ClusterIP` is allocated
+/// before either Pod runs. Each connection mode has a separate Service name
+/// and fixed selector, so legacy gateways keep their workload endpoint.
 #[must_use]
 pub fn boundary_service(
     namespace: &str,
     names: &SandboxRuntimeNames,
     sandbox_id: &str,
     boundary_port: u16,
+    mode: KubernetesControlConnection,
     owner: OwnerReference,
 ) -> Service {
     Service {
         metadata: ObjectMeta {
-            name: Some(names.boundary_service.clone()),
+            name: Some(names.control_service(mode).to_string()),
             namespace: Some(namespace.to_string()),
             owner_references: Some(vec![owner]),
             labels: Some(common_labels(sandbox_id, "boundary-service")),
             ..Default::default()
         },
         spec: Some(ServiceSpec {
-            selector: Some(pair_labels(sandbox_id, "workload")),
+            selector: Some(pair_labels(sandbox_id, boundary_service_role(mode))),
             ports: Some(vec![ServicePort {
                 name: Some("boundary".to_string()),
                 protocol: Some("TCP".to_string()),
@@ -201,10 +233,83 @@ pub fn boundary_service(
                 target_port: Some(IntOrString::Int(i32::from(boundary_port))),
                 ..Default::default()
             }]),
+            publish_not_ready_addresses: publishes_not_ready_supervisor(mode),
             ..Default::default()
         }),
         ..Default::default()
     }
+}
+
+/// A runtime-initiated supervisor becomes Ready only after the runtime has
+/// attached through this Service, so the Service must route to it before it is
+/// Ready. TLS and the Sandbox Protocol bearer, not readiness, authenticate the
+/// endpoint. Supervisor-initiated Services keep their original encoding.
+const fn publishes_not_ready_supervisor(mode: KubernetesControlConnection) -> Option<bool> {
+    match mode {
+        KubernetesControlConnection::RuntimeInitiated => Some(true),
+        KubernetesControlConnection::SupervisorInitiated => None,
+    }
+}
+
+/// Whether an existing boundary Service still selects the role required by
+/// `mode` for this sandbox's pair.
+#[must_use]
+pub fn boundary_service_matches_mode(
+    service: &Service,
+    sandbox_id: &str,
+    mode: KubernetesControlConnection,
+) -> bool {
+    let Some(spec) = service.spec.as_ref() else {
+        return false;
+    };
+    let publishes_not_ready = spec.publish_not_ready_addresses == Some(true);
+    spec.selector.as_ref() == Some(&pair_labels(sandbox_id, boundary_service_role(mode)))
+        && publishes_not_ready == (publishes_not_ready_supervisor(mode) == Some(true))
+}
+
+/// Per-sandbox control egress policy, owned by the Sandbox resource so it is
+/// garbage-collected with that sandbox only.
+#[must_use]
+pub fn control_policy(
+    namespace: &str,
+    names: &SandboxRuntimeNames,
+    sandbox_id: &str,
+    boundary_port: u16,
+    owner: OwnerReference,
+) -> NetworkPolicy {
+    let mut policy = runtime_control_policy(
+        namespace,
+        &names.control_policy,
+        &pair_label_value(sandbox_id),
+        boundary_port,
+    );
+    policy.metadata.owner_references = Some(vec![owner]);
+    policy.metadata.labels = Some(common_labels(sandbox_id, "sandbox-control-egress"));
+    policy
+}
+
+/// Egress allowance from this sandbox's workload Pod to the shared supervisor.
+#[must_use]
+pub fn shared_control_policy(
+    namespace: &str,
+    names: &SandboxRuntimeNames,
+    sandbox_id: &str,
+    supervisor_namespace: &str,
+    supervisor_selector: BTreeMap<String, String>,
+    runtime_port: u16,
+    owner: OwnerReference,
+) -> NetworkPolicy {
+    let mut policy = crate::isolation::shared_runtime_control_policy(
+        namespace,
+        &names.shared_control_policy,
+        &pair_label_value(sandbox_id),
+        supervisor_namespace,
+        supervisor_selector,
+        runtime_port,
+    );
+    policy.metadata.owner_references = Some(vec![owner]);
+    policy.metadata.labels = Some(common_labels(sandbox_id, "sandbox-shared-control-egress"));
+    policy
 }
 
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
@@ -337,7 +442,8 @@ pub fn supervisor_pod(
         "/openshell-supervisor".to_string(),
         "--backend-descriptor-file".to_string(),
         BACKEND_DESCRIPTOR_PATH.to_string(),
-        "--register-supervisor".to_string(),
+        "--auth-bundle-file".to_string(),
+        SUPERVISOR_AUTH_BUNDLE_PATH.to_string(),
         "--workdir".to_string(),
         "/sandbox".to_string(),
         "--health-socket-path".to_string(),
@@ -533,6 +639,7 @@ pub fn supervisor_bootstrap_secret(
     names: &SandboxRuntimeNames,
     sandbox_id: &str,
     backend_descriptor: Vec<u8>,
+    supervisor_auth_bundle: Vec<u8>,
     proxy_ca_certificate: Vec<u8>,
     proxy_ca_private_key: Vec<u8>,
     upstream_proxy_ca_bundle: Option<Vec<u8>>,
@@ -543,6 +650,10 @@ pub fn supervisor_bootstrap_secret(
         (
             BACKEND_DESCRIPTOR_KEY.to_string(),
             ByteString(backend_descriptor),
+        ),
+        (
+            SUPERVISOR_AUTH_BUNDLE_KEY.to_string(),
+            ByteString(supervisor_auth_bundle),
         ),
         (
             PROXY_CA_CERTIFICATE_KEY.to_string(),
@@ -573,6 +684,35 @@ pub fn supervisor_bootstrap_secret(
             ..Default::default()
         },
         data: Some(data),
+        immutable: Some(true),
+        type_: Some("Opaque".to_string()),
+        ..Default::default()
+    }
+}
+
+/// Durable launch material of one shared-supervisor sandbox instance, under
+/// the generation's supervisor Secret name so the existing generation cleanup
+/// deletes it. The gateway reads it back to rebuild the host's assignments.
+#[must_use]
+pub fn shared_instance_secret(
+    namespace: &str,
+    names: &SandboxRuntimeNames,
+    sandbox_id: &str,
+    registration: Vec<u8>,
+    owner: OwnerReference,
+) -> Secret {
+    Secret {
+        metadata: ObjectMeta {
+            name: Some(names.supervisor_secret.clone()),
+            namespace: Some(namespace.to_string()),
+            owner_references: Some(vec![owner]),
+            labels: Some(common_labels(sandbox_id, SUPERVISOR_SECRET_COMPONENT)),
+            ..Default::default()
+        },
+        data: Some(BTreeMap::from([(
+            SHARED_INSTANCE_KEY.to_string(),
+            ByteString(registration),
+        )])),
         immutable: Some(true),
         type_: Some("Opaque".to_string()),
         ..Default::default()
@@ -626,13 +766,7 @@ pub fn sandbox_owner_reference(
 }
 
 fn pair_labels(sandbox_id: &str, role: &str) -> BTreeMap<String, String> {
-    BTreeMap::from([
-        (
-            BOUNDARY_PAIR_LABEL.to_string(),
-            pair_label_value(sandbox_id),
-        ),
-        (BOUNDARY_ROLE_LABEL.to_string(), role.to_string()),
-    ])
+    crate::isolation::pair_role_labels(&pair_label_value(sandbox_id), role)
 }
 
 fn common_labels(sandbox_id: &str, component: &str) -> BTreeMap<String, String> {
@@ -720,11 +854,42 @@ mod tests {
     #[test]
     fn service_selects_only_the_workload_boundary() {
         let names = SandboxRuntimeNames::new("4b67c0d0-1111-2222-3333-444444444444");
-        let service = boundary_service("sandbox", &names, "pair", 5500, owner());
+        let legacy = boundary_service(
+            "sandbox",
+            &names,
+            "pair",
+            5500,
+            KubernetesControlConnection::SupervisorInitiated,
+            owner(),
+        );
         assert_eq!(
-            service.spec.unwrap().selector.unwrap()[BOUNDARY_ROLE_LABEL],
+            legacy.spec.as_ref().unwrap().selector.as_ref().unwrap()[BOUNDARY_ROLE_LABEL],
             "workload"
         );
+        let runtime_initiated = boundary_service(
+            "sandbox",
+            &names,
+            "pair",
+            5500,
+            KubernetesControlConnection::RuntimeInitiated,
+            owner(),
+        );
+        assert_eq!(
+            legacy.metadata.name.as_deref(),
+            Some(names.boundary_service.as_str())
+        );
+        assert_eq!(
+            runtime_initiated.metadata.name.as_deref(),
+            Some(names.supervisor_service.as_str())
+        );
+        assert_ne!(legacy.metadata.name, runtime_initiated.metadata.name);
+        assert_ne!(
+            legacy.spec.as_ref().unwrap().publish_not_ready_addresses,
+            Some(true)
+        );
+        let spec = runtime_initiated.spec.unwrap();
+        assert_eq!(spec.selector.unwrap()[BOUNDARY_ROLE_LABEL], "supervisor");
+        assert_eq!(spec.publish_not_ready_addresses, Some(true));
     }
 
     #[test]
@@ -787,6 +952,7 @@ mod tests {
             "sandbox",
             &names,
             "pair",
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1189,6 +1355,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             None,
             None,
             owner(),
@@ -1208,6 +1375,7 @@ mod tests {
             std::collections::BTreeSet::from([
                 PROXY_CA_CERTIFICATE_KEY.to_string(),
                 PROXY_CA_PRIVATE_KEY.to_string(),
+                SUPERVISOR_AUTH_BUNDLE_KEY.to_string(),
                 BACKEND_DESCRIPTOR_KEY.to_string(),
             ])
         );
@@ -1219,6 +1387,7 @@ mod tests {
             "sandbox",
             &names,
             "pair",
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),

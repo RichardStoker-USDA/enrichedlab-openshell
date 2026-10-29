@@ -169,6 +169,8 @@ the shared `check-protobuf-compatibility` action with `nix run .#check-protobuf-
 During `0.x`, a minor train permits compatibility findings
 as warnings; a patch train or no active train rejects them. Compare the current
 train's version with the latest stable release; commit messages are irrelevant.
+For the patch-train `v0.1.6-pre.N` exception, inspect the run summary and the
+qualification JSON's `exceptions` array; see `release-captain` for disposition.
 Compilation, baseline, and tool errors remain fatal. The `protobuf_compatibility` suite participates in
 the `release-tag-v1` qualification profile. Pre-release calls the reusable
 `release-qualification.yml` workflow after building, in parallel with publication. Release
@@ -176,6 +178,13 @@ selects the latest passing prerelease for the requested version and branch,
 verifies its qualification evidence, creates the stable tag at its exact commit,
 then rebuilds and publishes without rerunning qualification. The promotion job
 summary and `stable-promotion-*` artifact record the candidate and evidence.
+Both workflows accept optional tags. Tagless Pre-release creates the next
+candidate in the selected branch's seeded series; inspect Resolve Prerelease Tag
+for the actual tag and commit. Tagless Release infers the highest reachable
+prerelease version and stops if it is already stable. Explicit tags select an
+existing candidate or stable version for retries. Release Auto-Tag and manual
+candidate creation share a concurrency group; pending tag-resolution jobs can
+be waiting for that lock.
 Failed, cancelled, or skipped required suites fail
 qualification; stable publication is blocked, while published pre-release
 artifacts remain available. The Pre-release failure notification includes the
@@ -196,8 +205,10 @@ GitHub API failures; it requires `LLM_INFERENCE_API_KEY`, `ANTHROPIC_BASE_URL`, 
 Pre-release also runs `release-notes.yml` after building, alongside publication
 and qualification, and keeps the notes only in the `release-notes` artifact.
 This job is advisory: a notes failure emits a warning without failing the
-prerelease run or blocking promotion. Stable publication requires successful
-notes generation.
+prerelease run or blocking promotion. Stable publication reuses the promoted
+prerelease's `release-notes` artifact, retagged, and generates notes only when
+that preview is unavailable. The `Select Qualified Prerelease` summary says
+which happened.
 
 For `Codex Compatibility Review`, inspect its job summary and the
 `compatibility-review-run-<run-id>-attempt-<attempt>` artifact. Confirm the

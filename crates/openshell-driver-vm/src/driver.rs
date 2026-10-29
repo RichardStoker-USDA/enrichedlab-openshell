@@ -63,10 +63,10 @@ use openshell_core::proto::compute::v1::{
     GpuResourceCapabilities, ListSandboxesRequest, ListSandboxesResponse,
     MemoryResourceCapabilities, ResolvedWorkloadIdentity, ResourceCapabilities,
     StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
-    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesRequest,
-    WatchSandboxesSandboxEvent, WorkloadIdentityRequest, compute_driver_server::ComputeDriver,
-    watch_sandboxes_event,
+    SuspendSandboxRequest, SuspendSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
+    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
+    WorkloadIdentityRequest, compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
@@ -1636,14 +1636,20 @@ impl VmDriver {
             trust_anchor_pem: channel_tls.trust_anchor_pem.clone(),
         };
         let transport = if plan.backend == VmBackend::Qemu {
-            SandboxTransport::Vsock {
-                guest_cid: plan.vsock_cid.ok_or_else(|| {
-                    Status::internal("QEMU launch plan is missing a guest vsock CID")
-                })?,
-                port: VM_CONTROL_PORT,
+            let guest_cid = plan
+                .vsock_cid
+                .ok_or_else(|| Status::internal("QEMU launch plan is missing a guest vsock CID"))?;
+            SandboxTransport::RuntimeInitiatedVsock {
+                guest_cid,
+                // Each QEMU guest connects to a distinct host port. The CID
+                // allocator already guarantees uniqueness among live guests.
+                port: VM_CONTROL_PORT
+                    .checked_add(guest_cid)
+                    .filter(|port| *port != u32::MAX)
+                    .ok_or_else(|| Status::resource_exhausted("VM control port space exhausted"))?,
             }
         } else {
-            SandboxTransport::Unix {
+            SandboxTransport::RuntimeInitiatedUnix {
                 socket_path: control_socket.clone(),
             }
         };
@@ -1733,6 +1739,7 @@ impl VmDriver {
         } else {
             let _ = tokio::fs::remove_file(&control_socket).await;
             command
+                .arg("--vm-vsock-runtime-initiated")
                 .arg("--vm-vsock-control-port")
                 .arg(VM_CONTROL_PORT.to_string())
                 .arg("--vm-vsock-control-socket")
@@ -3304,6 +3311,43 @@ impl VmDriver {
         )
     }
 
+    fn publish_pulling_event(&self, sandbox_id: &str, image_ref: &str) {
+        self.publish_platform_event(
+            sandbox_id.to_string(),
+            platform_event(
+                "vm",
+                "Normal",
+                "Pulling",
+                format!("Pulling image \"{image_ref}\""),
+            ),
+        );
+    }
+
+    /// A registry-sourced root disk found in the cache: `Pulling`, the
+    /// `CacheHit` progress and `Pulled`, so the image step still advances.
+    async fn publish_registry_cache_hit(
+        &self,
+        sandbox_id: &str,
+        image_ref: &str,
+        image_identity: &str,
+        image_path: &Path,
+    ) {
+        self.publish_pulling_event(sandbox_id, image_ref);
+        self.publish_vm_progress(
+            sandbox_id,
+            "CacheHit",
+            format!("Using cached VM root disk for image \"{image_ref}\""),
+            HashMap::from([
+                ("image_ref".to_string(), image_ref.to_string()),
+                ("image_source".to_string(), "registry".to_string()),
+                ("cache_hit".to_string(), "true".to_string()),
+                ("image_identity".to_string(), image_identity.to_string()),
+            ]),
+        );
+        self.publish_pulled_event(sandbox_id, image_ref, image_path)
+            .await;
+    }
+
     async fn ensure_cached_registry_rootfs_image(
         &self,
         sandbox_id: &str,
@@ -3314,6 +3358,31 @@ impl VmDriver {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         info!(image_ref = %image_ref, "vm driver: ensuring cached root disk image (registry)");
         let reference = parse_registry_reference(image_ref)?;
+        // A digest pin already names the image's content, and a cached root
+        // disk is only published after its manifest was verified against
+        // that digest. On a hit the registry cannot add anything, so neither
+        // authenticate nor resolve: the sandbox boots from the cache without a
+        // network round trip, and keeps booting while the registry is down.
+        // Tags still resolve through the registry below.
+        if let Some(digest) = reference.digest() {
+            let image_identity = bootstrap_image_cache_identity(digest);
+            let image_path = image_cache_rootfs_image(&self.config.state_dir, &image_identity);
+            if tokio::fs::metadata(&image_path).await.is_ok() {
+                info!(
+                    image_identity = %image_identity,
+                    image_path = %image_path.display(),
+                    "vm driver: root disk image cache hit (digest-pinned, no registry call)"
+                );
+                self.publish_registry_cache_hit(
+                    sandbox_id,
+                    image_ref,
+                    &image_identity,
+                    &image_path,
+                )
+                .await;
+                return span_status.finish(Ok(image_identity));
+            }
+        }
         info!(image_ref = %image_ref, "vm driver: authenticating with registry");
         self.publish_vm_progress(
             sandbox_id,
@@ -3358,39 +3427,19 @@ impl VmDriver {
         let image_identity = bootstrap_image_cache_identity(&source_image_identity);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, &image_identity);
 
-        // Emit a driver progress hint for cache hits too and immediately
-        // follow with `Pulled` so the image step still advances cleanly.
-        self.publish_platform_event(
-            sandbox_id.to_string(),
-            platform_event(
-                "vm",
-                "Normal",
-                "Pulling",
-                format!("Pulling image \"{image_ref}\""),
-            ),
-        );
-
         if tokio::fs::metadata(&image_path).await.is_ok() {
             info!(
                 image_identity = %image_identity,
                 image_path = %image_path.display(),
                 "vm driver: root disk image cache hit (no build needed)"
             );
-            self.publish_vm_progress(
-                sandbox_id,
-                "CacheHit",
-                format!("Using cached VM root disk for image \"{image_ref}\""),
-                HashMap::from([
-                    ("image_ref".to_string(), image_ref.to_string()),
-                    ("image_source".to_string(), "registry".to_string()),
-                    ("cache_hit".to_string(), "true".to_string()),
-                    ("image_identity".to_string(), image_identity.clone()),
-                ]),
-            );
-            self.publish_pulled_event(sandbox_id, image_ref, &image_path)
+            self.publish_registry_cache_hit(sandbox_id, image_ref, &image_identity, &image_path)
                 .await;
             return span_status.finish(Ok(image_identity));
         }
+
+        // A driver progress hint before the build, so the image step advances.
+        self.publish_pulling_event(sandbox_id, image_ref);
 
         info!(
             image_identity = %image_identity,
@@ -4818,23 +4867,6 @@ fn configure_main_exit_marker(command: &mut Command, state_dir: &Path) {
 
 #[tonic::async_trait]
 impl ComputeDriver for VmDriver {
-    async fn select_warm_pair(
-        &self,
-        request: Request<openshell_core::proto::compute::v1::SelectWarmPairRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::SelectWarmPairResponse>, Status> {
-        let _ = &request;
-        Err(Status::unimplemented(
-            "warm pair allocation is not supported",
-        ))
-    }
-
-    async fn sync_warm_pools(
-        &self,
-        _request: Request<openshell_core::proto::compute::v1::SyncWarmPoolsRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::SyncWarmPoolsResponse>, Status> {
-        Err(Status::unimplemented("warm pools are not supported"))
-    }
-
     async fn authenticate_sandbox(
         &self,
         _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
@@ -4908,7 +4940,6 @@ impl ComputeDriver for VmDriver {
 
         Ok(Response::new(GetSandboxResponse {
             sandbox: Some(sandbox),
-            runtime_identity: String::new(),
         }))
     }
 
@@ -4919,6 +4950,15 @@ impl ComputeDriver for VmDriver {
         Ok(Response::new(ListSandboxesResponse {
             sandboxes: self.current_snapshots().await,
         }))
+    }
+
+    async fn suspend_sandbox(
+        &self,
+        _request: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SuspendSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "the VM compute driver does not support sandbox suspend",
+        ))
     }
 
     async fn stop_sandbox(
@@ -7136,7 +7176,10 @@ fn inject_guest_boundary_bundle(
     let tls = match &config.listener {
         BoundaryListener::Unix { tls, .. }
         | BoundaryListener::TlsTcp { tls, .. }
-        | BoundaryListener::Vsock { tls, .. } => tls.clone(),
+        | BoundaryListener::Vsock { tls, .. }
+        | BoundaryListener::RuntimeInitiatedTlsTcp { tls, .. }
+        | BoundaryListener::RuntimeInitiatedUnix { tls, .. }
+        | BoundaryListener::RuntimeInitiatedVsock { tls, .. } => tls.clone(),
     };
     let encoded_config = config
         .encode()
@@ -8140,7 +8183,6 @@ mod tests {
             client
                 .create_sandbox(request_with_traceparent(CreateSandboxRequest {
                     sandbox: None,
-                    ..Default::default()
                 }))
                 .await
                 .is_err()
@@ -8171,7 +8213,6 @@ mod tests {
             .delete_sandbox(request_with_traceparent(DeleteSandboxRequest {
                 sandbox_id: String::new(),
                 name: String::new(),
-                ..Default::default()
             }))
             .await
             .unwrap();
@@ -8251,7 +8292,6 @@ mod tests {
         };
         let request = request_with_traceparent(CreateSandboxRequest {
             sandbox: Some(sandbox),
-            ..Default::default()
         });
 
         let mut client = traced_driver_client(driver.clone()).await;

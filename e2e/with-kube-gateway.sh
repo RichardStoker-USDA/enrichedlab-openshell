@@ -32,6 +32,10 @@
 # files, relative to the repository root or absolute, to layer additional chart
 # configuration on top of ci/values-skaffold.yaml.
 #
+# Set OPENSHELL_E2E_KUBE_TLS=1 with an overlay that keeps gateway TLS on (for
+# example ci/values-tls-port-forward.yaml) to reach the gateway over mTLS
+# through the port-forward with the chart-generated client certificate.
+#
 # Image source:
 #   - Ephemeral k3d mode builds local
 #     `openshell/{gateway,sandbox,supervisor}:${IMAGE_TAG}`
@@ -119,7 +123,6 @@ CORPORATE_PROXY_FIXTURE_SECRET="openshell-e2e-proxy-auth"
 CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP="openshell-e2e-proxy-ca"
 CORPORATE_PROXY_CA_FIXTURE_DEPLOYED=0
 OPENSHIFT_DETECTED=0
-OPENSHIFT_SANDBOX_SCC_GRANTED=0
 OPENSHIFT_POSTGRES_SCC_GRANTED=0
 OPENSHIFT_ROUTE_HOST=""
 # Temp dir holding the client mTLS material extracted from openshell-client-tls
@@ -589,14 +592,6 @@ cleanup() {
       --ignore-not-found >/dev/null 2>&1 || true
   fi
 
-  if [ "${OPENSHIFT_SANDBOX_SCC_GRANTED}" = "1" ]; then
-    oc adm policy remove-scc-from-user privileged \
-      --context "${KUBE_CONTEXT}" \
-      -z openshell-sandbox -n "${NAMESPACE}" \
-      2>/dev/null || true
-    OPENSHIFT_SANDBOX_SCC_GRANTED=0
-  fi
-
   # Remove the extracted client mTLS material (also covered by the WORKDIR sweep
   # below, but drop the private key promptly and explicitly).
   if [ -n "${OPENSHIFT_PKI_DIR}" ]; then
@@ -762,6 +757,11 @@ run_scenario() {
   export OPENSHELL_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_KUBE_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_E2E_KUBE_RELEASE="${RELEASE_NAME}"
+  # Tests that upgrade the release (for example to scale the shared
+  # supervisor pool) reuse its values against this exact chart, through the
+  # kubeconfig this harness uses.
+  export OPENSHELL_E2E_KUBE_CHART="${ROOT}/deploy/helm/openshell"
+  export OPENSHELL_E2E_KUBECONFIG="${KUBECONFIG:-}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
 
   e2e_import_example_provider_profiles \
@@ -1259,12 +1259,6 @@ if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
 
   kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
 
-  echo "Granting privileged SCC to openshell-sandbox in namespace ${NAMESPACE}..."
-  oc adm policy add-scc-to-user privileged \
-    --context "${KUBE_CONTEXT}" \
-    -z openshell-sandbox -n "${NAMESPACE}"
-  OPENSHIFT_SANDBOX_SCC_GRANTED=1
-
   # Drive the gateway through a passthrough Route with mTLS instead of
   # port-forward. The Route host is deterministic: OpenShift serves any name
   # under the cluster ingress (apps) domain via the router's wildcard, so we
@@ -1480,6 +1474,27 @@ else
     # OpenShift: reach the gateway over the passthrough Route with mTLS so the
     # SSH-relay `sandbox connect` suites work (port-forward stalls them).
     openshift_register_route_gateway || exit 1
+  elif [ "${OPENSHELL_E2E_KUBE_TLS:-0}" = "1" ]; then
+    # Topologies that require gateway TLS: reach the gateway over mTLS through
+    # the port-forward with the chart-generated client certificate. The
+    # server certificate names 127.0.0.1.
+    start_gateway_portforward || exit 1
+    kube_pki_dir="${WORKDIR}/kube-client-pki"
+    mkdir -p "${kube_pki_dir}/client"
+    kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+      -o jsonpath='{.data.ca\.crt}' | base64 -d >"${kube_pki_dir}/ca.crt"
+    kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+      -o jsonpath='{.data.tls\.crt}' | base64 -d >"${kube_pki_dir}/client/tls.crt"
+    kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+      -o jsonpath='{.data.tls\.key}' | base64 -d >"${kube_pki_dir}/client/tls.key"
+    GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
+    GATEWAY_ENDPOINT="https://127.0.0.1:${LOCAL_PORT}"
+    e2e_register_mtls_gateway \
+      "${XDG_CONFIG_HOME}" \
+      "${GATEWAY_NAME}" \
+      "${GATEWAY_ENDPOINT}" \
+      "${LOCAL_PORT}" \
+      "${kube_pki_dir}"
   else
     # Vanilla Kubernetes: reach the gateway in plaintext over port-forward.
     start_gateway_portforward || exit 1
@@ -1506,6 +1521,11 @@ else
   export OPENSHELL_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_KUBE_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_E2E_KUBE_RELEASE="${RELEASE_NAME}"
+  # Tests that upgrade the release (for example to scale the shared
+  # supervisor pool) reuse its values against this exact chart, through the
+  # kubeconfig this harness uses.
+  export OPENSHELL_E2E_KUBE_CHART="${ROOT}/deploy/helm/openshell"
+  export OPENSHELL_E2E_KUBECONFIG="${KUBECONFIG:-}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
 
   e2e_import_example_provider_profiles \

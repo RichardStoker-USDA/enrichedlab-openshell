@@ -47,6 +47,7 @@ mod ssh_identity;
 mod ssh_sessions;
 mod storage_proto;
 mod supervisor_owner;
+mod supervisor_pool;
 pub mod supervisor_session;
 mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
@@ -73,7 +74,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::LazyLock;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -241,6 +242,53 @@ fn spawn_gateway_extension_token_refresh(
         }
     });
 }
+
+/// Mint the shared supervisor's token and renew it at half its lifetime so
+/// the delivered copy is never close to expiry when the supervisor restarts
+/// or reconnects. Minting failures are logged and retried shortly.
+fn spawn_supervisor_token_refresh(
+    authority: Arc<auth::sandbox_jwt::SandboxSessionJwtAuthority>,
+    ttl: Duration,
+    controller: openshell_supervisor_control::SupervisorHostController,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let delay = match authority.mint_supervisor_token(ttl) {
+                Ok(minted) => {
+                    let remaining = minted.expires_at.saturating_sub(
+                        i64::try_from(
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map_or(0, |elapsed| elapsed.as_secs()),
+                        )
+                        .unwrap_or(i64::MAX),
+                    );
+                    controller.publish_credential(
+                        openshell_supervisor_control::SupervisorCredential {
+                            token: minted.token,
+                            expires_at: minted.expires_at,
+                        },
+                    );
+                    Duration::from_secs(u64::try_from(remaining).unwrap_or(0) / 2)
+                        .max(Duration::from_secs(1))
+                }
+                Err(error) => {
+                    warn!(%error, "failed to mint the supervisor token; retrying");
+                    Duration::from_secs(10)
+                }
+            };
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
 pub use auth::audit::ConnectionSource;
 pub use multiplex::{MultiplexService, MultiplexedService};
 pub use persistence::Store;
@@ -344,6 +392,10 @@ pub struct ServerState {
 
     /// Optional K8s `ServiceAccount` authenticator for gateway peer RPCs.
     pub peer_authenticator: Option<Arc<auth::peer::PeerServiceAccountAuthenticator>>,
+
+    /// Credentials that have recently logged on, so each records one
+    /// authentication success rather than one per request.
+    pub(crate) logons: auth::audit::Logons,
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
@@ -463,6 +515,7 @@ impl ServerState {
             sandbox_session_jwt_authority: None,
             compute_driver_authenticator: None,
             peer_authenticator: None,
+            logons: auth::audit::Logons::default(),
             grpc_rate_limiter,
             reflection_service,
             gateway_interceptors: None,
@@ -739,6 +792,47 @@ pub(crate) async fn run_server(
     if let Some(issuer) = extension_jwt_issuer {
         spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
     }
+    // The shared supervisor authenticates with a token this gateway mints
+    // from its launch-signing key and carries only over TLS, so the topology
+    // needs both.
+    if let Some(controller) = state.compute.supervisor_host() {
+        let (authority, jwt) = state
+            .sandbox_session_jwt_authority
+            .clone()
+            .zip(config.gateway_jwt.as_ref())
+            .ok_or_else(|| {
+                Error::config(
+                    "the shared supervisor requires gateway_jwt signing material to mint \
+                     supervisor tokens; configure [openshell.gateway.gateway_jwt] or disable \
+                     supervisor_topology",
+                )
+            })?;
+        if config.tls.is_none() {
+            return Err(Error::config(
+                "the shared supervisor requires gateway TLS; its token travels only over TLS. \
+                 Enable TLS or disable supervisor_topology",
+            ));
+        }
+        let ttl = jwt.token_ttl().clamp(
+            openshell_core::jwt::MIN_SESSION_TOKEN_TTL,
+            openshell_core::jwt::MAX_SESSION_TOKEN_TTL,
+        );
+        info!(
+            ttl_secs = ttl.as_secs(),
+            "shared supervisor assignment stream enabled; minting supervisor tokens"
+        );
+        info!("shared supervisor pool enabled; reconciling pool membership and ownership");
+        supervisor_pool::SupervisorPool::new(
+            state.store.clone(),
+            controller.clone(),
+            authority.clone(),
+            state.credentials.clone(),
+            state.compute.supervisor_ocsf_headers_handle(),
+            state.replica_id.clone(),
+        )
+        .start(shutdown_rx.clone());
+        spawn_supervisor_token_refresh(authority, ttl, controller.clone(), shutdown_rx.clone());
+    }
 
     if state.sandbox_session_jwt_authority.is_some()
         && state.compute.supports_sandbox_authentication()
@@ -1010,7 +1104,6 @@ pub(crate) async fn run_server(
         gateway_members::MEMBER_REFRESH_INTERVAL,
         shutdown_rx.clone(),
     );
-    compute::warm_pool::spawn(state.clone(), shutdown_rx.clone());
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_profile_sources::spawn_refresh(state.clone());
@@ -1624,9 +1717,32 @@ impl ComputeDriverConfigContext<'_> {
 pub struct ComputeDriverBuildContext<'a> {
     config: ComputeDriverConfigContext<'a>,
     shutdown_rx: watch::Receiver<bool>,
+    shared_supervision: &'a OnceLock<openshell_supervisor_control::SharedSupervision>,
+    /// Recovery deadline from `[openshell.gateway.supervisor_pool]`, when
+    /// configured.
+    supervisor_recovery_timeout_secs: Option<u32>,
 }
 
 impl ComputeDriverBuildContext<'_> {
+    /// The gateway's coordination of the shared supervisor pool, for an
+    /// in-process driver whose configuration places new generations on it.
+    /// The gateway owns the desired set and ownership durably, serves each
+    /// member over the private assignment stream, mints the supervisor
+    /// token, and publishes each renewal for the driver to deliver.
+    /// `[openshell.gateway.supervisor_pool]` only tunes it. Created on first
+    /// request; every call returns the same coordination.
+    pub fn shared_supervision(&self) -> openshell_supervisor_control::SharedSupervision {
+        self.shared_supervision
+            .get_or_init(|| {
+                let supervision = openshell_supervisor_control::SharedSupervision::new();
+                if let Some(recovery_timeout_secs) = self.supervisor_recovery_timeout_secs {
+                    supervision.set_recovery_timeout_secs(recovery_timeout_secs);
+                }
+                supervision
+            })
+            .clone()
+    }
+
     #[must_use]
     pub fn config_context(&self) -> ComputeDriverConfigContext<'_> {
         self.config
@@ -1754,8 +1870,12 @@ async fn build_compute_runtime(
             })?,
         ConfiguredComputeDriver::Remote { .. } => true,
     };
+    let supervisor_pool = driver_startup
+        .file
+        .and_then(|file| file.openshell.gateway.supervisor_pool);
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
+            let shared_supervision = OnceLock::new();
             let build_context = ComputeDriverBuildContext {
                 config: ComputeDriverConfigContext {
                     driver_name: &registration.name,
@@ -1765,8 +1885,21 @@ async fn build_compute_runtime(
                     driver_startup,
                 },
                 shutdown_rx,
+                shared_supervision: &shared_supervision,
+                supervisor_recovery_timeout_secs: supervisor_pool
+                    .and_then(|pool| pool.recovery_timeout_secs),
             };
             let instance = registration.factory.build(build_context).await?;
+            let supervisor_host = shared_supervision
+                .into_inner()
+                .map(|supervision| supervision.controller().clone());
+            if supervisor_pool.is_some() && supervisor_host.is_none() {
+                return Err(Error::config(
+                    "openshell.gateway.supervisor_pool tunes the shared supervisor pool, but no \
+                     compute driver hosts sandboxes on it; set the Kubernetes driver's \
+                     supervisor_topology = \"gateway\" or remove the table",
+                ));
+            }
             match instance {
                 ComputeDriverInstance::InProcess(driver) => ComputeRuntime::from_driver(
                     registration.name,
@@ -1781,7 +1914,13 @@ async fn build_compute_runtime(
                 .await
                 .map_err(|error| {
                     Error::execution(format!("failed to create compute runtime: {error}"))
-                })?,
+                })?
+                .with_supervisor_host(supervisor_host),
+                ComputeDriverInstance::ManagedRemote(_) if supervisor_host.is_some() => {
+                    return Err(Error::config(
+                        "only an in-process compute driver can use the gateway's shared supervision",
+                    ));
+                }
                 ComputeDriverInstance::ManagedRemote(mut endpoint) => {
                     endpoint.name = registration.name;
                     ComputeRuntime::new_remote_driver(
@@ -1798,6 +1937,12 @@ async fn build_compute_runtime(
                     })?
                 }
             }
+        }
+        ConfiguredComputeDriver::Remote { .. } if supervisor_pool.is_some() => {
+            return Err(Error::config(
+                "openshell.gateway.supervisor_pool tunes the shared supervisor pool, which \
+                 only an in-process compute driver can use; remove the table",
+            ));
         }
         ConfiguredComputeDriver::Remote { name } => {
             let remote_config =
@@ -2223,6 +2368,54 @@ mod tests {
 
     #[derive(Clone, Copy)]
     struct TestComputeDriverFactory;
+
+    #[test]
+    fn shared_supervision_is_always_a_pool_tuned_by_its_table() {
+        let endpoint_overrides = std::collections::BTreeMap::new();
+        let (_shutdown, shutdown_rx) = watch::channel(false);
+        for (configured, offered) in [
+            (
+                None,
+                openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_SECS,
+            ),
+            (Some(75), 75),
+        ] {
+            let shared = std::sync::OnceLock::new();
+            let context = super::ComputeDriverBuildContext {
+                config: super::ComputeDriverConfigContext {
+                    driver_name: "kubernetes",
+                    gateway_name: "test",
+                    gateway_bind_address: "127.0.0.1:8080".parse().unwrap(),
+                    gateway_log_level: "info",
+                    driver_startup: crate::compute::driver_config::DriverStartupContext {
+                        file: None,
+                        guest_tls: None,
+                        gateway_port: 8080,
+                        gateway_tls_enabled: true,
+                        endpoint_overrides: &endpoint_overrides,
+                    },
+                },
+                shutdown_rx: shutdown_rx.clone(),
+                shared_supervision: &shared,
+                supervisor_recovery_timeout_secs: configured,
+            };
+            // The driver asks for shared supervision as before; it is the
+            // pool, with the configured recovery deadline or the default.
+            let supervision = context.shared_supervision();
+            assert_eq!(
+                supervision.controller().pool_recovery_timeout_secs(),
+                offered
+            );
+            assert_eq!(
+                context
+                    .shared_supervision()
+                    .controller()
+                    .pool_recovery_timeout_secs(),
+                offered
+            );
+            assert!(shared.get().is_some());
+        }
+    }
 
     #[test]
     fn factory_admission_defaults_remain_enabled() {
