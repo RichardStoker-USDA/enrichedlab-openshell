@@ -57,7 +57,9 @@ fi
 echo "main: $(git rev-parse --short main) ($upstream/main)"
 
 stable() { git tag --list 'v[0-9]*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$'; }
-contained=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' "$series")
+# The newest stable release merged into the series through any parent; describe prefers the first parent and misses
+# a release an upstream merge brought in.
+contained=$(git tag --merged "$series" --list 'v[0-9]*' --sort=-v:refname | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ && !found {print; found=1}')
 newest=$(stable | head -1)
 echo "$series: contains upstream $contained; newest upstream release is $newest"
 

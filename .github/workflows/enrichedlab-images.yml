@@ -47,7 +47,10 @@ jobs:
             cargo=${REF_NAME#v}
             tag=$cargo
           else
-            base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' HEAD)
+            # The newest stable release tag merged into HEAD, through any parent: an upstream merge brings its tag
+            # in through the second parent, which git describe does not prefer. Pre-releases never count.
+            base=$(git tag --merged HEAD --list 'v[0-9]*' --sort=-v:refname | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ && !found {print; found=1}')
+            [[ -n $base ]] || { echo "::error::no stable release tag is merged into HEAD"; exit 1; }
             commit=$(git rev-parse --short=12 HEAD)
             cargo="${base#v}-el.dev+g${commit}"
             tag="${base#v}-el.dev.g${commit}"
