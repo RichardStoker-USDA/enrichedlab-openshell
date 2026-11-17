@@ -10,11 +10,11 @@ use tracing::info;
 
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
-use openshell_core::sandbox_env::SupervisorOtlpArgs;
+use openshell_core::sandbox_env::{SupervisorOtlp, SupervisorOtlpArgs};
 use openshell_driver_kubernetes::{
     ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
     KubernetesComputeConfig, KubernetesComputeDriver, KubernetesImagePullPolicy,
-    KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, WorkspaceMode,
+    KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, SupervisorTelemetry, WorkspaceMode,
 };
 
 #[derive(Parser, Debug)]
@@ -45,6 +45,18 @@ struct Args {
 
     #[command(flatten)]
     otlp: SupervisorOtlpArgs,
+
+    /// Where supervisors send their traces and OCSF events: `gateway` (default) uses the exports set by this
+    /// driver's `--otlp*` flags, which must name the gateway's own collector; `off` sends none; an `http://` or
+    /// `https://` URL sends the same exports to that separate collector over OTLP/gRPC. Supervisors receive the
+    /// gateway's collector headers and TLS material only with `gateway` and at least one export.
+    #[arg(
+        long,
+        env = "OPENSHELL_SUPERVISOR_TELEMETRY",
+        default_value = "gateway",
+        value_parser = parse_supervisor_telemetry
+    )]
+    supervisor_telemetry: SupervisorTelemetry,
 
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
@@ -268,7 +280,11 @@ async fn main() -> Result<()> {
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
 
-    let supervisor_otlp = args.otlp.supervisor_otlp();
+    let (supervisor_telemetry, supervisor_otlp) = standalone_supervisor_telemetry(
+        args.supervisor_telemetry.clone(),
+        args.otlp.supervisor_otlp(),
+    )
+    .map_err(|err| miette::miette!("{err}"))?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let driver = KubernetesComputeDriver::new(
         KubernetesComputeConfig {
@@ -311,8 +327,9 @@ async fn main() -> Result<()> {
             proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
             proxy_ca_bundle: args.proxy_ca_bundle,
             grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
-            // The standalone driver takes the supervisors' exports from its own flags.
-            supervisor_telemetry: openshell_driver_kubernetes::SupervisorTelemetry::Gateway,
+            // The gateway hands a remote driver its collector material; this setting decides which
+            // supervisors receive it.
+            supervisor_telemetry,
             supervisor_otlp,
             supervisor_gateway_name: args.gateway_name.clone(),
             ssh_socket_path: args.sandbox_ssh_socket_path,
@@ -413,6 +430,38 @@ fn fixed_annotations(
     Ok(map)
 }
 
+/// Parse `--supervisor-telemetry`: `gateway`, `off`, or a collector URL.
+fn parse_supervisor_telemetry(raw: &str) -> std::result::Result<SupervisorTelemetry, String> {
+    let telemetry = match raw.trim() {
+        "gateway" => SupervisorTelemetry::Gateway,
+        "off" => SupervisorTelemetry::Off,
+        endpoint => SupervisorTelemetry::Endpoint(endpoint.to_string()),
+    };
+    telemetry.validate()?;
+    Ok(telemetry)
+}
+
+/// The telemetry setting and exports this driver gives supervisors. The exports come from the driver's own
+/// `--otlp*` flags. With none, supervisors are treated as `off`, so they never hold the gateway's collector
+/// material with nothing to send it to; a separate endpoint with no export to carry is refused, not accepted
+/// silently.
+fn standalone_supervisor_telemetry(
+    setting: SupervisorTelemetry,
+    flags: SupervisorOtlp,
+) -> std::result::Result<(SupervisorTelemetry, SupervisorOtlp), String> {
+    let exports = setting.resolve(flags);
+    if !exports.is_empty() {
+        return Ok((setting, exports));
+    }
+    if matches!(setting, SupervisorTelemetry::Endpoint(_)) {
+        return Err(
+            "--supervisor-telemetry with a collector URL needs --otlp-endpoint, --otlp-ocsf-endpoint or --otlp-agent-endpoint to choose what supervisors export"
+                .into(),
+        );
+    }
+    Ok((SupervisorTelemetry::Off, exports))
+}
+
 /// Parse a `KEY=VALUE` flag value; the key is validated with the rest of the
 /// driver configuration.
 fn parse_key_value(raw: &str) -> std::result::Result<(String, String), String> {
@@ -505,5 +554,56 @@ mod tests {
             Some("http://collector.example:4317")
         );
         assert_eq!(args.gateway_name.as_deref(), Some("kubernetes-dev"));
+    }
+
+    fn supervisor_telemetry_from(
+        flags: &[&str],
+    ) -> std::result::Result<(SupervisorTelemetry, SupervisorOtlp), String> {
+        let args = Args::try_parse_from(
+            std::iter::once("openshell-driver-kubernetes").chain(flags.iter().copied()),
+        )
+        .map_err(|error| error.to_string())?;
+        standalone_supervisor_telemetry(args.supervisor_telemetry, args.otlp.supervisor_otlp())
+    }
+
+    #[test]
+    fn standalone_supervisors_get_collector_material_only_when_exporting_to_the_gateway_collector()
+    {
+        let collector = ["--otlp-endpoint", "http://collector.example:4317"];
+
+        let (telemetry, exports) = supervisor_telemetry_from(&collector).unwrap();
+        assert!(telemetry.uses_gateway_collector());
+        assert_eq!(
+            exports.traces.map(|export| export.endpoint).as_deref(),
+            Some("http://collector.example:4317")
+        );
+
+        let off = [&collector[..], &["--supervisor-telemetry", "off"]].concat();
+        let (telemetry, exports) = supervisor_telemetry_from(&off).unwrap();
+        assert_eq!(telemetry, SupervisorTelemetry::Off);
+        assert!(exports.is_empty());
+
+        let separate = [
+            &collector[..],
+            &["--supervisor-telemetry", "http://192.0.2.10:4317"],
+        ]
+        .concat();
+        let (telemetry, exports) = supervisor_telemetry_from(&separate).unwrap();
+        assert!(!telemetry.uses_gateway_collector());
+        assert_eq!(
+            exports.traces.map(|export| export.endpoint).as_deref(),
+            Some("http://192.0.2.10:4317")
+        );
+
+        // No export: the default `gateway` setting withholds the collector material.
+        let (telemetry, exports) = supervisor_telemetry_from(&[]).unwrap();
+        assert_eq!(telemetry, SupervisorTelemetry::Off);
+        assert!(exports.is_empty());
+
+        let lonely =
+            supervisor_telemetry_from(&["--supervisor-telemetry", "http://192.0.2.10:4317"])
+                .unwrap_err();
+        assert!(lonely.contains("--otlp-endpoint"), "{lonely}");
+        assert!(supervisor_telemetry_from(&["--supervisor-telemetry", "elsewhere"]).is_err());
     }
 }

@@ -76,7 +76,12 @@ conflict is listed here and checked by hand on every merge:
   and the Kubernetes driver removes it from a recovered shared generation's Secret. Material without collector fields
   is kept byte for byte, so a launch and its replay keep one admission fingerprint. While supervisors use the
   gateway's collector, stored material keeps what it was launched with until the next launch.
-- Driver start validates both upstream's supervisor topology and the fork's fixed metadata.
+- The standalone Kubernetes driver takes `--supervisor-telemetry` (`OPENSHELL_SUPERVISOR_TELEMETRY`) and resolves it
+  against its own `--otlp*` exports in `standalone_supervisor_telemetry`; with no export it writes bundles as `off`.
+  The gateway treats every remote driver as using its collector (`ConfiguredComputeDriver::Remote` in
+  `openshell-server`), so the driver's `supervisor_auth_json` is what withholds the material there.
+- Driver start validates upstream's supervisor topology and the fork's fixed metadata and supervisor telemetry; a
+  separate telemetry endpoint is refused with a shared supervisor, which exports no supervisor telemetry.
 
 ## Carried upstream pull requests
 

@@ -2283,6 +2283,8 @@ async fn build_compute_runtime(
                 gateway_log_level: &config.log_level,
                 driver_startup,
             })?,
+        // A remote driver receives the collector material and decides itself which supervisors get it (the
+        // standalone Kubernetes driver's `--supervisor-telemetry`).
         ConfiguredComputeDriver::Remote { .. } => true,
     };
     let supervisor_pool = driver_startup

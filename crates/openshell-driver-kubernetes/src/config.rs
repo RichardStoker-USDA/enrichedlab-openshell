@@ -644,7 +644,21 @@ impl KubernetesComputeConfig {
         self.validate_allowed_pod_annotations()?;
         self.validate_allowed_pod_labels()?;
         self.validate_fixed_pod_metadata()?;
-        self.supervisor_telemetry.validate()
+        self.validate_supervisor_telemetry()
+    }
+
+    /// Validate `supervisor_telemetry`: an endpoint must be a well-formed URL,
+    /// and a shared supervisor (`supervisor_topology = "gateway"`) exports no
+    /// supervisor telemetry, so a separate endpoint is refused there rather than
+    /// accepted and left without exports.
+    pub fn validate_supervisor_telemetry(&self) -> Result<(), String> {
+        self.supervisor_telemetry.validate()?;
+        if matches!(self.supervisor_telemetry, SupervisorTelemetry::Endpoint(_))
+            && matches!(self.supervisor_topology, Some(SupervisorTopology::Gateway))
+        {
+            return Err("supervisor_telemetry endpoint needs dedicated supervisor Pods: supervisor_topology=gateway exports no supervisor telemetry, so set supervisor_telemetry to \"gateway\" or \"off\"".into());
+        }
+        Ok(())
     }
 
     /// Validate `fixed_pod_labels` and `fixed_pod_annotations`: exact keys
@@ -1372,6 +1386,39 @@ mod tests {
             ..KubernetesComputeConfig::default()
         };
         assert!(workspace.validate_supervisor_topology().is_err());
+    }
+
+    #[test]
+    fn separate_supervisor_telemetry_is_refused_with_shared_supervisors() {
+        let shared = KubernetesComputeConfig {
+            supervisor_topology: Some(SupervisorTopology::Gateway),
+            shared_supervisor: Some(SharedSupervisorConfig {
+                service_name: "openshell-supervisor".to_string(),
+                service_namespace: "openshell".to_string(),
+                runtime_port: 8443,
+                token_secret_name: "openshell-supervisor-token".to_string(),
+            }),
+            ..KubernetesComputeConfig::default()
+        };
+        let with = |telemetry: SupervisorTelemetry, base: &KubernetesComputeConfig| {
+            KubernetesComputeConfig {
+                supervisor_telemetry: telemetry,
+                ..base.clone()
+            }
+            .validate_supervisor_telemetry()
+        };
+        let endpoint = || SupervisorTelemetry::Endpoint("http://192.0.2.10:4317".to_string());
+        let refused = with(endpoint(), &shared).unwrap_err();
+        assert!(refused.contains("dedicated supervisor Pods"), "{refused}");
+        assert!(with(SupervisorTelemetry::Gateway, &shared).is_ok());
+        assert!(with(SupervisorTelemetry::Off, &shared).is_ok());
+        assert!(with(endpoint(), &KubernetesComputeConfig::default()).is_ok());
+        let full = KubernetesComputeConfig {
+            supervisor_telemetry: endpoint(),
+            ..shared
+        };
+        let refused = full.validate_configuration().unwrap_err();
+        assert!(refused.contains("dedicated supervisor Pods"), "{refused}");
     }
 
     #[test]

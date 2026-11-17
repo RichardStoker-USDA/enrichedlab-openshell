@@ -799,7 +799,7 @@ In-process compute drivers read their backend-specific settings from `[openshell
 
 ### OCSF Log Export
 
-Set `enabled = true` in `[openshell.gateway.otlp.ocsf]` to export gateway OCSF events as OTLP log records. It defaults to `false`, so trace export alone never sends OCSF events. Records go to the table's `endpoint`, or to `[openshell.gateway.otlp]` `endpoint` when it is omitted, with the same resource attributes as spans, under the `openshell.ocsf` instrumentation scope. Use a separate endpoint to send OCSF events to a collector that feeds a SIEM while spans go elsewhere. Sandbox supervisors receive the same endpoint and protocol and export their own OCSF events there directly, so the endpoint must also be reachable from sandboxes. Supervisor records carry the supervisor's resource attributes, including `openshell.sandbox.id` and `openshell.gateway.name`. Supervisors also send the collector [headers](#otlp-export) that the gateway uses for OCSF export, so a collector that requires authentication accepts their records too. With the Kubernetes driver's `supervisor_telemetry` set to `"off"`, supervisors receive no exports; set to a separate endpoint, they send every export the gateway has to that endpoint over OTLP/gRPC. Either way they never receive the gateway's collector headers or TLS material. The gateway delivers headers with each sandbox's launch credentials, never through the sandbox environment. Other `OTEL_*` variables do not reach supervisors.
+Set `enabled = true` in `[openshell.gateway.otlp.ocsf]` to export gateway OCSF events as OTLP log records. It defaults to `false`, so trace export alone never sends OCSF events. Records go to the table's `endpoint`, or to `[openshell.gateway.otlp]` `endpoint` when it is omitted, with the same resource attributes as spans, under the `openshell.ocsf` instrumentation scope. Use a separate endpoint to send OCSF events to a collector that feeds a SIEM while spans go elsewhere. Sandbox supervisors receive the same endpoint and protocol and export their own OCSF events there directly, so the endpoint must also be reachable from sandboxes. Supervisor records carry the supervisor's resource attributes, including `openshell.sandbox.id` and `openshell.gateway.name`. Supervisors also send the collector [headers](#otlp-export) that the gateway uses for OCSF export, so a collector that requires authentication accepts their records too. With the Kubernetes driver's `supervisor_telemetry` set to `"off"`, supervisors receive no exports; set to a separate endpoint, they send every export the gateway has to that endpoint over OTLP/gRPC. Either way they never receive the gateway's collector headers or TLS material. A separate endpoint needs dedicated supervisor Pods: a shared supervisor (`supervisor_topology = "gateway"`) exports no supervisor telemetry, so the driver refuses to start with that combination. The standalone Kubernetes driver takes the same choice as `--supervisor-telemetry` (`gateway`, `off`, or a collector URL) and applies it to the exports its own `--otlp*` flags set. The gateway hands a standalone driver its collector material and the driver decides which supervisors receive it, so with `gateway` its flags must name the gateway's own collector; with no `--otlp*` export, supervisors receive no collector material. The gateway delivers headers with each sandbox's launch credentials, never through the sandbox environment. Other `OTEL_*` variables do not reach supervisors.
 
 ```toml
 [openshell.gateway.otlp.ocsf]
@@ -1374,9 +1374,10 @@ workspace_default_storage_size = "10Gi"
 # (default) hands them the gateway's [openshell.gateway.otlp] export; "off"
 # hands them none; an endpoint sends the same signals to a separate OTLP/gRPC
 # collector, for clusters that keep sandbox telemetry apart from the
-# gateway's. The standalone driver takes --otlp-endpoint and
-# --otlp-ocsf-endpoint instead.
-# supervisor_telemetry         = { endpoint = "http://10.43.0.50:4317" }
+# gateway's. An endpoint needs dedicated supervisor Pods and is refused with
+# supervisor_topology = "gateway". The standalone driver takes
+# --supervisor-telemetry gateway|off|URL with its own --otlp* flags.
+# supervisor_telemetry         = { endpoint = "http://192.0.2.10:4317" }
 # Kubelet clamps projected tokens below 600 seconds. The driver caps values at 86400.
 sa_token_ttl_secs              = 3600
 # Optional SPIFFE Workload API socket mounted into sandbox pods for dynamic

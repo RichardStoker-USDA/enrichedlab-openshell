@@ -1220,6 +1220,9 @@ impl KubernetesComputeDriver {
         config
             .validate_fixed_pod_metadata()
             .map_err(KubernetesDriverError::Precondition)?;
+        config
+            .validate_supervisor_telemetry()
+            .map_err(KubernetesDriverError::Precondition)?;
         // Read the bundle once at startup so an unreadable path or a
         // certificate-free file fails the gateway here, rather than as a
         // repeated sandbox-create failure. The authoritative read still
