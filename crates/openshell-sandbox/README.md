@@ -10,6 +10,13 @@ the lower-level mechanisms used by that orchestration and the boundary server.
 Unsafe kernel ABI, process-launch, and descriptor-ownership operations stay in
 this runtime crate behind safe APIs where their contracts can be enforced.
 
+Landlock policy anchors are resolved relative to open directory descriptors.
+Symlinks are followed only through ancestors that the workload neither owns nor
+can write, preserving system aliases while rejecting mutable workspace links.
+The rule uses the resolved descriptor directly. Unsafe resolution and an empty
+effective allowlist fail the launch independently of Landlock compatibility;
+they cannot trigger the best-effort fallback to baseline-only restrictions.
+
 The network broker retains source socket descriptors only while preparing a
 workload endpoint. A successful connection or `listen` releases that reference;
 the kernel then tracks the lifetime through workload-owned descriptors. Native
@@ -47,6 +54,19 @@ member's address grants nothing: a later term at a fenced owner's address
 authenticates with its own grant. A retired connection that does not shut down
 gracefully within two seconds, such as an unused spare, has its transport
 dropped.
+
+When `AgentSpec::otlp_relay_active` is set, `child_env::apply_otlp_relay_env`
+gives every workload process (main, exec, and SSH) `OTEL_EXPORTER_OTLP_ENDPOINT`
+pointing at the relay address, `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`, and
+`none` for `OTEL_EXPORTER_OTLP_COMPRESSION` and
+`OTEL_EXPORTER_OTLP_TRACES_COMPRESSION`, and removes any inherited
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`. These defaults apply after the provider
+variables. If the creation request or a per-exec environment names a generic
+or traces-specific OTLP endpoint, the runtime injects nothing, and the
+workload exports to that endpoint under the sandbox's network policy. An
+endpoint in the image `ENV` does the same for the main process; exec children
+start from a cleared environment (`ChildEnvironment::Cleared`), never see the
+image's endpoint, and still get the relay default.
 
 ## Supervisor takeover
 

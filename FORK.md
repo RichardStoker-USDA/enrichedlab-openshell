@@ -32,8 +32,8 @@ the fork are tags `vX.Y.Z-el.N` on `enrichedlab/main`, where `vX.Y.Z` is the ups
 
 ```shell
 scripts/enrichedlab/sync-upstream.sh                 # fetch, fast-forward main, rebuild enrichedlab/next, report
-scripts/enrichedlab/sync-upstream.sh --merge v0.1.6  # also prepare enrichedlab/merge-v0.1.6
-scripts/enrichedlab/sync-upstream.sh --merge v0.1.6 --push origin
+scripts/enrichedlab/sync-upstream.sh --merge v0.1.8  # also prepare enrichedlab/merge-v0.1.8
+scripts/enrichedlab/sync-upstream.sh --merge v0.1.8 --push origin
 ```
 
 The script refuses to run on a dirty tree, never moves `enrichedlab/main`, and enables `git rerere` for this
@@ -42,7 +42,7 @@ branch passes CI:
 
 ```shell
 git switch enrichedlab/main
-git merge --ff-only enrichedlab/merge-v0.1.6
+git merge --ff-only enrichedlab/merge-v0.1.8
 git push origin enrichedlab/main
 ```
 
@@ -50,32 +50,42 @@ rerere replays conflicting hunks only. A fork change that has to move to new ups
 conflict is listed here and checked by hand on every merge:
 
 - Since v0.1.6 upstream creates every dedicated supervisor Pod in `create_sandbox_runtime_supervisor`; the fixed
-  labels and annotations are applied there (`apply_fixed_pod_metadata`). A shared supervisor (`supervisor_topology =
+  labels and annotations are applied there (`apply_fixed_pod_metadata`), after v0.1.8's app listener and supervisor
+  RuntimeClass settings. A shared supervisor (`supervisor_topology =
   "gateway"`) is deployed by Helm, not per sandbox, so the fixed metadata does not reach it.
 - The restart patch is built by `restart_running_patch`, which carries upstream's bootstrap annotations (including
   the control connection and supervisor topology keys added in v0.1.6) and then the operator's fixed metadata.
+- Since v0.1.8 upstream gives supervisors one export per signal (`SupervisorOtlp`: traces, OCSF and relayed agent
+  traces), each with its own endpoint, protocol, headers and TLS material (CA and client certificate and key). The
+  fork's `supervisor_telemetry` maps the gateway's exports through `SupervisorTelemetry::resolve`: `gateway` keeps
+  them, `"off"` drops them, and a separate endpoint replaces every export's endpoint with OTLP/gRPC.
+- "Collector material" is every field in `COLLECTOR_MATERIAL_FIELDS` (`openshell-supervisor-control`): the three
+  header sets and the four TLS fields. A new per-signal header or TLS field upstream adds to the auth bundle goes into
+  that list, or it reaches supervisors that export elsewhere.
 - Upstream writes the supervisor's auth bundle into its bootstrap Secret in `install_sandbox_runtime_generation`; the
-  fork writes it through `supervisor_auth_json`, so a supervisor whose telemetry goes elsewhere never receives the
-  gateway's collector headers.
+  fork writes it through `supervisor_auth_json`, which calls `withhold_collector_material`, so a supervisor whose
+  telemetry goes elsewhere never receives the gateway's collector material.
 - A shared supervisor gets its credentials from the gateway's launch bundle at registration, not from that Secret. The
-  gateway therefore withholds the collector headers itself: the compute driver factory reports whether supervisors use
-  the gateway's collector (`supervisors_use_gateway_collector`), and when they do not, no launch or registration bundle
-  carries the headers (`withhold_supervisor_ocsf_headers`).
-- Stored launch material never carries headers the gateway withholds: when supervisors export elsewhere, the
-  supervisor pool removes them as it records, places or loads material (`launch_material_without_collector_headers`),
-  and the Kubernetes driver removes them from a recovered shared generation's Secret. Material without headers is
-  kept byte for byte, so a launch and its replay keep one admission fingerprint. While supervisors use the gateway's
-  collector, stored material keeps the headers it was launched with until the next launch.
+  gateway therefore withholds the material itself: the compute driver factory reports whether supervisors use the
+  gateway's collector (`supervisors_use_gateway_collector`), and when they do not, `withhold_supervisor_collector_material`
+  fills upstream's header and TLS slots with empty values before `configure_supervisor_otlp_headers` and
+  `configure_supervisor_otlp_tls` run, so those calls leave them empty. Check on every merge that the compute runtime
+  is still built before those two calls; `withheld_collector_material_never_reaches_launch_bundles` fails if it is not.
+- Stored launch material never carries material the gateway withholds: when supervisors export elsewhere, the
+  supervisor pool removes it as it records, places or loads material (`launch_material_without_collector_headers`),
+  and the Kubernetes driver removes it from a recovered shared generation's Secret. Material without collector fields
+  is kept byte for byte, so a launch and its replay keep one admission fingerprint. While supervisors use the
+  gateway's collector, stored material keeps what it was launched with until the next launch.
 - Driver start validates both upstream's supervisor topology and the fork's fixed metadata.
 
 ## Carried upstream pull requests
 
-None on the v0.1.6 line. [NVIDIA/OpenShell#3508](https://github.com/NVIDIA/OpenShell/pull/3508) (template-driven warm
+None on the v0.1.8 line. [NVIDIA/OpenShell#3508](https://github.com/NVIDIA/OpenShell/pull/3508) (template-driven warm
 pooling for the Kubernetes driver) was carried on v0.1.5 with three adaptations. v0.1.6 changed the supervisor's
 gateway credentials to per-instance credentials for shared supervisors, and the pull request's registration path
 depends on the earlier process-wide token, so carrying it is a port of its design, not a merge; its author is
-rebasing it upstream. Until a version that applies to the current release exists, the v0.1.6 line has no warm pools:
-v0.1.6's shared supervisor (`supervisor_topology = "gateway"`) is the measured alternative for start latency, and a
+rebasing it upstream. Until a version that applies to the current release exists, the v0.1.6 and later lines have no warm
+pools: the shared supervisor (`supervisor_topology = "gateway"`) is the measured alternative for start latency, and a
 site that needs warm pools keeps the v0.1.5 line. The run receipt interceptor still matches a warm pair's Pods through
 the pair id the Sandbox object names (`openshell.ai/warm-pair-id`); without warm pools that path is unused.
 

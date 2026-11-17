@@ -111,7 +111,7 @@ supervisor:
   # -- Seconds a sandbox workload stays frozen after losing its pool member's
   # supervision before the sandbox runtime terminates it, rendered as
   # [openshell.gateway.supervisor_pool] recovery_timeout_secs. Must be an
-  # integer from 10 to 300. Null leaves the gateway's pool default of 60
+  # integer from 30 to 300. Null leaves the gateway's pool default of 60
   # seconds.
   recoveryTimeoutSeconds: 60
   # Pod security context for the shared supervisor Deployment, rendered only
@@ -134,6 +134,9 @@ supervisor:
   # gatewayConfig selects supervisor_topology = "gateway". Top-level affinity
   # applies only to the gateway pod.
   affinity: {}
+  network:
+    # -- Name of an operator-owned ConfigMap with a `ca.crt` key containing additional destination CA certificates for sandbox supervisors. Empty disables additional destination trust.
+    additionalCaConfigMapName: ""
   sandboxRuntime:
     # -- Workload boundary TLS listener port.
     boundaryPort: 5500
@@ -268,6 +271,21 @@ service:
   # -- Gateway metrics service port.
   metricsPort: 9090
 
+# Optional TLS and mTLS configuration for the dedicated metrics listener.
+# Plaintext metrics remain the default for compatibility with existing
+# Prometheus deployments. Secrets are supplied by the operator; the chart does
+# not generate metrics-specific PKI in this initial integration.
+metrics:
+  tls:
+    # -- Enable TLS for the dedicated metrics listener.
+    enabled: false
+    # -- Kubernetes TLS Secret with tls.crt and tls.key. Empty reuses server.tls.certSecretName.
+    certSecretName: ""
+    # -- Secret with ca.crt for verifying metrics scraper client certificates. It must not contain the gateway client CA. The chart rejects reusing the gateway client CA and client TLS Secret names; the check is by name only and cannot detect a different Secret holding the same CA. Required when requireClientCert is true.
+    clientCaSecretName: ""
+    # -- Require a client certificate signed by clientCaSecretName to scrape metrics.
+    requireClientCert: false
+
 # Agent Sandbox is a cluster-scoped prerequisite for the Kubernetes compute
 # driver. OpenShell deliberately does not install its CRDs or controller.
 # Enable this check for live Helm installs to fail before creating gateway
@@ -371,6 +389,15 @@ tolerations: []
 # -- Affinity rules for the gateway pod.
 affinity: {}
 
+# -- PriorityClass for the gateway pod. The gateway is a control-plane
+# component; when it shares nodes with the workloads it serves, the default
+# priority gives it no advantage under node pressure. Empty = omit the field.
+priorityClassName: ""
+
+# -- Topology spread constraints for the gateway pod, used to spread replicas
+# across zones or nodes. Empty = omit the field.
+topologySpreadConstraints: []
+
 # -- Non-secret gateway application configuration. Top-level keys name TOML
 # tables and are rendered into the mounted gateway.toml file. Kubernetes
 # resource inputs remain outside this map; template expressions derive the
@@ -387,9 +414,11 @@ server:
   name: ""
   # -- Gateway log level.
   logLevel: info
-  # OpenTelemetry trace export over OTLP/gRPC. Leave endpoint empty to disable.
+  # OpenTelemetry trace export over OTLP. Leave endpoint empty to disable.
   otlp:
-    # -- OTLP/gRPC collector endpoint, conventionally using port 4317.
+    # -- OTLP/gRPC collector endpoint, conventionally port 4317. For an
+    # `http/protobuf` collector, also set protocol under
+    # gatewayConfig."openshell.gateway.otlp".
     endpoint: ""
     # -- Gateway OpenTelemetry service name. Empty uses openshell-gateway.
     serviceName: ""
@@ -403,8 +432,8 @@ server:
     # When replicas share the volume, set subPathExpr: $(OPENSHELL_POD_NAME)
     # on the mount so each replica writes its own file.
     path: /tmp/gateway-ocsf.jsonl
-    # -- Optional OCSF downgrade target. Empty emits native OCSF 1.8.0.
-    # Supported values: "1.1", "1.3".
+    # -- Deprecated and ignored: the gateway emits native OCSF 1.8.0 and logs
+    # a warning at startup when this is set.
     schemaVersion: ""
     # -- Rotate the active file daily in UTC, or never.
     rotation: daily
@@ -519,6 +548,13 @@ server:
   # -- Enable plaintext HTTP routing for loopback sandbox service URLs on
   # TLS-enabled gateways.
   enableLoopbackServiceHttp: true
+  # -- Hostname format for exposed sandbox services. Empty or "readable"
+  # keeps readable `<workspace>--<sandbox>[--<service>]` hostnames; "hashed"
+  # mints opaque one-label hostnames discriminated by the gateway
+  # installation name (server.name, defaulting to the release name). The
+  # name must be unique among all gateways sharing the service base domain,
+  # and renaming the installation changes every minted hostname.
+  serviceHostnameFormat: ""
   # -- Enable the WebSocket tunnel used by CLI/SDK clients behind an
   # authenticated edge proxy. Leave disabled for direct gateway installs.
   enableWebsocketTunnel: false

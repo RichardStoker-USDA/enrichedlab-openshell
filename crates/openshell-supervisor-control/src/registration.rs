@@ -230,23 +230,55 @@ impl SandboxInstanceRegistration {
     }
 }
 
-/// Launch material without the supervisor's collector headers, for a gateway that withholds them, so that material
-/// persisted under an earlier telemetry setting never carries them to a supervisor that now exports elsewhere.
-/// Material without headers is returned byte for byte, so a launch and its later replay keep one fingerprint; only an
-/// `auth` object's headers are removed, and material that is not a JSON object with one passes unchanged, since the
-/// supervisor host refuses it when it validates the assignment. Decoder errors are not reported, because they can
-/// quote field values, including credentials.
+/// The supervisor bundle fields that carry the gateway's collector material: each export's headers and the TLS
+/// material, client keys included, with its per-export positions.
+pub const COLLECTOR_MATERIAL_FIELDS: [&str; 7] = [
+    "traces_otlp_headers",
+    "ocsf_otlp_headers",
+    "agent_otlp_headers",
+    "otlp_tls",
+    "traces_otlp_tls",
+    "ocsf_otlp_tls",
+    "agent_otlp_tls",
+];
+
+/// Remove the gateway's collector material ([`COLLECTOR_MATERIAL_FIELDS`]) from a supervisor bundle, for a gateway
+/// whose supervisors export elsewhere or nowhere.
+pub fn withhold_collector_material(bundle: &mut openshell_core::jwt::SupervisorAuthBundle) {
+    bundle.traces_otlp_headers = None;
+    bundle.ocsf_otlp_headers = None;
+    bundle.agent_otlp_headers = None;
+    bundle.otlp_tls.clear();
+    bundle.traces_otlp_tls = None;
+    bundle.ocsf_otlp_tls = None;
+    bundle.agent_otlp_tls = None;
+}
+
+/// Launch material without the supervisor's collector material (headers and TLS).
+///
+/// A gateway that withholds that material uses this so material persisted under an earlier telemetry setting never
+/// carries it to a supervisor that now exports elsewhere. Material without any of it is returned byte for byte, so a
+/// launch and its later replay keep one fingerprint; only an `auth` object's collector fields
+/// ([`COLLECTOR_MATERIAL_FIELDS`]) are removed, and material that is not a JSON object with one passes unchanged,
+/// since the supervisor host refuses it when it validates the assignment. Decoder errors are not reported, because
+/// they can quote field values, including credentials.
 pub fn launch_material_without_collector_headers(
     material: Vec<u8>,
 ) -> Result<Vec<u8>, RegistrationError> {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&material) else {
         return Ok(material);
     };
-    let removed = value
+    let Some(auth) = value
         .get_mut("auth")
         .and_then(serde_json::Value::as_object_mut)
-        .and_then(|auth| auth.remove("ocsf_otlp_headers"));
-    if removed.is_none() {
+    else {
+        return Ok(material);
+    };
+    let removed = COLLECTOR_MATERIAL_FIELDS
+        .iter()
+        .filter(|field| auth.remove(**field).is_some())
+        .count();
+    if removed == 0 {
         return Ok(material);
     }
     serde_json::to_vec(&value)
@@ -265,6 +297,17 @@ mod tests {
         assert!(value["auth"].get("ocsf_otlp_headers").is_none());
         assert_eq!(value["auth"]["auth_epoch"], 1);
         assert_eq!(value["route"], "rt-0123456789abcdef");
+        // Every export's headers and the TLS material, client keys included, go too.
+        let mut auth = serde_json::json!({"auth_epoch": 1});
+        for field in COLLECTOR_MATERIAL_FIELDS {
+            auth[field] = serde_json::json!("old");
+        }
+        let all = serde_json::to_vec(&serde_json::json!({"route": "rt", "auth": auth})).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&launch_material_without_collector_headers(all).unwrap())
+                .unwrap();
+        assert_eq!(value["auth"], serde_json::json!({"auth_epoch": 1}));
+        assert_eq!(value["route"], "rt");
         // Nothing to remove: the bytes stay as launched, key order included.
         for other in [
             &br#"{"route":"rt","auth":{"auth_epoch":1}}"#[..],

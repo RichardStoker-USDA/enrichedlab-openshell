@@ -118,6 +118,7 @@ impl FromStr for KubernetesControlConnection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesSandboxRuntimeConfig {
+    pub app_listener: KubernetesAppListenerConfig,
     /// TCP port of the Sandbox Protocol listener: the workload boundary for
     /// supervisor-initiated sandboxes, the supervisor for runtime-initiated ones.
     pub boundary_port: u16,
@@ -127,12 +128,32 @@ impl Default for KubernetesSandboxRuntimeConfig {
     fn default() -> Self {
         Self {
             boundary_port: 5500,
+            app_listener: KubernetesAppListenerConfig::default(),
         }
     }
 }
 
+/// Driver-owned TLS deployment inputs. Common listener settings
+/// are injected by the gateway so there is only one port/domain source.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesAppListenerConfig {
+    pub tls_secret_name: String,
+    #[serde(skip)]
+    pub common: openshell_core::app_listener::AppListenerConfig,
+}
+
 impl KubernetesSandboxRuntimeConfig {
     pub fn validate(&self) -> Result<(), String> {
+        self.app_listener.common.validate()?;
+        if self.app_listener.common.enabled {
+            if !is_dns_subdomain(&self.app_listener.tls_secret_name) {
+                return Err("sandbox_runtime.app_listener.tls_secret_name is required when the app listener is enabled".into());
+            }
+            if [self.boundary_port, 5501].contains(&self.app_listener.common.port) {
+                return Err("supervisor.app_listener.port conflicts with a supervisor runtime or health port".into());
+            }
+        }
         if self.boundary_port < 1024 {
             return Err("sandbox_runtime.boundary_port must be at least 1024".to_string());
         }
@@ -310,27 +331,30 @@ impl SupervisorTelemetry {
         matches!(self, Self::Gateway)
     }
 
-    /// The trace endpoint and OCSF export supervisors receive, given what the
-    /// gateway itself exports. A separate endpoint carries the same signals the
-    /// gateway exports, with the gateway's OCSF schema version.
+    /// The exports supervisors receive, given what the gateway itself exports.
+    /// A separate endpoint carries the same exports the gateway has, over
+    /// OTLP/gRPC.
     pub fn resolve(
         &self,
-        gateway_traces: Option<String>,
-        gateway_ocsf: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
-    ) -> (
-        Option<String>,
-        Option<openshell_core::sandbox_env::OcsfOtlpExport>,
-    ) {
+        gateway: openshell_core::sandbox_env::SupervisorOtlp,
+    ) -> openshell_core::sandbox_env::SupervisorOtlp {
+        use openshell_core::sandbox_env::{OtlpExport, OtlpProtocol, SupervisorOtlp};
         match self {
-            Self::Gateway => (gateway_traces, gateway_ocsf),
-            Self::Off => (None, None),
-            Self::Endpoint(endpoint) => (
-                gateway_traces.map(|_| endpoint.clone()),
-                gateway_ocsf.map(|ocsf| openshell_core::sandbox_env::OcsfOtlpExport {
-                    endpoint: endpoint.clone(),
-                    schema_version: ocsf.schema_version,
-                }),
-            ),
+            Self::Gateway => gateway,
+            Self::Off => SupervisorOtlp::default(),
+            Self::Endpoint(endpoint) => {
+                let separate = |export: Option<OtlpExport>| {
+                    export.map(|_| OtlpExport {
+                        endpoint: endpoint.clone(),
+                        protocol: OtlpProtocol::Grpc,
+                    })
+                };
+                SupervisorOtlp {
+                    traces: separate(gateway.traces),
+                    ocsf: separate(gateway.ocsf),
+                    agent: separate(gateway.agent),
+                }
+            }
         }
     }
 }
@@ -437,15 +461,11 @@ pub struct KubernetesComputeConfig {
     /// Where supervisors send their traces and OCSF events: the gateway's
     /// own collector (default), nowhere, or a separate collector.
     pub supervisor_telemetry: SupervisorTelemetry,
-    /// OTLP/gRPC collector endpoint passed to supervisor pods, resolved from
-    /// `supervisor_telemetry` and the gateway's export; driver TOML cannot
-    /// set it.
+    /// OTLP exports passed to supervisor pods, resolved from
+    /// `supervisor_telemetry` and the gateway's `[otlp]`; driver TOML cannot
+    /// set them.
     #[serde(skip)]
-    pub supervisor_otlp_endpoint: Option<String>,
-    /// OCSF event export passed to supervisors. The gateway supplies its own
-    /// export; driver TOML cannot set it.
-    #[serde(skip)]
-    pub supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
+    pub supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp,
 
     /// Gateway name passed to supervisors for their telemetry. The gateway
     /// supplies its own name; driver TOML cannot set it.
@@ -466,6 +486,10 @@ pub struct KubernetesComputeConfig {
     /// Applied when a `CreateSandbox` request does not specify one.
     /// Empty string (default) = omit the field, using the cluster default.
     pub default_runtime_class_name: String,
+    /// Kubernetes `runtimeClassName` for dedicated supervisor pods. Set only
+    /// by the gateway administrator; sandbox creators cannot change it, and
+    /// it never inherits the workload class. Empty (default) = omit the field.
+    pub supervisor_runtime_class_name: String,
     /// Pod annotation keys that sandbox templates may set. Each entry is an
     /// exact key (`example.com/team`) or a prefix wildcard (`example.com/*`).
     /// Empty (default) rejects every caller-supplied pod annotation.
@@ -586,8 +610,7 @@ impl Default for KubernetesComputeConfig {
             proxy_ca_bundle: None,
             grpc_endpoint: String::new(),
             supervisor_telemetry: SupervisorTelemetry::default(),
-            supervisor_otlp_endpoint: None,
-            supervisor_ocsf_export: None,
+            supervisor_otlp: openshell_core::sandbox_env::SupervisorOtlp::default(),
             supervisor_gateway_name: None,
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             client_tls_secret_name: String::new(),
@@ -596,6 +619,7 @@ impl Default for KubernetesComputeConfig {
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
             workspace_storage_class: String::new(),
             default_runtime_class_name: String::new(),
+            supervisor_runtime_class_name: String::new(),
             allowed_pod_annotations: Vec::new(),
             allowed_pod_labels: Vec::new(),
             fixed_pod_labels: BTreeMap::new(),
@@ -687,6 +711,11 @@ impl KubernetesComputeConfig {
                     "supervisor_topology=gateway requires shared_supervisor".to_string()
                 })?;
                 shared.validate()?;
+                if self.sandbox_runtime.app_listener.common.enabled
+                    && self.sandbox_runtime.app_listener.common.port == shared.runtime_port
+                {
+                    return Err("supervisor.app_listener.port conflicts with shared_supervisor.runtime_port".into());
+                }
                 if self.provider_spiffe_enabled() {
                     return Err("supervisor_topology=gateway does not support provider_spiffe_workload_api_socket_path; a shared supervisor has no per-sandbox workload identity".into());
                 }
@@ -1264,6 +1293,25 @@ mod tests {
     use std::collections::BTreeMap as HashMap;
 
     #[test]
+    fn app_endpoint_configuration_has_one_port_source_and_explicit_enablement() {
+        let mut config = KubernetesSandboxRuntimeConfig::default();
+        config.app_listener.tls_secret_name = "app-tls".into();
+        assert!(!config.app_listener.common.enabled);
+        assert!(config.validate().is_ok());
+        config.app_listener.common = openshell_core::app_listener::AppListenerConfig {
+            enabled: true,
+            port: 9443,
+            domain: "services.example.com".into(),
+        };
+        assert!(config.validate().is_ok());
+        config.app_listener.common.port = config.boundary_port;
+        assert!(config.validate().is_err());
+        config.app_listener.common.port = 9443;
+        config.app_listener.tls_secret_name.clear();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn gateway_supervisor_topology_requires_its_connection_and_refuses_unsupported_inputs() {
         let shared = || SharedSupervisorConfig {
             service_name: "openshell-supervisor".to_string(),
@@ -1328,7 +1376,7 @@ mod tests {
 
     #[test]
     fn supervisor_telemetry_parses_and_resolves() {
-        use openshell_core::sandbox_env::OcsfOtlpExport;
+        use openshell_core::sandbox_env::{OtlpExport, OtlpProtocol, SupervisorOtlp};
         let parse = |toml_text: &str| {
             toml::from_str::<KubernetesComputeConfig>(toml_text).map(|c| c.supervisor_telemetry)
         };
@@ -1379,41 +1427,49 @@ mod tests {
         config.supervisor_telemetry = SupervisorTelemetry::Off;
         assert!(config.validate_configuration().is_ok());
 
-        let traces = Some("http://gateway-collector:4317".to_string());
-        let ocsf = Some(OcsfOtlpExport {
-            endpoint: "http://gateway-collector:4317".to_string(),
-            schema_version: Some("1.3".to_string()),
-        });
+        let export = |endpoint: &str, protocol| {
+            Some(OtlpExport {
+                endpoint: endpoint.to_string(),
+                protocol,
+            })
+        };
+        let gateway = SupervisorOtlp {
+            traces: export("http://gateway-collector:4317", OtlpProtocol::Grpc),
+            ocsf: export("http://gateway-collector:4318", OtlpProtocol::HttpProtobuf),
+            agent: export("http://gateway-collector:4318", OtlpProtocol::HttpProtobuf),
+        };
         assert_eq!(
-            SupervisorTelemetry::Gateway.resolve(traces.clone(), ocsf.clone()),
-            (traces.clone(), ocsf.clone())
+            SupervisorTelemetry::Gateway.resolve(gateway.clone()),
+            gateway
         );
         assert_eq!(
-            SupervisorTelemetry::Off.resolve(traces.clone(), ocsf.clone()),
-            (None, None)
+            SupervisorTelemetry::Off.resolve(gateway.clone()),
+            SupervisorOtlp::default()
         );
-        let (t, o) = separate.resolve(traces, ocsf);
-        assert_eq!(t.as_deref(), Some("http://192.0.2.10:4317"));
-        let o = o.unwrap();
-        assert_eq!(o.endpoint, "http://192.0.2.10:4317");
-        assert_eq!(o.schema_version.as_deref(), Some("1.3"));
+        let to_separate = export("http://192.0.2.10:4317", OtlpProtocol::Grpc);
         assert_eq!(
-            separate.resolve(None, None),
-            (None, None),
-            "a separate endpoint adds no signal the gateway lacks"
+            separate.resolve(gateway),
+            SupervisorOtlp {
+                traces: to_separate.clone(),
+                ocsf: to_separate.clone(),
+                agent: to_separate.clone(),
+            }
         );
-        let only_ocsf = separate.resolve(
-            None,
-            Some(OcsfOtlpExport {
-                endpoint: "http://g:4317".into(),
-                schema_version: None,
-            }),
-        );
-        assert_eq!(only_ocsf.0, None);
-        assert_eq!(only_ocsf.1.unwrap().endpoint, "http://192.0.2.10:4317");
         assert_eq!(
-            separate.resolve(Some("http://g:4317".into()), None),
-            (Some("http://192.0.2.10:4317".to_string()), None)
+            separate.resolve(SupervisorOtlp::default()),
+            SupervisorOtlp::default(),
+            "a separate endpoint adds no export the gateway lacks"
+        );
+        let only_ocsf = SupervisorOtlp {
+            ocsf: export("http://g:4318", OtlpProtocol::HttpProtobuf),
+            ..SupervisorOtlp::default()
+        };
+        assert_eq!(
+            separate.resolve(only_ocsf),
+            SupervisorOtlp {
+                ocsf: to_separate,
+                ..SupervisorOtlp::default()
+            }
         );
         for good in [
             "http://192.0.2.10:4317",
@@ -1736,6 +1792,17 @@ mod tests {
     #[test]
     fn default_runtime_class_name_is_empty() {
         let cfg = KubernetesComputeConfig::default();
+        assert!(cfg.default_runtime_class_name.is_empty());
+        assert!(cfg.supervisor_runtime_class_name.is_empty());
+    }
+
+    #[test]
+    fn serde_override_supervisor_runtime_class_name() {
+        let json = serde_json::json!({
+            "supervisor_runtime_class_name": "kata-supervisor"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.supervisor_runtime_class_name, "kata-supervisor");
         assert!(cfg.default_runtime_class_name.is_empty());
     }
 
