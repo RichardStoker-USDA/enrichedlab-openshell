@@ -297,9 +297,18 @@ fn children_from_process_table(parent: u32) -> io::Result<HashSet<i32>> {
 /// parentheses and may hold spaces, parentheses and non-UTF-8 bytes, so the
 /// fields are read after its last `)`: state, then parent PID.
 fn stat_parent(stat: &[u8]) -> Option<u32> {
+    proc_stat_fields(stat)?.nth(1)?.parse().ok()
+}
+
+/// The kernel emits ASCII fields after the command's closing parenthesis.
+/// The command itself is an arbitrary sequence of bytes.
+pub(crate) fn proc_stat_fields(stat: &[u8]) -> Option<std::str::SplitAsciiWhitespace<'_>> {
     let end = stat.iter().rposition(|byte| *byte == b')')?;
-    let fields = std::str::from_utf8(&stat[end + 1..]).ok()?;
-    fields.split_ascii_whitespace().nth(1)?.parse().ok()
+    Some(
+        std::str::from_utf8(&stat[end + 1..])
+            .ok()?
+            .split_ascii_whitespace(),
+    )
 }
 
 #[cfg(test)]

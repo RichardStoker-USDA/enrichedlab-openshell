@@ -662,31 +662,32 @@ struct ProcStat {
 
 #[cfg(target_os = "linux")]
 fn read_proc_stat(pid: u32) -> std::io::Result<ProcStat> {
+    parse_proc_stat(&std::fs::read(format!("/proc/{pid}/stat"))?)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_stat(stat: &[u8]) -> std::io::Result<ProcStat> {
     let malformed = || {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "malformed /proc/<pid>/stat",
         )
     };
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    // The command name may contain spaces or parentheses; fields resume after
-    // the final ") ". Field 3 is the state, 4 the parent, 22 the start time.
-    let fields = stat
-        .rsplit_once(") ")
-        .ok_or_else(malformed)?
-        .1
-        .split_whitespace()
-        .collect::<Vec<_>>();
+    // Fields 3, 4 and 22 are process state, parent PID and start time.
+    let mut fields = crate::managed_children::proc_stat_fields(stat).ok_or_else(malformed)?;
+    let state = fields.next().ok_or_else(malformed)?;
+    let parent = fields
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(malformed)?;
+    let start_time = fields
+        .nth(17)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(malformed)?;
     Ok(ProcStat {
-        parent: fields
-            .get(1)
-            .and_then(|field| field.parse().ok())
-            .ok_or_else(malformed)?,
-        start_time: fields
-            .get(19)
-            .and_then(|field| field.parse().ok())
-            .ok_or_else(malformed)?,
-        live: !matches!(*fields.first().ok_or_else(malformed)?, "Z" | "X" | "x"),
+        parent,
+        start_time,
+        live: !matches!(state, "Z" | "X" | "x"),
     })
 }
 
@@ -949,6 +950,20 @@ impl BoundaryLoopbackConnector for LocalLoopbackConnector {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_inventory_reads_kernel_fields_after_binary_names() {
+        let mut stat = b"21 (sample)".to_vec();
+        stat.extend([0xff, b')']);
+        stat.extend_from_slice(b" S 7 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1024");
+        let parsed = super::parse_proc_stat(&stat).unwrap();
+        assert_eq!(
+            (parsed.parent, parsed.start_time, parsed.live),
+            (7, 1024, true)
+        );
+        assert!(super::parse_proc_stat(b"21 (short) S 7").is_err());
+    }
+
     #[cfg(target_os = "linux")]
     use super::test_proc_stat::{ProcessGroupKillGuard, process_group_of, process_stopped};
     use super::*;
