@@ -837,6 +837,9 @@ const SERVICE_ACCOUNT_TOKEN_VOLUME_NAME: &str = "openshell-sa-token";
 const SERVICE_ACCOUNT_TOKEN_MOUNT_PATH: &str = "/var/run/secrets/openshell";
 const PINNED_ACCOUNTS_VOLUME: &str = "openshell-pinned-accounts";
 const PINNED_ACCOUNTS_INIT: &str = "pinned-accounts";
+const PINNED_ACCOUNT_TOOL: &str = "pinned-account-tool";
+const PINNED_ACCOUNT_TOOL_DIR: &str = "/.openshell/account-tool";
+const PINNED_ACCOUNT_TOOL_PATH: &str = "/.openshell/account-tool/openshell-sandbox";
 const PINNED_ACCOUNT_FILES: [&str; 2] = ["/etc/passwd", "/etc/group"];
 
 const KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES: &[&str] = &[
@@ -850,6 +853,7 @@ const KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES: &[&str] = &[
     SANDBOX_POD_IDENTITY_VOLUME_NAME,
     SANDBOX_PROXY_CA_VOLUME_NAME,
     PINNED_ACCOUNTS_VOLUME,
+    PINNED_ACCOUNT_TOOL,
     WORKSPACE_VOLUME_NAME,
 ];
 
@@ -984,7 +988,10 @@ fn validate_kubernetes_protected_mount_target(
 }
 
 /// Recheck caller PVC destinations in saved Pod templates before restart or release.
-fn validate_stored_kubernetes_pvc_mounts(spec: &serde_json::Value) -> Result<(), String> {
+fn validate_stored_kubernetes_pvc_mounts(
+    spec: &serde_json::Value,
+    pin_accounts: bool,
+) -> Result<(), String> {
     let caller_volumes: HashSet<_> = spec["volumes"]
         .as_array()
         .into_iter()
@@ -1013,6 +1020,9 @@ fn validate_stored_kubernetes_pvc_mounts(spec: &serde_json::Value) -> Result<(),
                 target,
                 KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS,
             )?;
+            if pin_accounts {
+                validate_kubernetes_protected_mount_target(target, &PINNED_ACCOUNT_FILES)?;
+            }
         }
     }
     Ok(())
@@ -2184,8 +2194,11 @@ impl KubernetesComputeDriver {
     }
 
     async fn admit_stored_resources(&self, object: &DynamicObject) -> Result<(), tonic::Status> {
-        validate_stored_kubernetes_pvc_mounts(&object.data["spec"]["podTemplate"]["spec"])
-            .map_err(tonic::Status::failed_precondition)?;
+        validate_stored_kubernetes_pvc_mounts(
+            &object.data["spec"]["podTemplate"]["spec"],
+            self.config.sandbox_uid.is_some() || self.config.sandbox_gid.is_some(),
+        )
+        .map_err(tonic::Status::failed_precondition)?;
         if self.config.allow_driver_config && !self.config.resource_admission.enabled {
             return Ok(());
         }
@@ -3296,14 +3309,21 @@ impl KubernetesComputeDriver {
             .ok_or_else(|| fail("trusted bootstrap init container missing"))?;
         check_container(bootstrap, "bootstrap init container")?;
         if pin_accounts {
-            let initializer = spec
-                .init_containers
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .find(|container| container.name == PINNED_ACCOUNTS_INIT)
-                .ok_or_else(|| fail("pinned account initializer missing"))?;
-            check_container(initializer, PINNED_ACCOUNTS_INIT)?;
+            for name in [PINNED_ACCOUNT_TOOL, PINNED_ACCOUNTS_INIT] {
+                let initializer = spec
+                    .init_containers
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .find(|container| container.name == name)
+                    .ok_or_else(|| fail("pinned account initializer missing"))?;
+                check_container(initializer, name)?;
+                if name == PINNED_ACCOUNT_TOOL && initializer.image != bootstrap.image {
+                    return Err(fail(
+                        "account helper must come from the trusted runtime image",
+                    ));
+                }
+            }
             validate_admitted_accounts(&pod_json["spec"]).map_err(fail)?;
         }
         let mounts_volume = |container: &k8s_openapi::api::core::v1::Container,
@@ -4400,6 +4420,64 @@ impl KubernetesComputeDriver {
         let control_connection = KubernetesControlConnection::RuntimeInitiated;
         let placement = self.new_generation_placement();
         let names = SandboxRuntimeNames::for_generation(sandbox_id, generation.as_str());
+        let (agent_uid, agent_gid, _) =
+            self.resolve_sandbox_identity_in_namespace(&namespace).await;
+        let mut init_containers = object
+            .data
+            .pointer("/spec/podTemplate/spec/initContainers")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        replace_sandbox_bootstrap_init_container(
+            &mut init_containers,
+            sandbox_bootstrap_init_container(
+                &self.config.sandbox_runtime_image,
+                self.config.sandbox_runtime_image_pull_policy,
+                agent_uid,
+                agent_gid,
+            ),
+        )?;
+        let mut volumes = object
+            .data
+            .pointer("/spec/podTemplate/spec/volumes")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                KubernetesDriverError::Precondition(
+                    "Sandbox pod template has no volume list".to_string(),
+                )
+            })?;
+        let sandbox_secret = volumes
+            .iter_mut()
+            .find(|volume| {
+                volume.get("name").and_then(serde_json::Value::as_str)
+                    == Some(SANDBOX_BOOTSTRAP_VOLUME_NAME)
+            })
+            .and_then(|volume| volume.get_mut("secret"))
+            .ok_or_else(|| {
+                KubernetesDriverError::Precondition(
+                    "Sandbox pod template is missing its bootstrap Secret volume".to_string(),
+                )
+            })?;
+        sandbox_secret["secretName"] = serde_json::json!(names.sandbox_secret);
+        let image_pull_secrets = self.generation_image_pull_secret_names(&names);
+        let mut restart_spec =
+            restart_pod_template_spec(&volumes, &init_containers, &image_pull_secrets);
+        let stored_containers = &object.data["spec"]["podTemplate"]["spec"]["containers"];
+        restart_spec["containers"] = stored_containers.clone();
+        reconcile_pinned_accounts(
+            &mut restart_spec,
+            self.config.sandbox_uid.is_some() || self.config.sandbox_gid.is_some(),
+            agent_uid,
+            agent_gid,
+        )
+        .map_err(|e| KubernetesDriverError::Precondition(e.to_owned()))?;
+        if &restart_spec["containers"] == stored_containers {
+            restart_spec
+                .as_object_mut()
+                .expect("restart patch")
+                .remove("containers");
+        }
         self.create_sandbox_runtime_fence(&namespace, &names)
             .await?;
         // Validate the current gateway generation before touching a stopped
@@ -4470,23 +4548,6 @@ impl KubernetesComputeDriver {
                 "Sandbox resource is missing its OpenShell sandbox name".to_string(),
             )
         })?;
-        let (agent_uid, agent_gid, _) =
-            self.resolve_sandbox_identity_in_namespace(&namespace).await;
-        let mut init_containers = object
-            .data
-            .pointer("/spec/podTemplate/spec/initContainers")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        replace_sandbox_bootstrap_init_container(
-            &mut init_containers,
-            sandbox_bootstrap_init_container(
-                &self.config.sandbox_runtime_image,
-                self.config.sandbox_runtime_image_pull_policy,
-                agent_uid,
-                agent_gid,
-            ),
-        )?;
         let supervisor = match &placement {
             SupervisorPlacement::Dedicated => GenerationSupervisor::Dedicated {
                 pod_uid: self
@@ -4515,47 +4576,6 @@ impl KubernetesComputeDriver {
             },
         };
 
-        let mut volumes = object
-            .data
-            .pointer("/spec/podTemplate/spec/volumes")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .ok_or_else(|| {
-                KubernetesDriverError::Precondition(
-                    "Sandbox pod template has no volume list".to_string(),
-                )
-            })?;
-        let sandbox_secret = volumes
-            .iter_mut()
-            .find(|volume| {
-                volume.get("name").and_then(serde_json::Value::as_str)
-                    == Some(SANDBOX_BOOTSTRAP_VOLUME_NAME)
-            })
-            .and_then(|volume| volume.get_mut("secret"))
-            .ok_or_else(|| {
-                KubernetesDriverError::Precondition(
-                    "Sandbox pod template is missing its bootstrap Secret volume".to_string(),
-                )
-            })?;
-        sandbox_secret["secretName"] = serde_json::json!(names.sandbox_secret);
-        let image_pull_secrets = self.generation_image_pull_secret_names(&names);
-        let mut restart_spec =
-            restart_pod_template_spec(&volumes, &init_containers, &image_pull_secrets);
-        let stored_containers = &object.data["spec"]["podTemplate"]["spec"]["containers"];
-        restart_spec["containers"] = stored_containers.clone();
-        reconcile_pinned_accounts(
-            &mut restart_spec,
-            self.config.sandbox_uid.is_some() || self.config.sandbox_gid.is_some(),
-            agent_uid,
-            agent_gid,
-        )
-        .map_err(|e| KubernetesDriverError::Precondition(e.to_owned()))?;
-        if &restart_spec["containers"] == stored_containers {
-            restart_spec
-                .as_object_mut()
-                .expect("restart patch")
-                .remove("containers");
-        }
         let restart = async {
             patch_dynamic_object_with_resource_version_retry(
                 &sandbox_api.api,
@@ -8333,15 +8353,12 @@ fn sandbox_template_to_k8s_with_validated_config(
 }
 
 fn pinned_accounts_command() -> serde_json::Value {
-    serde_json::json!([
-        format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"),
-        "prepare-pinned-accounts"
-    ])
+    serde_json::json!([PINNED_ACCOUNT_TOOL_PATH, "prepare-pinned-accounts"])
 }
 
 fn pinned_accounts_mounts() -> serde_json::Value {
     serde_json::json!([
-        {"name": SANDBOX_RUNTIME_VOLUME_NAME, "mountPath": SANDBOX_RUNTIME_MOUNT_PATH, "readOnly": true},
+        {"name": PINNED_ACCOUNT_TOOL, "mountPath": PINNED_ACCOUNT_TOOL_DIR, "readOnly": true},
         {"name": PINNED_ACCOUNTS_VOLUME, "mountPath": "/mnt/openshell-accounts"}
     ])
 }
@@ -8361,6 +8378,17 @@ fn pinned_accounts_init(agent: &serde_json::Value, uid: u32, gid: u32) -> serde_
         init["imagePullPolicy"] = policy.clone();
     }
     init
+}
+
+// The saved helper image survives a rollback to a gateway that replaces the runtime bootstrap.
+fn pinned_account_tool(bootstrap: &serde_json::Value, uid: u32, gid: u32) -> serde_json::Value {
+    let mut tool = pinned_accounts_init(bootstrap, uid, gid);
+    tool["name"] = PINNED_ACCOUNT_TOOL.into();
+    tool["command"] =
+        serde_json::json!(["/openshell-sandbox", "copy-self", PINNED_ACCOUNT_TOOL_PATH]);
+    tool["volumeMounts"] =
+        serde_json::json!([{"name": PINNED_ACCOUNT_TOOL, "mountPath": PINNED_ACCOUNT_TOOL_DIR}]);
+    tool
 }
 
 // Starts from the saved template on restart, including templates written by older gateways.
@@ -8406,22 +8434,30 @@ fn reconcile_pinned_accounts(
     let inits = spec["initContainers"]
         .as_array_mut()
         .ok_or("missing init containers")?;
-    inits.retain(|c| c["name"] != PINNED_ACCOUNTS_INIT);
+    if !existing && inits.iter().any(|c| c["name"] == PINNED_ACCOUNT_TOOL) {
+        return Err("existing initializer conflicts with the pinned account helper");
+    }
+    inits.retain(|c| c["name"] != PINNED_ACCOUNTS_INIT && c["name"] != PINNED_ACCOUNT_TOOL);
     if pin {
         let bootstrap = inits
             .iter()
             .position(|c| c["name"] == SANDBOX_BOOTSTRAP_CONTAINER_NAME)
             .ok_or("pinned accounts require the trusted bootstrap")?;
-        inits.insert(bootstrap + 1, init);
+        let tool = pinned_account_tool(&inits[bootstrap], uid, gid);
+        inits.splice(bootstrap + 1..bootstrap + 1, [tool, init]);
     }
     let volumes = spec["volumes"]
         .as_array_mut()
         .ok_or("missing workload volumes")?;
-    if !existing && volumes.iter().any(|v| v["name"] == PINNED_ACCOUNTS_VOLUME) {
+    let reserved = |v: &serde_json::Value| {
+        v["name"] == PINNED_ACCOUNTS_VOLUME || v["name"] == PINNED_ACCOUNT_TOOL
+    };
+    if !existing && volumes.iter().any(reserved) {
         return Err("existing volume conflicts with the pinned account volume");
     }
-    volumes.retain(|v| v["name"] != PINNED_ACCOUNTS_VOLUME);
+    volumes.retain(|v| !reserved(v));
     if pin {
+        volumes.push(serde_json::json!({"name": PINNED_ACCOUNT_TOOL, "emptyDir": {}}));
         volumes.push(
             serde_json::json!({"name": PINNED_ACCOUNTS_VOLUME, "emptyDir": {"sizeLimit":"16Mi"}}),
         );
@@ -8432,9 +8468,13 @@ fn reconcile_pinned_accounts(
 fn validate_admitted_accounts(spec: &serde_json::Value) -> Result<(), &'static str> {
     let named = |item: &serde_json::Value| item["name"] == PINNED_ACCOUNTS_VOLUME;
     let volumes = spec["volumes"].as_array().ok_or("missing account volume")?;
-    if !volumes
+    if ![PINNED_ACCOUNTS_VOLUME, PINNED_ACCOUNT_TOOL]
         .iter()
-        .any(|v| named(v) && v["emptyDir"].is_object())
+        .all(|name| {
+            volumes
+                .iter()
+                .any(|v| v["name"] == *name && v["emptyDir"].is_object())
+        })
     {
         return Err("pinned accounts require a per-Pod emptyDir");
     }
@@ -8452,6 +8492,27 @@ fn validate_admitted_accounts(spec: &serde_json::Value) -> Result<(), &'static s
         .iter()
         .find(|c| c["name"] == PINNED_ACCOUNTS_INIT)
         .ok_or("missing account initializer")?;
+    let tool_index = inits
+        .iter()
+        .position(|c| c["name"] == PINNED_ACCOUNT_TOOL)
+        .ok_or("missing pinned account helper")?;
+    let tool = &inits[tool_index];
+    if !inits[..tool_index]
+        .iter()
+        .any(|c| c["name"] == SANDBOX_BOOTSTRAP_CONTAINER_NAME)
+        || inits.get(tool_index + 1) != Some(init)
+        || tool["command"]
+            != serde_json::json!(["/openshell-sandbox", "copy-self", PINNED_ACCOUNT_TOOL_PATH])
+        || tool["volumeMounts"]
+            != serde_json::json!([{"name": PINNED_ACCOUNT_TOOL, "mountPath": PINNED_ACCOUNT_TOOL_DIR}])
+        || tool["securityContext"]["readOnlyRootFilesystem"] != true
+        || tool["securityContext"]["privileged"] == true
+        || !tool["args"].is_null()
+        || !tool["envFrom"].is_null()
+        || !tool["env"].is_null()
+    {
+        return Err("pinned account helper setup or mounts changed");
+    }
     if init["image"] != agent["image"]
         || init["command"] != pinned_accounts_command()
         || init["securityContext"]["readOnlyRootFilesystem"] != true
@@ -8468,6 +8529,17 @@ fn validate_admitted_accounts(spec: &serde_json::Value) -> Result<(), &'static s
         return Err("pinned account initializer image, command or mounts changed");
     }
     for c in containers.iter().chain(inits) {
+        if c["name"] != PINNED_ACCOUNT_TOOL
+            && c["name"] != PINNED_ACCOUNTS_INIT
+            && c["volumeMounts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|m| m["name"] == PINNED_ACCOUNT_TOOL)
+        {
+            return Err("another container mounts the pinned account helper");
+        }
+
         let mounts: Vec<_> = c["volumeMounts"]
             .as_array()
             .into_iter()
@@ -12179,10 +12251,12 @@ mod tests {
         ));
         let mut saved = DynamicObject::new("saved-mount", &resource);
         saved.data = rendered;
-        validate_stored_kubernetes_pvc_mounts(&saved.data["spec"]["podTemplate"]["spec"]).unwrap();
+        validate_stored_kubernetes_pvc_mounts(&saved.data["spec"]["podTemplate"]["spec"], false)
+            .unwrap();
         for enabled in [true, false] {
             let mut config = KubernetesComputeConfig {
                 allow_driver_config: true,
+                sandbox_uid: Some(1500),
                 ..Default::default()
             };
             config.resource_admission.enabled = enabled;
@@ -12191,6 +12265,9 @@ mod tests {
                 "/.openshell/runtime/openshell-sandbox",
                 BOUNDARY_CONFIG_PATH,
                 "/run/custom",
+                "/etc/passwd",
+                "/etc/group",
+                "/etc",
             ] {
                 let agent = saved.data["spec"]["podTemplate"]["spec"]["containers"]
                     .as_array_mut()
@@ -12356,6 +12433,7 @@ mod tests {
             SANDBOX_POD_IDENTITY_VOLUME_NAME,
             SANDBOX_PROXY_CA_VOLUME_NAME,
             PINNED_ACCOUNTS_VOLUME,
+            PINNED_ACCOUNT_TOOL,
             WORKSPACE_VOLUME_NAME,
         ] {
             let template = SandboxTemplate {
@@ -12820,7 +12898,7 @@ mod tests {
                 ..params
             });
             validate_admitted_accounts(&pinned).unwrap();
-            let init = &pinned["initContainers"][1];
+            let init = &pinned["initContainers"][2];
             assert_eq!(init["name"], PINNED_ACCOUNTS_INIT);
             assert_eq!(init["image"], "workload:test");
             assert_eq!(init["imagePullPolicy"], "Always");
@@ -12839,8 +12917,22 @@ mod tests {
             assert_eq!(restarted, stopped);
             reconcile_pinned_accounts(&mut stopped, false, 1500, 1600).unwrap();
             assert_eq!(stopped, unpinned);
+            // A rolled-back gateway replaces only its bootstrap.
             let mut changed = pinned;
-            changed["initContainers"][1]["volumeMounts"]
+            changed["initContainers"].as_array_mut().unwrap().swap(0, 2);
+            assert!(validate_admitted_accounts(&changed).is_err());
+            changed["initContainers"].as_array_mut().unwrap().swap(0, 2);
+            changed["initContainers"][0]["image"] = "earlier-runtime".into();
+            assert_ne!(
+                changed["initContainers"][0]["image"],
+                changed["initContainers"][1]["image"]
+            );
+            assert_eq!(
+                changed["initContainers"][2]["command"][0],
+                PINNED_ACCOUNT_TOOL_PATH
+            );
+            validate_admitted_accounts(&changed).unwrap();
+            changed["initContainers"][2]["volumeMounts"]
                 .as_array_mut()
                 .unwrap()
                 .push(serde_json::json!({"name":"extra","mountPath":"/input"}));

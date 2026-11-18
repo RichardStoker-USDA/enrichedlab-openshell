@@ -83,8 +83,10 @@ conflict is listed here and checked by hand on every merge:
 - The non-root child filter permits a capability drop after confirming empty effective, permitted, inheritable and
   bounding sets and setting no-new-privileges. The kernel checks the request against the calling thread's credentials.
   Retest both the capability-free workload and the default-deny path on Linux.
-- An explicit sandbox UID or GID enables the `pinned-accounts` init after bootstrap. Admission policies that name
-  allowed initializers must include it. It runs as the workload identity from the same image. The workload gets
+- An explicit sandbox UID or GID enables `pinned-account-tool` and `pinned-accounts` after bootstrap. The first
+  stages a helper from the configured runtime image, so earlier gateways can still restart the saved template.
+  The second reads the workload image. Both use the pinned identity. Admission policies that name allowed
+  initializers must include both. The workload gets
   read-only passwd and group files on a per-Pod volume. Missing IDs use the name `agent` with a numeric suffix on
   collision and home `/sandbox`. An existing numeric user keeps its name, home and shell and uses the pinned primary
   group. Image files, supplementary groups and persistent workspace ownership are preserved. Image name service

@@ -72,6 +72,14 @@ fn project(input: &[u8], uid: u32, gid: u32, user: bool) -> io::Result<Vec<u8>> 
     let mut output = Vec::with_capacity(input.len());
     for line in input.split_inclusive(|b| *b == b'\n') {
         let entry = line.strip_suffix(b"\n").unwrap_or(line);
+        if entry
+            .trim_ascii_start()
+            .first()
+            .is_some_and(|b| matches!(b, b'#' | b'+' | b'-'))
+        {
+            output.extend_from_slice(line);
+            continue;
+        }
         let fields: Vec<_> = entry.splitn(8, |b| *b == b':').collect();
         names.insert(fields[0]);
         let numeric = |value: &[u8]| std::str::from_utf8(value).ok()?.parse::<u32>().ok();
@@ -132,6 +140,11 @@ mod tests {
             [b"agent:!:1500:1600::/sandbox:/bin/sh\n".as_slice(), old].concat()
         );
         assert_eq!(project(&passwd, 1500, 1600, true).unwrap(), passwd);
+        assert!(
+            project(b"#ignored:x:1500:1600::/:/bin/sh\n", 1500, 1600, true)
+                .unwrap()
+                .starts_with(b"agent:!:1500:1600:")
+        );
         assert_eq!(project(b"", 1500, 1600, false).unwrap(), b"agent:!:1600:\n");
     }
 

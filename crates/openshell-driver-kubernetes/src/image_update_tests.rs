@@ -99,7 +99,8 @@ fn snapshot(version: &str) -> serde_json::Value {
                     "initContainers": [
                         {"name":SANDBOX_BOOTSTRAP_CONTAINER_NAME, "image":"trusted-runtime:v3"},
                         {"name":WORKSPACE_INIT_CONTAINER_NAME, "image":"registry.example/agent:v1", "command":["seed-workspace"], "volumeMounts":[{"name":"workspace", "mountPath":WORKSPACE_INIT_MOUNT_PATH}]},
-                        {"name":"operator-init", "image":"registry.example/agent:v1"}
+                        {"name":"operator-init", "image":"registry.example/agent:v1"},
+                        {"name":PINNED_ACCOUNTS_INIT, "image":"registry.example/agent:v1"}
                     ]
                 }
             }
@@ -347,6 +348,8 @@ async fn image_update_preserves_resource_storage_and_operator_bootstrap_annotati
             expected["spec"]["podTemplate"]["spec"]["containers"][0]["image"] =
                 serde_json::json!(request().image);
             expected["spec"]["podTemplate"]["spec"]["initContainers"][1]["image"] =
+                serde_json::json!(request().image);
+            expected["spec"]["podTemplate"]["spec"]["initContainers"][3]["image"] =
                 serde_json::json!(request().image);
             // Whole-object equality proves claim templates, mounts, owner UID,
             // launch state, operator annotations, and trusted/sidecar images
@@ -608,7 +611,14 @@ async fn image_update_propagates_known_pod_read_errors_without_writes() {
 
 #[tokio::test]
 async fn image_update_rejects_image_name_and_runtime_identity_conflicts() {
-    for scenario in ["image", "name", "runtime", "seed", "missing-provenance"] {
+    for scenario in [
+        "image",
+        "name",
+        "runtime",
+        "seed",
+        "accounts",
+        "missing-provenance",
+    ] {
         let (driver, state) = fixture(SANDBOX_VERSION_V1BETA1, false);
         let mut request = request();
         match scenario {
@@ -618,9 +628,10 @@ async fn image_update_rejects_image_name_and_runtime_identity_conflicts() {
                 request.expected_runtime_identity =
                     "kubernetes://openshell/replacement-uid/old-supervisor".into();
             }
-            "seed" => {
-                state.lock().unwrap().sandbox["spec"]["podTemplate"]["spec"]["initContainers"][1]
-                    ["image"] = serde_json::json!("different-seed:v1");
+            "seed" | "accounts" => {
+                let index = if scenario == "seed" { 1 } else { 3 };
+                state.lock().unwrap().sandbox["spec"]["podTemplate"]["spec"]["initContainers"]
+                    [index]["image"] = serde_json::json!("different-seed:v1");
             }
             "missing-provenance" => {
                 state.lock().unwrap().sandbox["metadata"]["annotations"]
@@ -724,6 +735,8 @@ async fn image_update_can_repair_a_legacy_invalid_image_reference() {
         state.sandbox["spec"]["podTemplate"]["spec"]["containers"][0]["image"] =
             serde_json::json!(invalid_image);
         state.sandbox["spec"]["podTemplate"]["spec"]["initContainers"][1]["image"] =
+            serde_json::json!(invalid_image);
+        state.sandbox["spec"]["podTemplate"]["spec"]["initContainers"][3]["image"] =
             serde_json::json!(invalid_image);
     }
     let mut update = request();
