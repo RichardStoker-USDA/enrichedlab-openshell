@@ -8794,6 +8794,26 @@ fn validate_sandbox_runtime_fence(
 }
 
 fn sandbox_runtime_fence_matches(existing: &NetworkPolicy, expected: &NetworkPolicy) -> bool {
+    fn omit_empty<T>(items: &mut Option<Vec<T>>) {
+        if items.as_ref().is_some_and(Vec::is_empty) {
+            *items = None;
+        }
+    }
+
+    fn normalize_selector(selector: &mut LabelSelector) {
+        if selector
+            .match_labels
+            .as_ref()
+            .is_some_and(BTreeMap::is_empty)
+        {
+            selector.match_labels = None;
+        }
+        for expression in selector.match_expressions.iter_mut().flatten() {
+            omit_empty(&mut expression.values);
+        }
+        omit_empty(&mut selector.match_expressions);
+    }
+
     fn normalized_spec(mut spec: Option<NetworkPolicySpec>) -> Option<NetworkPolicySpec> {
         if let Some(spec) = spec.as_mut() {
             // The Kubernetes API server omits explicitly empty rule arrays when it
@@ -8804,13 +8824,24 @@ fn sandbox_runtime_fence_matches(existing: &NetworkPolicy, expected: &NetworkPol
                 for port in rule.ports.iter_mut().flatten() {
                     port.protocol.get_or_insert_with(|| "TCP".to_string());
                 }
+                for peer in rule.to.iter_mut().flatten() {
+                    if let Some(block) = &mut peer.ip_block {
+                        omit_empty(&mut block.except);
+                    }
+                    // The selector itself has meaning, even when it is an empty object.
+                    for selector in peer
+                        .pod_selector
+                        .iter_mut()
+                        .chain(peer.namespace_selector.iter_mut())
+                    {
+                        normalize_selector(selector);
+                    }
+                }
+                omit_empty(&mut rule.ports);
+                omit_empty(&mut rule.to);
             }
-            if spec.egress.as_ref().is_some_and(Vec::is_empty) {
-                spec.egress = None;
-            }
-            if spec.ingress.as_ref().is_some_and(Vec::is_empty) {
-                spec.ingress = None;
-            }
+            omit_empty(&mut spec.egress);
+            omit_empty(&mut spec.ingress);
         }
         spec
     }
@@ -10686,6 +10717,34 @@ mod tests {
                 protocol == "TCP"
             );
         }
+    }
+
+    #[test]
+    fn supervisor_fence_accepts_omitted_empty_collections_and_preserves_selectors() {
+        let policy = |rules| {
+            let config =
+                serde_json::from_value(serde_json::json!({"supervisor_egress": rules})).unwrap();
+            workload_fence("sample", &SandboxRuntimeNames::new("sample"), &config).supervisor_policy
+        };
+        let explicit = policy(serde_json::json!([
+            {"to": [], "ports": []},
+            {"to": [{"podSelector": {"matchLabels": {}, "matchExpressions": []}}]},
+            {"to": [{"ipBlock": {"cidr":"192.0.2.0/24", "except":[]}}]}
+        ]));
+        let mut persisted = serde_json::json!([
+            {},
+            {"to": [{"podSelector": {}}]},
+            {"to": [{"ipBlock": {"cidr":"192.0.2.0/24"}}]}
+        ]);
+        assert!(sandbox_runtime_fence_matches(
+            &policy(persisted.clone()),
+            &explicit
+        ));
+        persisted[1] = serde_json::json!({"to":[{"namespaceSelector":{}}]});
+        assert!(!sandbox_runtime_fence_matches(
+            &policy(persisted),
+            &explicit
+        ));
     }
 
     fn sandbox_runtime_fence_pair_for_test() -> (NetworkPolicy, DynamicObject) {
