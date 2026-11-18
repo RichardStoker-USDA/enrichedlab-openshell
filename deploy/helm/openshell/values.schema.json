@@ -1,0 +1,157 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Validate supervisor egress before installing a shared NetworkPolicy. Other gateway settings are validated by the driver.",
+  "type": "object",
+  "properties": {
+    "gatewayConfig": {
+      "type": "object",
+      "properties": {
+        "openshell.drivers.kubernetes": {
+          "type": "object",
+          "properties": {
+            "sandbox_runtime": {
+              "$ref": "#/definitions/sandboxRuntime"
+            }
+          }
+        },
+        "openshell.drivers.kubernetes.sandbox_runtime": {
+          "$ref": "#/definitions/sandboxRuntime"
+        }
+      }
+    }
+  },
+  "definitions": {
+    "supervisorEgress": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/egressRule"
+      }
+    },
+    "egressRule": {
+      "type": "object",
+      "properties": {
+        "ports": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/port"
+          }
+        },
+        "to": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/peer"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "port": {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "enum": [
+            "TCP",
+            "UDP",
+            "SCTP"
+          ]
+        },
+        "port": {
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "endPort": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "peer": {
+      "type": "object",
+      "properties": {
+        "ipBlock": {
+          "$ref": "#/definitions/ipBlock"
+        },
+        "namespaceSelector": {
+          "$ref": "#/definitions/selector"
+        },
+        "podSelector": {
+          "$ref": "#/definitions/selector"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ipBlock": {
+      "type": "object",
+      "properties": {
+        "cidr": {
+          "type": "string"
+        },
+        "except": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cidr"
+      ]
+    },
+    "selector": {
+      "type": "object",
+      "properties": {
+        "matchLabels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "matchExpressions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/expression"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "expression": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "operator": {
+          "enum": [
+            "In",
+            "NotIn",
+            "Exists",
+            "DoesNotExist"
+          ]
+        },
+        "values": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "operator"
+      ]
+    },
+    "sandboxRuntime": {
+      "type": "object",
+      "properties": {
+        "supervisor_egress": {
+          "$ref": "#/definitions/supervisorEgress"
+        }
+      }
+    }
+  }
+}

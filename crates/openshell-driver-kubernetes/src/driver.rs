@@ -8799,6 +8799,12 @@ fn sandbox_runtime_fence_matches(existing: &NetworkPolicy, expected: &NetworkPol
             // The Kubernetes API server omits explicitly empty rule arrays when it
             // persists a NetworkPolicy. For a policy type named in `policyTypes`,
             // an omitted rule array and an empty rule array both deny all traffic.
+            // The API server defaults an omitted NetworkPolicy port protocol to TCP.
+            for rule in spec.egress.iter_mut().flatten() {
+                for port in rule.ports.iter_mut().flatten() {
+                    port.protocol.get_or_insert_with(|| "TCP".to_string());
+                }
+            }
             if spec.egress.as_ref().is_some_and(Vec::is_empty) {
                 spec.egress = None;
             }
@@ -10658,6 +10664,28 @@ mod tests {
             validate_sandbox_runtime_fence(&persisted, &expected),
             Err(KubernetesDriverError::Precondition(_))
         ));
+    }
+
+    #[test]
+    fn supervisor_fence_accepts_defaulted_tcp_without_accepting_another_protocol() {
+        let config = serde_json::from_value(serde_json::json!({
+            "supervisor_egress": [{"ports": [{"port": 443}]}]
+        }))
+        .unwrap();
+        let expected = workload_fence("sample", &SandboxRuntimeNames::new("sample"), &config)
+            .supervisor_policy;
+        let mut actual = expected.clone();
+        for protocol in ["TCP", "UDP"] {
+            actual.spec.as_mut().unwrap().egress.as_mut().unwrap()[0]
+                .ports
+                .as_mut()
+                .unwrap()[0]
+                .protocol = Some(protocol.to_owned());
+            assert_eq!(
+                sandbox_runtime_fence_matches(&actual, &expected),
+                protocol == "TCP"
+            );
+        }
     }
 
     fn sandbox_runtime_fence_pair_for_test() -> (NetworkPolicy, DynamicObject) {

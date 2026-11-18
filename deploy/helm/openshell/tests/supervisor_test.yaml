@@ -821,3 +821,31 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: supervisor_topology requires the kubernetes compute driver
+  - it: uses configured supervisor egress rules for the shared pool
+    template: templates/supervisor-networkpolicy.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+          sandbox_runtime:
+            supervisor_egress:
+              - to:
+                  - podSelector: { matchLabels: { app: gateway } }
+                ports: [{ protocol: TCP, port: 8080 }]
+    asserts:
+      - equal:
+          path: spec.egress
+          value:
+            - to:
+                - podSelector: { matchLabels: { app: gateway } }
+              ports: [{ protocol: TCP, port: 8080 }]
+  - it: keeps an explicit empty supervisor egress list
+    template: templates/supervisor-networkpolicy.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.drivers.kubernetes.sandbox_runtime:
+          supervisor_egress: []
+    asserts:
+      - equal: { path: spec.egress, value: [] }

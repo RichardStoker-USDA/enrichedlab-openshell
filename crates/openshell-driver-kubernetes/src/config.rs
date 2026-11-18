@@ -119,14 +119,41 @@ impl FromStr for KubernetesControlConnection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesSandboxRuntimeConfig {
-    /// Egress rules for dedicated supervisor Pods. An empty list allows no egress through this policy.
+    /// Egress rules for supervisor Pods. An empty list allows no egress through this policy.
     /// Omitting the field preserves the upstream unrestricted supervisor egress rule.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "supervisor_egress_rules"
+    )]
     pub supervisor_egress: Option<Vec<NetworkPolicyEgressRule>>,
     pub app_listener: KubernetesAppListenerConfig,
     /// TCP port of the Sandbox Protocol listener: the workload boundary for
     /// supervisor-initiated sandboxes, the supervisor for runtime-initiated ones.
     pub boundary_port: u16,
+}
+
+// Kubernetes clients ignore unknown fields by default. In an egress rule, removing
+// a misspelled selector could widen the rule. Refuse input the API type would discard.
+fn supervisor_egress_rules<'de, D>(
+    input: D,
+) -> Result<Option<Vec<NetworkPolicyEgressRule>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<serde_json::Value>::deserialize(input)?;
+    let mut rules = Vec::with_capacity(values.len());
+    for value in values {
+        let rule: NetworkPolicyEgressRule = serde_json::from_value(value.clone())
+            .map_err(|_| serde::de::Error::custom("invalid supervisor egress rule"))?;
+        if serde_json::to_value(&rule).map_err(serde::de::Error::custom)? != value {
+            return Err(serde::de::Error::custom(
+                "unsupported field or null in supervisor egress rule",
+            ));
+        }
+        rules.push(rule);
+    }
+    Ok(Some(rules))
 }
 
 impl Default for KubernetesSandboxRuntimeConfig {
@@ -1916,6 +1943,28 @@ mod tests {
         let cfg = KubernetesComputeConfig::default();
         assert!(cfg.default_runtime_class_name.is_empty());
         assert!(cfg.supervisor_runtime_class_name.is_empty());
+    }
+
+    #[test]
+    fn dedicated_supervisor_egress_rules_keep_omitted_and_empty_distinct() {
+        let parse = |value| serde_json::from_value::<KubernetesSandboxRuntimeConfig>(value);
+        assert!(
+            parse(serde_json::json!({}))
+                .unwrap()
+                .supervisor_egress
+                .is_none()
+        );
+        assert_eq!(
+            parse(serde_json::json!({"supervisor_egress": []}))
+                .unwrap()
+                .supervisor_egress,
+            Some(vec![])
+        );
+        assert!(parse(serde_json::json!({"supervisor_egress": null})).is_err());
+        assert!(
+            parse(serde_json::json!({"supervisor_egress": [{"to": [{"pod_selector": {}}]}]}))
+                .is_err()
+        );
     }
 
     #[test]
