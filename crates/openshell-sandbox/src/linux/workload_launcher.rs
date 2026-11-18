@@ -10,6 +10,7 @@
 //! an in-process channel; no descriptor handoff syscall or reusable exception
 //! is needed.
 
+use std::cell::Cell;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +20,14 @@ use std::thread;
 use crate::linux::seccomp_notify::{NotificationListener, install_workload_listener};
 
 type LaunchJob = Box<dyn FnOnce() + Send + 'static>;
+
+thread_local! {
+    static IDENTITY_LISTENER: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(super) fn has_identity_listener() -> bool {
+    IDENTITY_LISTENER.try_with(Cell::get).unwrap_or(false)
+}
 
 /// Serialized child-launch executor whose thread owns the inherited listener
 /// filter.
@@ -77,6 +86,7 @@ pub fn start() -> io::Result<(WorkloadLauncher, NotificationListener)> {
         .spawn(move || {
             match install_workload_listener() {
                 Ok(listener) => {
+                    IDENTITY_LISTENER.set(true);
                     if ready_tx.send(Ok(listener)).is_err() {
                         thread_alive.store(false, Ordering::Release);
                         return;

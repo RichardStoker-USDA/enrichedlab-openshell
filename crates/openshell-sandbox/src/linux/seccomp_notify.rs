@@ -341,6 +341,7 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
         libc::SYS_sendmsg,
         libc::SYS_sendmmsg,
         libc::SYS_setsockopt,
+        libc::SYS_setgroups,
         libc::SYS_kill,
         libc::SYS_tkill,
         libc::SYS_tgkill,

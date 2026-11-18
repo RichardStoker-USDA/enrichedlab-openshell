@@ -956,12 +956,12 @@ mod tests {
         let mut stat = b"21 (sample)".to_vec();
         stat.extend([0xff, b')']);
         stat.extend_from_slice(b" S 7 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1024");
-        let parsed = super::parse_proc_stat(&stat).unwrap();
+        let parsed = parse_proc_stat(&stat).unwrap();
         assert_eq!(
             (parsed.parent, parsed.start_time, parsed.live),
             (7, 1024, true)
         );
-        assert!(super::parse_proc_stat(b"21 (short) S 7").is_err());
+        assert!(parse_proc_stat(b"21 (short) S 7").is_err());
     }
 
     #[cfg(target_os = "linux")]

@@ -33,7 +33,7 @@ NVIDIA.
 | Operator-defined supervisor egress peers and ports | Shared supervisors use the Helm policy. Dedicated supervisors use the same rules from the Kubernetes driver configuration. |
 | A failed initial workload Pod is reported during provisioning | The Kubernetes driver preserves the terminal Pod condition while the gateway awaits configuration admission. |
 | Reap adopted children on kernels without task children lists | The runtime also reads the kernel process table. |
-| GNU Make and CMake may reapply the workload's current user and group IDs | Identity-preserving calls only, as proposed in [NVIDIA/OpenShell#4104](https://github.com/NVIDIA/OpenShell/pull/4104) |
+| Build tools and X server helpers can reapply the workload's current user and group IDs | The child filter checks scalar IDs. The workload listener verifies supplementary groups and acknowledges an unchanged list. [NVIDIA/OpenShell#4104](https://github.com/NVIDIA/OpenShell/pull/4104) |
 | A run receipt per sandbox: policy and image digests, runtime, OCSF event counts, exit status, output checksums | in progress |
 
 Changes that are useful beyond one site are offered upstream; this table shrinks as they land.

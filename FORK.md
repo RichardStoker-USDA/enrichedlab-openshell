@@ -77,7 +77,9 @@ conflict is listed here and checked by hand on every merge:
   condition identifies a failed Pod. It discards conflicting conditions and private container messages. The gateway
   rejects relay access during admission and after an initial Pod failure. Check initial creation, restart and
   terminal delivery for an activated workload separately on every merge.
-- The workload child filter allows GNU Make and CMake to reapply their current user and group IDs. Each argument must retain its present value. Keep the existing identity-change restrictions and the build-tool checks when syncing NVIDIA/OpenShell#4104.
+- The workload child filter checks every scalar ID used by build tools and X server helpers. For supplementary groups,
+  the workload listener verifies the caller's full group list and acknowledges a match without writing credentials.
+  Standalone child filters deny group-list changes. Retest both paths when syncing [NVIDIA/OpenShell#4104](https://github.com/NVIDIA/OpenShell/pull/4104).
 - Stored launch material never carries material the gateway withholds: when supervisors export elsewhere, the
   supervisor pool removes it as it records, places or loads material (`launch_material_without_collector_headers`),
   and the Kubernetes driver removes it from a recovered shared generation's Secret. Material without collector fields

@@ -7,6 +7,7 @@
 //! The in-workload sandbox owns lifecycle, policy, and failure handling.
 
 pub mod child_seccomp;
+pub(crate) mod group_identity;
 pub mod landlock;
 pub mod proc_fd;
 pub mod process_signal;

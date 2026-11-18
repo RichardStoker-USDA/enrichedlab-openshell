@@ -693,6 +693,9 @@ fn dispatch_notification(
     queues: NotificationQueues,
 ) -> io::Result<()> {
     let syscall = i64::from(notification.syscall);
+    if syscall == libc::SYS_setgroups {
+        return crate::linux::group_identity::reapply_groups(&listener, notification);
+    }
     if syscall == libc::SYS_openat || syscall == libc::SYS_openat2 {
         return queues.provider_files.handle_open(&listener, notification);
     }
@@ -1898,6 +1901,46 @@ fn error_to_errno(error: &io::Error) -> i32 {
 mod tests {
     use super::*;
     use crate::linux::socket_confinement;
+
+    #[test]
+    fn workload_reapplies_only_its_existing_supplementary_groups() {
+        use std::os::unix::process::CommandExt as _;
+        const PROBE: &str = "OPENSHELL_GROUP_LIST_TEST";
+        if std::env::var_os(PROBE).is_some() {
+            let groups = nix::unistd::getgroups().expect("initial groups");
+            let mut ids: Vec<_> = groups.iter().map(|g| g.as_raw()).collect();
+            ids.reverse();
+            // SAFETY: the slice covers the specified number of native GIDs.
+            let set = |ids: &[libc::gid_t]| unsafe {
+                libc::syscall(libc::SYS_setgroups, ids.len(), ids.as_ptr())
+            };
+            assert_eq!(set(&ids), 0, "{}", io::Error::last_os_error());
+            if let Some(first) = ids.first_mut() {
+                *first = first.wrapping_add(1);
+                assert_eq!(set(&ids), -1);
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+            }
+            ids.push(37);
+            assert_eq!(set(&ids), -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+            assert_eq!(nix::unistd::getgroups().unwrap(), groups);
+            return;
+        }
+        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let _broker = NetworkBroker::start_for_test(listener).unwrap();
+        let mut program = crate::linux::child_seccomp::prepare(std::process::id()).unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "network_broker::tests::workload_reapplies_only_its_existing_supplementary_groups",
+            ])
+            .env(PROBE, "1");
+        // SAFETY: the child installs only the prebuilt filter before exec.
+        unsafe { command.pre_exec(move || program.install()) };
+        let mut child = launcher.execute(move || command.spawn()).unwrap().unwrap();
+        assert!(child.wait().unwrap().success());
+    }
 
     fn assert_listener_closed(address: SocketAddr, inode: u64) {
         let table = if address.is_ipv4() {

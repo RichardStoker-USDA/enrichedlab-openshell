@@ -46,6 +46,7 @@ const CLONE_NAMESPACE_FLAGS: u32 = (libc::CLONE_NEWCGROUP
 /// A prebuilt child filter that can be installed without heap allocation.
 pub struct ChildHardeningProgram {
     instructions: Vec<libc::sock_filter>,
+    setgroups_action: usize,
 }
 
 impl ChildHardeningProgram {
@@ -56,6 +57,15 @@ impl ChildHardeningProgram {
     pub fn install(&mut self) -> io::Result<()> {
         mark_inherited_descriptors_close_on_exec()?;
         set_no_new_privileges()?;
+        // Only the production launch thread installs the listener that answers
+        // setgroups without changing kernel credentials. Its children inherit
+        // both the filter and the thread-local witness across fork.
+        self.instructions[self.setgroups_action] =
+            if super::workload_launcher::has_identity_listener() {
+                stmt(BPF_RET_K, SECCOMP_RET_ALLOW)
+            } else {
+                errno(libc::EPERM)
+            };
         let len = u16::try_from(self.instructions.len()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -181,13 +191,8 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
         libc::SYS_io_uring_enter,
         libc::SYS_io_uring_register,
         libc::SYS_capset,
-        libc::SYS_setuid,
-        libc::SYS_setgid,
-        libc::SYS_setreuid,
-        libc::SYS_setregid,
         libc::SYS_setfsuid,
         libc::SYS_setfsgid,
-        libc::SYS_setgroups,
         libc::SYS_sethostname,
         libc::SYS_setdomainname,
         libc::SYS_setpriority,
@@ -196,12 +201,21 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
         append_unconditional_deny(&mut instructions, syscall)?;
     }
 
-    // GNU Make resets its effective IDs before launching each recipe, even
-    // when it is already running with the intended identity. Permit only the
-    // fixed workload ID or the kernel's "leave unchanged" sentinel in every
-    // slot; changing any real, effective, or saved ID remains denied.
-    append_identity_preserving_setres(&mut instructions, libc::SYS_setresuid, workload_uid)?;
-    append_identity_preserving_setres(&mut instructions, libc::SYS_setresgid, workload_gid)?;
+    append_unconditional_deny(&mut instructions, libc::SYS_setgroups)?;
+    let setgroups_action = instructions.len() - 1;
+
+    // Helper launchers reset IDs before exec. Every supplied ID must be the
+    // fixed identity, or -1 where Linux defines it as "leave unchanged".
+    for (syscall, identity, slots) in [
+        (libc::SYS_setuid, workload_uid, 1),
+        (libc::SYS_setgid, workload_gid, 1),
+        (libc::SYS_setreuid, workload_uid, 2),
+        (libc::SYS_setregid, workload_gid, 2),
+        (libc::SYS_setresuid, workload_uid, 3),
+        (libc::SYS_setresgid, workload_gid, 3),
+    ] {
+        append_fixed_identity(&mut instructions, syscall, identity, slots)?;
+    }
 
     // Modern launchers fall back from clone3 and pidfd_open only for ENOSYS.
     // Returning EPERM here breaks otherwise portable process creation. The
@@ -260,7 +274,10 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
     }
 
     instructions.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
-    Ok(ChildHardeningProgram { instructions })
+    Ok(ChildHardeningProgram {
+        instructions,
+        setgroups_action,
+    })
 }
 
 #[allow(clippy::similar_names)]
@@ -280,13 +297,17 @@ fn fixed_process_identity() -> io::Result<(u32, u32)> {
             &raw mut saved_uid,
         )
     } != 0
-        || unsafe {
-            libc::getresgid(
-                &raw mut real_gid,
-                &raw mut effective_gid,
-                &raw mut saved_gid,
-            )
-        } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: all three GID output pointers are live and distinct.
+    if unsafe {
+        libc::getresgid(
+            &raw mut real_gid,
+            &raw mut effective_gid,
+            &raw mut saved_gid,
+        )
+    } != 0
     {
         return Err(io::Error::last_os_error());
     }
@@ -303,23 +324,33 @@ fn fixed_process_identity() -> io::Result<(u32, u32)> {
     Ok((effective_uid, effective_gid))
 }
 
-fn append_identity_preserving_setres(
+fn append_fixed_identity(
     instructions: &mut Vec<libc::sock_filter>,
     syscall: i64,
     identity: u32,
+    slots: u8,
 ) -> io::Result<()> {
+    let allow_unchanged = slots > 1;
+    let words_per_slot = if allow_unchanged { 4 } else { 3 };
     instructions.extend([
         stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
-        jump(BPF_JMP_JEQ_K, syscall_number(syscall)?, 0, 12),
+        jump(
+            BPF_JMP_JEQ_K,
+            syscall_number(syscall)?,
+            0,
+            slots * words_per_slot,
+        ),
     ]);
-    for argument in 0..3 {
+    for argument in 0..u32::from(slots) {
         // Linux consumes uid_t/gid_t as 32-bit values, including (uid_t)-1.
         instructions.extend([
             stmt(BPF_LD_W_ABS, argument_word_offset(argument)),
-            jump(BPF_JMP_JEQ_K, identity, 2, 0),
-            jump(BPF_JMP_JEQ_K, u32::MAX, 1, 0),
-            errno(libc::EPERM),
+            jump(BPF_JMP_JEQ_K, identity, words_per_slot - 2, 0),
         ]);
+        if allow_unchanged {
+            instructions.push(jump(BPF_JMP_JEQ_K, u32::MAX, 1, 0));
+        }
+        instructions.push(errno(libc::EPERM));
     }
     Ok(())
 }
@@ -539,8 +570,15 @@ mod tests {
 
         let filter = prepare(std::process::id()).unwrap();
         let (uid, gid) = fixed_process_identity().unwrap();
-        for (call, identity) in [(libc::SYS_setresuid, uid), (libc::SYS_setresgid, gid)] {
-            for mask in 0..8 {
+        for (call, identity, slots) in [
+            (libc::SYS_setuid, uid, 1),
+            (libc::SYS_setgid, gid, 1),
+            (libc::SYS_setreuid, uid, 2),
+            (libc::SYS_setregid, gid, 2),
+            (libc::SYS_setresuid, uid, 3),
+            (libc::SYS_setresgid, gid, 3),
+        ] {
+            for mask in 0..1 << slots {
                 let args = std::array::from_fn(|slot| {
                     if mask & (1 << slot) == 0 {
                         identity
@@ -548,11 +586,16 @@ mod tests {
                         u32::MAX
                     }
                 });
-                assert_eq!(decision(&filter, call, args), SECCOMP_RET_ALLOW);
+                let expected = if slots == 1 && mask != 0 {
+                    errno(libc::EPERM).k
+                } else {
+                    SECCOMP_RET_ALLOW
+                };
+                assert_eq!(decision(&filter, call, args), expected);
             }
             let other = if identity == 1 { 2 } else { 1 };
-            for slot in 0..3 {
-                let mut args = [u32::MAX; 3];
+            for slot in 0..slots {
+                let mut args = [identity; 3];
                 args[slot] = other;
                 assert_eq!(decision(&filter, call, args), errno(libc::EPERM).k);
             }
@@ -567,6 +610,16 @@ mod tests {
             let mut filter = prepare(std::process::id().saturating_add(1))
                 .expect("prepare child hardening filter");
             filter.install().expect("install child hardening filter");
+
+            // X server helper setup reapplies the real GID and UID before exec.
+            for (call, id) in [(libc::SYS_setgid, gid), (libc::SYS_setuid, uid)] {
+                assert_eq!(unsafe { libc::syscall(call, id) }, 0);
+            }
+            for (call, id) in [(libc::SYS_setregid, gid), (libc::SYS_setreuid, uid)] {
+                for (real, effective) in [(id, id), (u32::MAX, id), (id, u32::MAX)] {
+                    assert_eq!(unsafe { libc::syscall(call, real, effective) }, 0);
+                }
+            }
 
             for (syscall, identity) in [(libc::SYS_setresuid, uid), (libc::SYS_setresgid, gid)] {
                 // Exercise every combination of fixed ID and unchanged ID,
