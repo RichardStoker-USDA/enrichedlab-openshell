@@ -30,6 +30,9 @@ NVIDIA.
 | Operator-fixed labels and annotations on every Sandbox, workload and dedicated supervisor Pod and workspace claim (`fixed_pod_labels`, `fixed_pod_annotations`), for clusters whose admission, telemetry or retention policy requires them | available |
 | Supervisor telemetry to the gateway's collector, a separate collector, or none (`supervisor_telemetry`), without forwarding the gateway's collector headers or TLS client keys | available |
 | Retention class and expiry on every sandbox object | in progress |
+| Operator-defined supervisor egress peers and ports | Shared supervisors use the Helm policy. Dedicated supervisors use the same rules from the Kubernetes driver configuration. |
+| A failed initial workload Pod is reported during provisioning | The Kubernetes driver preserves the terminal Pod condition while the gateway awaits configuration admission. |
+| Reap adopted children on kernels without task children lists | The runtime also reads the kernel process table. |
 | GNU Make and CMake may reapply the workload's current user and group IDs | Identity-preserving calls only, as proposed in [NVIDIA/OpenShell#4104](https://github.com/NVIDIA/OpenShell/pull/4104) |
 | A run receipt per sandbox: policy and image digests, runtime, OCSF event counts, exit status, output checksums | in progress |
 

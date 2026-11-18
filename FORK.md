@@ -73,6 +73,9 @@ conflict is listed here and checked by hand on every merge:
   is still built before those two calls; `withheld_collector_material_never_reaches_launch_bundles` fails if it is not.
 - The Kubernetes driver accepts optional supervisor_egress rules under sandbox_runtime. The driver uses them for dedicated Pods and the chart applies the same list to shared supervisors. The upstream supervisor_runtime_class_name setting selects their RuntimeClass. Keep the workload egress deny independent of the supervisor rules.
 - The process reaper falls back to the kernel process table when task children lists are unavailable. It reads process stat files as bytes and only waits on its own direct children. Keep both kernel configurations covered.
+- On initial creation the Kubernetes driver preserves a terminal workload Pod failure when the controller reports
+  both `Finished=True` and `Ready=False` with reason `PodFailed`. The gateway can report the failure while
+  configuration admission is still pending. Check initial creation and restart separately on every merge.
 - The workload child filter allows GNU Make and CMake to reapply their current user and group IDs. Each argument must retain its present value. Keep the existing identity-change restrictions and the build-tool checks when syncing NVIDIA/OpenShell#4104.
 - Stored launch material never carries material the gateway withholds: when supervisors export elsewhere, the
   supervisor pool removes it as it records, places or loads material (`launch_material_without_collector_headers`),

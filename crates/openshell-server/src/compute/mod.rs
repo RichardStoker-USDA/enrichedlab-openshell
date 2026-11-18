@@ -12748,6 +12748,38 @@ mod tests {
     }
 
     #[test]
+    fn failed_initial_pod_is_terminal_while_configuration_is_pending() {
+        for supervisor_connected in [false, true] {
+            let mut sandbox = sandbox_record("id", "sandbox", SandboxPhase::Provisioning);
+            sandbox.status.as_mut().unwrap().configuration_admission =
+                Some(openshell_core::proto::SandboxConfigurationAdmission::default());
+            let mut incoming = ready_driver_sandbox("id", "sandbox");
+            let mut status = make_driver_status(make_driver_condition(
+                "PodFailed",
+                "Workload initialization failed",
+            ));
+            status.conditions.push(DriverCondition {
+                r#type: "Finished".into(),
+                status: "True".into(),
+                reason: "PodFailed".into(),
+                ..Default::default()
+            });
+            incoming.status = Some(status);
+
+            apply_driver_snapshot(&mut sandbox, &incoming, supervisor_connected, false);
+
+            assert_eq!(sandbox.phase(), SandboxPhase::Error as i32);
+            let status = sandbox.status.unwrap();
+            assert!(status.conditions.iter().any(|condition| {
+                condition.r#type == "Ready"
+                    && condition.status == "False"
+                    && condition.reason == "PodFailed"
+            }));
+            assert_ne!(status.configuration_activated, Some(true));
+        }
+    }
+
+    #[test]
     fn derive_phase_returns_ready_for_ready_true() {
         let status = DriverSandboxStatus {
             conditions: vec![DriverCondition {

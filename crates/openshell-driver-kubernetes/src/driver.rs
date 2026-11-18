@@ -7148,6 +7148,11 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
     namespace: &str,
     obj: DynamicObject,
 ) -> Result<(String, Sandbox), String> {
+    // A failed initial Pod cannot become ready. Preserve the controller's terminal
+    // condition before bootstrap and dependency checks replace it with a wait reason.
+    if initial_workload_pod_failed(&obj) {
+        return sandbox_from_object(namespace, obj);
+    }
     let sandbox_id = sandbox_id_from_object(&obj).unwrap_or_default();
     let object_namespace = obj
         .metadata
@@ -7191,6 +7196,34 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
         }
     }
     Ok((name, sandbox))
+}
+
+fn initial_workload_pod_failed(obj: &DynamicObject) -> bool {
+    if !sandbox_runtime_bootstrap_in_progress(obj)
+        || sandbox_runtime_bootstrap_operation(obj) != Some("create")
+    {
+        return false;
+    }
+    // status_from_object filters out conditions from previous generations.
+    // A restart can also leave a finished Pod behind. It never enters this path.
+    let Some(status) = status_from_object(obj) else {
+        return false;
+    };
+    let mut failed = false;
+    let mut finished = false;
+    for condition in &status.conditions {
+        match (
+            condition.r#type.as_str(),
+            condition.status.as_str(),
+            condition.reason.as_str(),
+        ) {
+            ("Ready", "False", "PodFailed") => failed = true,
+            ("Finished", "True", "PodFailed") => finished = true,
+            ("Ready" | "Suspended", "True", _) => return false,
+            _ => {}
+        }
+    }
+    failed && finished
 }
 
 fn sandbox_from_object_with_bootstrap_state(
@@ -15267,6 +15300,53 @@ mod tests {
                 .iter()
                 .any(|condition| condition.r#type == r#type && condition.status == status)
         })
+    }
+
+    #[tokio::test]
+    async fn terminal_initial_pod_failure_survives_bootstrap_readiness() {
+        let mut obj = sandbox_cr_mid_operation(Some("create"));
+        obj.metadata.generation = Some(2);
+        obj.data["status"]["conditions"] = serde_json::json!([
+            {"type": "Ready", "status": "False", "reason": "PodFailed", "observedGeneration": 2},
+            {"type": "Finished", "status": "True", "reason": "PodFailed", "observedGeneration": 2}
+        ]);
+        let client = Client::new(
+            tower::service_fn(|_: http::Request<kube::client::Body>| async {
+                Err::<http::Response<kube::client::Body>, _>(std::io::Error::other(
+                    "unexpected request",
+                ))
+            }),
+            "default",
+        );
+        let (_, sandbox) = sandbox_from_object_with_sandbox_runtime_readiness(
+            &client,
+            None,
+            "default",
+            obj.clone(),
+        )
+        .await
+        .unwrap();
+        let status = sandbox.status.unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.r#type == "Ready" && c.status == "False" && c.reason == "PodFailed")
+        );
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.r#type == "Bootstrapping")
+        );
+        obj.data["status"]["conditions"][1]["observedGeneration"] = serde_json::json!(1);
+        assert!(!initial_workload_pod_failed(&obj));
+        obj.data["status"]["conditions"][1]["observedGeneration"] = serde_json::json!(2);
+        obj.metadata.annotations.as_mut().unwrap().insert(
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION.to_string(),
+            "restart".to_string(),
+        );
+        assert!(!initial_workload_pod_failed(&obj));
     }
 
     // The gateway treats Bootstrapping=True as an accepted start and lets it
