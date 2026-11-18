@@ -25,6 +25,11 @@ static REAPER_EVENT_FD: AtomicI32 = AtomicI32::new(-1);
 const REAPER_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(test)]
 static REAPER_SCAN_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Tests set this to exercise the process-table fallback on a kernel that
+/// does provide task children lists.
+#[cfg(test)]
+static FORCE_PROCESS_TABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 extern "C" fn notify_reaper_on_sigchld(_: libc::c_int) {
     let fd = REAPER_EVENT_FD.load(Ordering::Acquire);
@@ -227,7 +232,21 @@ fn reap_unmanaged_children_once() -> io::Result<usize> {
 }
 
 fn direct_child_pids() -> io::Result<HashSet<i32>> {
+    #[cfg(test)]
+    if FORCE_PROCESS_TABLE.load(Ordering::Relaxed) {
+        return children_from_process_table(std::process::id());
+    }
+    // A kernel built without CONFIG_PROC_CHILDREN (it comes with
+    // CONFIG_CHECKPOINT_RESTORE, which Kata guest kernels leave out) has no
+    // task children lists, so every adopted orphan would stay a zombie.
+    children_from_task_lists()?.map_or_else(|| children_from_process_table(std::process::id()), Ok)
+}
+
+/// Children named in this process's task `children` lists, or `None` when
+/// the kernel provides no such list.
+fn children_from_task_lists() -> io::Result<Option<HashSet<i32>>> {
     let mut children = HashSet::new();
+    let mut listed = false;
     for task in std::fs::read_dir("/proc/self/task")? {
         let task = task?;
         let path = task.path().join("children");
@@ -236,6 +255,7 @@ fn direct_child_pids() -> io::Result<HashSet<i32>> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
+        listed = true;
         children.extend(
             contents
                 .split_ascii_whitespace()
@@ -243,7 +263,52 @@ fn direct_child_pids() -> io::Result<HashSet<i32>> {
                 .filter(|pid| *pid > 0),
         );
     }
+    Ok(listed.then_some(children))
+}
+
+/// Processes whose parent is `parent`, read from each process's `stat`.
+/// A process whose `stat` cannot be read (it exited during the scan, the
+/// mount hides it) is skipped, so one process never stops the scan; the
+/// reaper's `waitpid` refuses any PID that is not its child.
+fn children_from_process_table(parent: u32) -> io::Result<HashSet<i32>> {
+    let mut children = HashSet::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+            .filter(|pid| *pid > 0)
+        else {
+            continue;
+        };
+        // Bytes, not text: a command name may hold any non-NUL byte.
+        let Ok(stat) = std::fs::read(entry.path().join("stat")) else {
+            continue;
+        };
+        if stat_parent(&stat) == Some(parent) {
+            children.insert(pid);
+        }
+    }
     Ok(children)
+}
+
+/// The parent PID in a `/proc/<pid>/stat` line. The command name sits in
+/// parentheses and may hold spaces, parentheses and non-UTF-8 bytes, so the
+/// fields are read after its last `)`: state, then parent PID.
+fn stat_parent(stat: &[u8]) -> Option<u32> {
+    proc_stat_fields(stat)?.nth(1)?.parse().ok()
+}
+
+/// The kernel emits ASCII fields after the command's closing parenthesis.
+/// The command itself is an arbitrary sequence of bytes.
+pub(crate) fn proc_stat_fields(stat: &[u8]) -> Option<std::str::SplitAsciiWhitespace<'_>> {
+    let end = stat.iter().rposition(|byte| *byte == b')')?;
+    Some(
+        std::str::from_utf8(&stat[end + 1..])
+            .ok()?
+            .split_ascii_whitespace(),
+    )
 }
 
 #[cfg(test)]
@@ -277,25 +342,95 @@ mod tests {
 
     #[test]
     fn orphan_reaper_waits_while_idle_and_reaps_only_unmanaged_children() {
+        run_reaper_scenario_isolated(
+            "managed_children::tests::orphan_reaper_waits_while_idle_and_reaps_only_unmanaged_children",
+            false,
+        );
+    }
+
+    #[test]
+    fn orphan_reaper_reads_the_process_table_without_task_children_lists() {
+        run_reaper_scenario_isolated(
+            "managed_children::tests::orphan_reaper_reads_the_process_table_without_task_children_lists",
+            true,
+        );
+    }
+
+    #[test]
+    fn process_table_lists_this_process_children_only() {
+        let pids: Vec<i32> = (0..3).map(|_| fork_exiting_child()).collect();
+        // An exited child stays in the table as a zombie until it is reaped.
+        let children = children_from_process_table(std::process::id()).expect("scan");
+        assert!(pids.iter().all(|pid| children.contains(pid)));
+        assert!(!children.contains(&i32::try_from(std::process::id()).unwrap()));
+        for pid in pids {
+            assert!(matches!(
+                waitpid(Pid::from_raw(pid), None),
+                Ok(WaitStatus::Exited(..))
+            ));
+        }
+        assert!(
+            children_from_process_table(u32::MAX)
+                .expect("scan")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn process_table_lists_a_child_with_a_non_utf8_name() {
+        // SAFETY: the child renames itself and waits for its parent's signal
+        // using raw syscalls only; it never returns into Rust code.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let name = b"\xff\xfe(x) S 1\0";
+            unsafe {
+                libc::prctl(libc::PR_SET_NAME, name.as_ptr(), 0, 0, 0);
+                libc::pause();
+                libc::_exit(0);
+            }
+        }
+        assert!(pid > 0, "fork failed: {}", io::Error::last_os_error());
+        wait_until(|| {
+            std::fs::read(format!("/proc/{pid}/stat")).is_ok_and(|stat| stat.contains(&0xff))
+        });
+        let children = children_from_process_table(std::process::id()).expect("scan");
+        assert!(children.contains(&pid));
+        // SAFETY: the PID is this test's own unreaped child.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        assert!(waitpid(Pid::from_raw(pid), None).is_ok());
+    }
+
+    #[test]
+    fn stat_parent_reads_past_a_command_name_with_spaces_and_parentheses() {
+        assert_eq!(stat_parent(b"42 (a b) c)) S 7 42 42 0 -1"), Some(7));
+        assert_eq!(stat_parent(b"1 (openshell-sandb) S 0 1 1 0 -1"), Some(0));
+        assert_eq!(stat_parent(b"9 (\xff\xfe)) S 3 9 9 0 -1"), Some(3));
+        assert_eq!(stat_parent(b"no command name"), None);
+        assert_eq!(stat_parent(b"5 (x) S"), None);
+    }
+
+    /// Run the reaper scenario in a fresh copy of this test binary, since it
+    /// installs a process-wide SIGCHLD handler.
+    fn run_reaper_scenario_isolated(test: &str, process_table: bool) {
         const HELPER_ENV: &str = "OPENSHELL_ORPHAN_REAPER_TEST_HELPER";
-        if std::env::var_os(HELPER_ENV).is_none() {
-            let output = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "managed_children::tests::orphan_reaper_waits_while_idle_and_reaps_only_unmanaged_children",
-                    "--nocapture",
-                ])
-                .env(HELPER_ENV, "1")
-                .output()
-                .expect("start isolated reaper test process");
-            assert!(
-                output.status.success(),
-                "reaper test failed: {}",
-                String::from_utf8_lossy(&output.stdout)
-            );
+        if std::env::var_os(HELPER_ENV).is_some() {
+            FORCE_PROCESS_TABLE.store(process_table, Ordering::Relaxed);
+            run_reaper_scenario();
             return;
         }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(HELPER_ENV, "1")
+            .output()
+            .expect("start isolated reaper test process");
+        assert!(
+            output.status.success(),
+            "reaper test failed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 
+    fn run_reaper_scenario() {
         start_orphan_reaper().expect("start orphan reaper");
         wait_until(|| REAPER_SCAN_COUNT.load(Ordering::Relaxed) > 0);
         let idle_scan_count = REAPER_SCAN_COUNT.load(Ordering::Relaxed);
