@@ -138,7 +138,7 @@ mod lifecycle_reconciliation {
     }
 
     fn preparing_dependencies() -> Vec<KubeTestStep> {
-        let mut fence = workload_fence("openshell", &SandboxRuntimeNames::new("sandbox-1"), 5500);
+        let mut fence = workload_fence("openshell", &SandboxRuntimeNames::new("sandbox-1"), &crate::config::KubernetesSandboxRuntimeConfig::default());
         for (policy, component) in [
             (&mut fence.workload_policy, "sandbox-workload-fence"),
             (&mut fence.supervisor_policy, "sandbox-supervisor-egress"),

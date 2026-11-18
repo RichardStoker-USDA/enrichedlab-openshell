@@ -294,6 +294,7 @@ async fn main() -> Result<()> {
                 app_listener:
                     openshell_driver_kubernetes::config::KubernetesAppListenerConfig::default(),
                 boundary_port: args.sandbox_runtime_boundary_port,
+                ..Default::default()
             },
             runtime_bootstrap_grace_seconds: args.runtime_bootstrap_grace_seconds,
             sandbox_attach_request_timeout_seconds: args.sandbox_attach_request_timeout_seconds,

@@ -1519,6 +1519,10 @@ gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes
 [openshell.drivers.kubernetes.sandbox_runtime]
 # TLS-protected boundary listener reached only by the paired control pod.
 boundary_port = 5500
+# Optional Kubernetes NetworkPolicy egress rules for dedicated and shared supervisor Pods.
+# An empty list grants no egress through this policy. Omitting the key allows all
+# destinations through this policy. Other NetworkPolicies still apply additively.
+# supervisor_egress = []
 ```
 
 The Kubernetes driver always creates the workload `NetworkPolicy` before
