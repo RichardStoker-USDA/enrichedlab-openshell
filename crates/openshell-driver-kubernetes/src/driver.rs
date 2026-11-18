@@ -7151,7 +7151,21 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
     // A failed initial Pod cannot become ready. Preserve the controller's terminal
     // condition before bootstrap and dependency checks replace it with a wait reason.
     if initial_workload_pod_failed(&obj) {
-        return sandbox_from_object(namespace, obj);
+        let (name, mut sandbox) = sandbox_from_object(namespace, obj)?;
+        if let Some(status) = sandbox.status.as_mut() {
+            // A Pod condition can include container output. Publish only the
+            // failure class. Drop stale positives and unrelated condition text.
+            status.conditions = [("Ready", "False"), ("Finished", "True")]
+                .map(|(kind, value)| SandboxCondition {
+                    r#type: kind.into(),
+                    status: value.into(),
+                    reason: "PodFailed".into(),
+                    message: "Initial workload Pod failed".into(),
+                    transition_time: None,
+                })
+                .into();
+        }
+        return Ok((name, sandbox));
     }
     let sandbox_id = sandbox_id_from_object(&obj).unwrap_or_default();
     let object_namespace = obj
@@ -7209,21 +7223,13 @@ fn initial_workload_pod_failed(obj: &DynamicObject) -> bool {
     let Some(status) = status_from_object(obj) else {
         return false;
     };
-    let mut failed = false;
-    let mut finished = false;
-    for condition in &status.conditions {
-        match (
-            condition.r#type.as_str(),
-            condition.status.as_str(),
-            condition.reason.as_str(),
-        ) {
-            ("Ready", "False", "PodFailed") => failed = true,
-            ("Finished", "True", "PodFailed") => finished = true,
-            ("Ready" | "Suspended", "True", _) => return false,
-            _ => {}
-        }
-    }
-    failed && finished
+    // Either current failure observation prevents activation, including when a
+    // controller also publishes a stale Ready or Suspended value in this update.
+    status.conditions.iter().any(|condition| {
+        (condition.r#type.eq_ignore_ascii_case("Ready")
+            || condition.r#type.eq_ignore_ascii_case("Finished"))
+            && condition.reason.eq_ignore_ascii_case("PodFailed")
+    })
 }
 
 fn sandbox_from_object_with_bootstrap_state(
@@ -15307,8 +15313,9 @@ mod tests {
         let mut obj = sandbox_cr_mid_operation(Some("create"));
         obj.metadata.generation = Some(2);
         obj.data["status"]["conditions"] = serde_json::json!([
-            {"type": "Ready", "status": "False", "reason": "PodFailed", "observedGeneration": 2},
-            {"type": "Finished", "status": "True", "reason": "PodFailed", "observedGeneration": 2}
+            {"type": "Ready", "status": "True", "reason": "DependenciesReady", "observedGeneration": 2},
+            {"type": "Suspended", "status": "True", "reason": "PodTerminated", "observedGeneration": 2},
+            {"type": "Finished", "status": "True", "reason": "PodFailed", "message": "private container diagnostic", "observedGeneration": 2}
         ]);
         let client = Client::new(
             tower::service_fn(|_: http::Request<kube::client::Body>| async {
@@ -15333,15 +15340,19 @@ mod tests {
                 .iter()
                 .any(|c| c.r#type == "Ready" && c.status == "False" && c.reason == "PodFailed")
         );
+        assert_eq!(status.conditions.len(), 2);
         assert!(
-            !status
+            status
                 .conditions
                 .iter()
-                .any(|c| c.r#type == "Bootstrapping")
+                .all(|c| { c.reason == "PodFailed" && c.message == "Initial workload Pod failed" })
         );
-        obj.data["status"]["conditions"][1]["observedGeneration"] = serde_json::json!(1);
+        obj.data["status"]["conditions"][2]["observedGeneration"] = serde_json::json!(1);
         assert!(!initial_workload_pod_failed(&obj));
-        obj.data["status"]["conditions"][1]["observedGeneration"] = serde_json::json!(2);
+        obj.data["status"]["conditions"] = serde_json::json!([
+            {"type": "Ready", "status": "False", "reason": "PodFailed", "observedGeneration": 2}
+        ]);
+        assert!(initial_workload_pod_failed(&obj));
         obj.metadata.annotations.as_mut().unwrap().insert(
             ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION.to_string(),
             "restart".to_string(),

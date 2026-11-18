@@ -3431,10 +3431,36 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
 // ---------------------------------------------------------------------------
 
 fn sandbox_relay_reachable(state: &ServerState, sandbox: &Sandbox) -> bool {
-    let phase = SandboxPhase::try_from(sandbox.phase()).ok();
-    matches!(phase, Some(SandboxPhase::Ready))
-        || (matches!(phase, Some(SandboxPhase::Completed | SandboxPhase::Error))
-            && state.supervisor_sessions.has_session(sandbox.object_id()))
+    let Some(status) = sandbox.status.as_ref() else {
+        return false;
+    };
+    if status.configuration_activated == Some(false)
+        || status
+            .configuration_admission
+            .as_ref()
+            .is_some_and(|admission| {
+                admission.state
+                    != i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted)
+            })
+        || status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready" && condition.reason.eq_ignore_ascii_case("PodFailed")
+        })
+    {
+        return false;
+    }
+    match SandboxPhase::try_from(status.phase) {
+        Ok(SandboxPhase::Ready) => true,
+        Ok(SandboxPhase::Completed | SandboxPhase::Error) => {
+            // Terminal delivery serves an admitted workload. Older records can
+            // establish that one ran through its recorded main process exit.
+            let activated = status.configuration_activated == Some(true)
+                || (status.configuration_activated.is_none()
+                    && status.exit_code.is_some()
+                    && !status.main_process_instance_id.is_empty());
+            activated && state.supervisor_sessions.has_session(sandbox.object_id())
+        }
+        _ => false,
+    }
 }
 
 pub(super) async fn handle_create_ssh_session(
@@ -9631,6 +9657,7 @@ mod tests {
         let state = test_server_state().await;
         let mut sandbox = test_sandbox("work", Vec::new());
         sandbox.set_phase(SandboxPhase::Completed as i32);
+        sandbox.status.as_mut().unwrap().configuration_activated = Some(true);
         state.store.put_message(&sandbox).await.unwrap();
 
         let (tx, _rx) = mpsc::channel(1);
@@ -9661,6 +9688,29 @@ mod tests {
                 .finalize_main_process_exit("sandbox-work")
         );
         assert!(sandbox_relay_reachable(&state, &sandbox));
+
+        let status = sandbox.status.as_mut().unwrap();
+        status.configuration_activated = None;
+        status.exit_code = Some(0);
+        status.main_process_instance_id = "completed-process".into();
+        assert!(sandbox_relay_reachable(&state, &sandbox));
+
+        let status = sandbox.status.as_mut().unwrap();
+        status.phase = SandboxPhase::Error.into();
+        status.configuration_activated = Some(false);
+        assert!(!sandbox_relay_reachable(&state, &sandbox));
+        let status = sandbox.status.as_mut().unwrap();
+        status.configuration_activated = Some(true);
+        status
+            .conditions
+            .push(openshell_core::proto::SandboxCondition {
+                r#type: "Ready".into(),
+                status: "False".into(),
+                reason: "PodFailed".into(),
+                ..Default::default()
+            });
+        assert!(!sandbox_relay_reachable(&state, &sandbox));
+        sandbox.status.as_mut().unwrap().conditions.clear();
 
         assert!(state.supervisor_sessions.disconnect("sandbox-work"));
         assert!(!sandbox_relay_reachable(&state, &sandbox));
