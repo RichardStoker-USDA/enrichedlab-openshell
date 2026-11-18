@@ -10,10 +10,11 @@ use tracing::info;
 
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_core::sandbox_env::{SupervisorOtlp, SupervisorOtlpArgs};
 use openshell_driver_kubernetes::{
     ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
     KubernetesComputeConfig, KubernetesComputeDriver, KubernetesImagePullPolicy,
-    KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, WorkspaceMode,
+    KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, SupervisorTelemetry, WorkspaceMode,
 };
 
 #[derive(Parser, Debug)]
@@ -28,6 +29,14 @@ struct Args {
         default_value = "{}"
     )]
     admission_config_json: openshell_core::resource_admission::DriverAdmissionConfig,
+    /// Runtime bootstrap budget in seconds.
+    #[arg(long, env = "OPENSHELL_RUNTIME_BOOTSTRAP_GRACE_SECONDS", default_value = "300",
+        value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    runtime_bootstrap_grace_seconds: u64,
+    /// Initial attachment budget passed to dedicated supervisor Pods.
+    #[arg(long, env = "OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS",
+        value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    sandbox_attach_request_timeout_seconds: Option<u64>,
     /// Public compute-driver Unix socket used by an external gateway.
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     bind_socket: Option<PathBuf>,
@@ -42,20 +51,20 @@ struct Args {
     #[arg(long, env = "OPENSHELL_LOG_LEVEL", default_value = "info")]
     log_level: String,
 
-    #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
-    otlp_endpoint: Option<String>,
+    #[command(flatten)]
+    otlp: SupervisorOtlpArgs,
 
-    /// OTLP/gRPC collector endpoint for supervisor OCSF event export.
-    #[arg(long, env = "OPENSHELL_OTLP_OCSF_ENDPOINT")]
-    otlp_ocsf_endpoint: Option<String>,
-
-    /// OCSF schema version that supervisors downgrade exported events to.
+    /// Where supervisors send their traces and OCSF events: `gateway` (default) uses the exports set by this
+    /// driver's `--otlp*` flags, which must name the gateway's own collector; `off` sends none; an `http://` or
+    /// `https://` URL sends the same exports to that separate collector over OTLP/gRPC. Supervisors receive the
+    /// gateway's collector headers and TLS material only with `gateway` and at least one export.
     #[arg(
         long,
-        env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION",
-        requires = "otlp_ocsf_endpoint"
+        env = "OPENSHELL_SUPERVISOR_TELEMETRY",
+        default_value = "gateway",
+        value_parser = parse_supervisor_telemetry
     )]
-    otlp_ocsf_schema_version: Option<String>,
+    supervisor_telemetry: SupervisorTelemetry,
 
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
@@ -237,12 +246,18 @@ async fn main() -> Result<()> {
     let _tracing = openshell_otel::install_driver_tracing(
         openshell_driver_kubernetes::otel_tracing::TRACING,
         openshell_otel::DriverTracingConfig {
-            endpoint: args.otlp_endpoint.as_deref(),
+            endpoint: args.otlp.endpoint.as_deref(),
+            protocol: args.otlp.protocol.into(),
+            ca_file: args.otlp.ca_file.as_deref(),
+            cert_file: args.otlp.cert_file.as_deref(),
+            key_file: args.otlp.key_file.as_deref(),
             gateway_name: args.gateway_name.as_deref(),
             service_version: VERSION,
             log_level: &args.log_level,
+            ansi: openshell_core::color::stdout_ansi(),
         },
     );
+    args.otlp.warn_deprecated();
 
     let managed_ssh_gateway_pod_selector = args
         .managed_ssh_gateway_pod_selector
@@ -257,10 +272,16 @@ async fn main() -> Result<()> {
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
 
+    let (supervisor_telemetry, supervisor_otlp) = standalone_supervisor_telemetry(
+        args.supervisor_telemetry.clone(),
+        args.otlp.supervisor_otlp(),
+    )
+    .map_err(|err| miette::miette!("{err}"))?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let driver = KubernetesComputeDriver::new(
         KubernetesComputeConfig {
             supervisor_topology: None,
+            shared_supervisor: None,
             allow_driver_config: args.admission_config_json.allow_driver_config,
             resource_admission: args.admission_config_json.resource_admission.clone(),
             workspace_mode: args.workspace_mode,
@@ -286,8 +307,12 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(openshell_core::config::default_supervisor_image),
             supervisor_image_pull_policy: args.supervisor_image_pull_policy,
             sandbox_runtime: KubernetesSandboxRuntimeConfig {
+                app_listener:
+                    openshell_driver_kubernetes::config::KubernetesAppListenerConfig::default(),
                 boundary_port: args.sandbox_runtime_boundary_port,
             },
+            runtime_bootstrap_grace_seconds: args.runtime_bootstrap_grace_seconds,
+            sandbox_attach_request_timeout_seconds: args.sandbox_attach_request_timeout_seconds,
             https_proxy: args.https_proxy,
             no_proxy: args.no_proxy,
             proxy_auth_secret_name: args.proxy_auth_secret_name,
@@ -296,16 +321,11 @@ async fn main() -> Result<()> {
             proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
             proxy_ca_bundle: args.proxy_ca_bundle,
             grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
-            // The standalone driver takes the supervisors' endpoints from its own flags.
-            supervisor_telemetry: openshell_driver_kubernetes::SupervisorTelemetry::Gateway,
-            supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
+            // The gateway hands a remote driver its collector material; this setting decides which
+            // supervisors receive it.
+            supervisor_telemetry,
+            supervisor_otlp,
             supervisor_gateway_name: args.gateway_name.clone(),
-            supervisor_ocsf_export: args.otlp_ocsf_endpoint.clone().map(|endpoint| {
-                openshell_core::sandbox_env::OcsfOtlpExport {
-                    endpoint,
-                    schema_version: args.otlp_ocsf_schema_version.clone(),
-                }
-            }),
             ssh_socket_path: args.sandbox_ssh_socket_path,
             client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
             host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
@@ -320,6 +340,10 @@ async fn main() -> Result<()> {
                 .unwrap_or_default(),
             default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
                 .unwrap_or_default(),
+            supervisor_runtime_class_name: std::env::var(
+                "OPENSHELL_K8S_SUPERVISOR_RUNTIME_CLASS_NAME",
+            )
+            .unwrap_or_default(),
             allowed_pod_annotations: args.allowed_pod_annotations,
             allowed_pod_labels: args.allowed_pod_labels,
             sa_token_ttl_secs: args.sa_token_ttl_secs,
@@ -330,11 +354,15 @@ async fn main() -> Result<()> {
             sandbox_gid: args.sandbox_gid,
         },
         shutdown_rx,
+        None,
     )
     .await
     .into_diagnostic()?;
 
-    let service = ComputeDriverServer::new(ComputeDriverService::new(driver));
+    let driver_service = ComputeDriverService::new(driver);
+    let configuration_updates_service = openshell_core::proto::compute::v1::compute_driver_configuration_updates_server::ComputeDriverConfigurationUpdatesServer::new(driver_service.clone());
+    let app_endpoints_service = openshell_core::proto::compute::v1::compute_driver_app_endpoints_server::ComputeDriverAppEndpointsServer::new(driver_service.clone());
+    let service = ComputeDriverServer::new(driver_service);
     let shutdown = async move {
         shutdown_signal().await;
         let _ = shutdown_tx.send(true);
@@ -348,6 +376,8 @@ async fn main() -> Result<()> {
         tonic::transport::Server::builder()
             .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
+            .add_service(configuration_updates_service)
+            .add_service(app_endpoints_service)
             .serve_with_incoming_shutdown(
                 openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
                 shutdown,
@@ -359,14 +389,75 @@ async fn main() -> Result<()> {
         tonic::transport::Server::builder()
             .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
+            .add_service(configuration_updates_service)
+            .add_service(app_endpoints_service)
             .serve_with_shutdown(args.bind_address, shutdown)
             .await
             .into_diagnostic()
     }
 }
 
+/// Parse `--supervisor-telemetry`: `gateway`, `off`, or a collector URL.
+fn parse_supervisor_telemetry(raw: &str) -> std::result::Result<SupervisorTelemetry, String> {
+    let telemetry = match raw.trim() {
+        "gateway" => SupervisorTelemetry::Gateway,
+        "off" => SupervisorTelemetry::Off,
+        endpoint => SupervisorTelemetry::Endpoint(endpoint.to_string()),
+    };
+    telemetry.validate()?;
+    Ok(telemetry)
+}
+
+/// The telemetry setting and exports this driver gives supervisors. The exports come from the driver's own
+/// `--otlp*` flags. With none, supervisors are treated as `off`, so they never hold the gateway's collector
+/// material with nothing to send it to; a separate endpoint with no export to carry is refused, not accepted
+/// silently.
+fn standalone_supervisor_telemetry(
+    setting: SupervisorTelemetry,
+    flags: SupervisorOtlp,
+) -> std::result::Result<(SupervisorTelemetry, SupervisorOtlp), String> {
+    let exports = setting.resolve(flags);
+    if !exports.is_empty() {
+        return Ok((setting, exports));
+    }
+    if matches!(setting, SupervisorTelemetry::Endpoint(_)) {
+        return Err(
+            "--supervisor-telemetry with a collector URL needs --otlp-endpoint, --otlp-ocsf-endpoint or --otlp-agent-endpoint to choose what supervisors export"
+                .into(),
+        );
+    }
+    Ok((SupervisorTelemetry::Off, exports))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_timeout_arguments_reject_invalid_values() {
+        let defaults = Args::try_parse_from(["openshell-driver-kubernetes"]).unwrap();
+        assert_eq!(defaults.runtime_bootstrap_grace_seconds, 300);
+        assert!(defaults.sandbox_attach_request_timeout_seconds.is_none());
+        for flag in [
+            "--runtime-bootstrap-grace-seconds",
+            "--sandbox-attach-request-timeout-seconds",
+        ] {
+            for value in ["0", "86401", "invalid"] {
+                assert!(
+                    Args::try_parse_from(["openshell-driver-kubernetes", flag, value]).is_err()
+                );
+            }
+            for value in ["1", "900", "86400"] {
+                let args =
+                    Args::try_parse_from(["openshell-driver-kubernetes", flag, value]).unwrap();
+                let seconds = value.parse::<u64>().unwrap();
+                if flag == "--runtime-bootstrap-grace-seconds" {
+                    assert_eq!(args.runtime_bootstrap_grace_seconds, seconds);
+                } else {
+                    assert_eq!(args.sandbox_attach_request_timeout_seconds, Some(seconds));
+                }
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -381,9 +472,60 @@ mod tests {
         .expect("OTLP endpoint should parse");
 
         assert_eq!(
-            args.otlp_endpoint.as_deref(),
+            args.otlp.endpoint.as_deref(),
             Some("http://collector.example:4317")
         );
         assert_eq!(args.gateway_name.as_deref(), Some("kubernetes-dev"));
+    }
+
+    fn supervisor_telemetry_from(
+        flags: &[&str],
+    ) -> std::result::Result<(SupervisorTelemetry, SupervisorOtlp), String> {
+        let args = Args::try_parse_from(
+            std::iter::once("openshell-driver-kubernetes").chain(flags.iter().copied()),
+        )
+        .map_err(|error| error.to_string())?;
+        standalone_supervisor_telemetry(args.supervisor_telemetry, args.otlp.supervisor_otlp())
+    }
+
+    #[test]
+    fn standalone_supervisors_get_collector_material_only_when_exporting_to_the_gateway_collector()
+    {
+        let collector = ["--otlp-endpoint", "http://collector.example:4317"];
+
+        let (telemetry, exports) = supervisor_telemetry_from(&collector).unwrap();
+        assert!(telemetry.uses_gateway_collector());
+        assert_eq!(
+            exports.traces.map(|export| export.endpoint).as_deref(),
+            Some("http://collector.example:4317")
+        );
+
+        let off = [&collector[..], &["--supervisor-telemetry", "off"]].concat();
+        let (telemetry, exports) = supervisor_telemetry_from(&off).unwrap();
+        assert_eq!(telemetry, SupervisorTelemetry::Off);
+        assert!(exports.is_empty());
+
+        let separate = [
+            &collector[..],
+            &["--supervisor-telemetry", "http://192.0.2.10:4317"],
+        ]
+        .concat();
+        let (telemetry, exports) = supervisor_telemetry_from(&separate).unwrap();
+        assert!(!telemetry.uses_gateway_collector());
+        assert_eq!(
+            exports.traces.map(|export| export.endpoint).as_deref(),
+            Some("http://192.0.2.10:4317")
+        );
+
+        // No export: the default `gateway` setting withholds the collector material.
+        let (telemetry, exports) = supervisor_telemetry_from(&[]).unwrap();
+        assert_eq!(telemetry, SupervisorTelemetry::Off);
+        assert!(exports.is_empty());
+
+        let lonely =
+            supervisor_telemetry_from(&["--supervisor-telemetry", "http://192.0.2.10:4317"])
+                .unwrap_err();
+        assert!(lonely.contains("--otlp-endpoint"), "{lonely}");
+        assert!(supervisor_telemetry_from(&["--supervisor-telemetry", "elsewhere"]).is_err());
     }
 }

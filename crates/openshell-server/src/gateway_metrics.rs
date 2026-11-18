@@ -23,6 +23,8 @@ use tonic::{Code, Status};
 
 // Gauges
 pub const SUPERVISOR_SESSIONS: &str = "openshell_server_supervisor_sessions";
+pub const SUPERVISOR_HOSTS: &str = "openshell_server_supervisor_hosts";
+pub const SUPERVISOR_HOST_INSTANCES_MAX: &str = "openshell_server_supervisor_host_instances_max";
 pub const RELAY_PENDING: &str = "openshell_server_relay_pending";
 pub const RELAY_PENDING_CAPACITY: &str = "openshell_server_relay_pending_capacity";
 pub const MUTATION_LOCK_CONNECTIONS_IN_USE: &str =
@@ -35,6 +37,8 @@ pub const RELAY_EXPIRED_TOTAL: &str = "openshell_server_relay_expired_total";
 pub const ROUTED_REQUEST_ATTEMPTS_TOTAL: &str = "openshell_server_routed_request_attempts_total";
 pub const MUTATION_LOCK_TIMEOUTS_TOTAL: &str = "openshell_server_mutation_lock_timeouts_total";
 pub const MUTATION_LOCK_ERRORS_TOTAL: &str = "openshell_server_mutation_lock_errors_total";
+pub const PROVISIONING_DEADLINE_SKIPS_TOTAL: &str =
+    "openshell_server_provisioning_deadline_skips_total";
 // Histograms (explicit buckets, see BUCKETED_HISTOGRAMS)
 pub const RELAY_CLAIM_DURATION_SECONDS: &str = "openshell_server_relay_claim_duration_seconds";
 pub const PEER_REQUEST_DURATION_SECONDS: &str = "openshell_server_peer_request_duration_seconds";
@@ -52,6 +56,7 @@ const LABEL_GRPC_CODE: &str = "grpc_code";
 const LABEL_RELAY_KIND: &str = "relay_kind";
 const LABEL_ROUTE: &str = "route";
 const LABEL_SCOPE: &str = "scope";
+const LABEL_OVERDUE: &str = "overdue";
 
 /// Buckets for the new latency histograms, 1 ms to 15 s. The top buckets cover the 10 s relay
 /// claim and lock timeouts and the 15 s routed-relay wait.
@@ -260,6 +265,16 @@ pub fn describe_and_initialize(relay: RelayCapacity, mutation_lock_connections: 
         "Supervisor control sessions registered on this gateway replica."
     );
     describe_gauge!(
+        SUPERVISOR_HOSTS,
+        Unit::Count,
+        "Shared supervisors whose assignment streams this gateway replica serves."
+    );
+    describe_gauge!(
+        SUPERVISOR_HOST_INSTANCES_MAX,
+        Unit::Count,
+        "Most sandbox instances placed on one shared supervisor this gateway replica serves."
+    );
+    describe_gauge!(
         RELAY_PENDING,
         Unit::Count,
         "Relay channels on this replica waiting for the supervisor to connect back, including channels opened for peer replicas."
@@ -294,6 +309,11 @@ pub fn describe_and_initialize(relay: RelayCapacity, mutation_lock_connections: 
         Unit::Count,
         "Mutation lock acquisitions that failed without timing out, such as a lock connection PostgreSQL did not open."
     );
+    describe_counter!(
+        PROVISIONING_DEADLINE_SKIPS_TOTAL,
+        Unit::Count,
+        "Times the provisioning deadline scan skipped a sandbox because its local mutation locks were busy."
+    );
     describe_histogram!(
         RELAY_CLAIM_DURATION_SECONDS,
         Unit::Seconds,
@@ -327,6 +347,8 @@ pub fn describe_and_initialize(relay: RelayCapacity, mutation_lock_connections: 
 
     // `increment(0)` registers a series without overwriting a value recorded earlier.
     gauge!(SUPERVISOR_SESSIONS).increment(0.0);
+    gauge!(SUPERVISOR_HOSTS).increment(0.0);
+    gauge!(SUPERVISOR_HOST_INSTANCES_MAX).increment(0.0);
     gauge!(RELAY_PENDING).increment(0.0);
     gauge!(RELAY_PENDING_CAPACITY).set(count_as_f64(relay.per_replica));
     for kind in RelayKind::ALL {
@@ -349,6 +371,10 @@ pub fn describe_and_initialize(relay: RelayCapacity, mutation_lock_connections: 
     for scope in LockScope::ALL {
         counter!(MUTATION_LOCK_TIMEOUTS_TOTAL, LABEL_SCOPE => scope.label()).increment(0);
         counter!(MUTATION_LOCK_ERRORS_TOTAL, LABEL_SCOPE => scope.label()).increment(0);
+    }
+    for overdue in [false, true] {
+        counter!(PROVISIONING_DEADLINE_SKIPS_TOTAL, LABEL_OVERDUE => overdue_label(overdue))
+            .increment(0);
     }
     if let Some(capacity) = mutation_lock_connections {
         describe_gauge!(
@@ -421,6 +447,11 @@ impl Drop for GaugeSlot {
     }
 }
 
+pub fn record_supervisor_hosts(hosts: usize, most_instances: usize) {
+    gauge!(SUPERVISOR_HOSTS).set(count_as_f64(hosts));
+    gauge!(SUPERVISOR_HOST_INSTANCES_MAX).set(count_as_f64(most_instances));
+}
+
 pub fn record_relay_rejected(reason: RelayRejection) {
     counter!(RELAY_REJECTED_TOTAL, LABEL_REASON => reason.label()).increment(1);
 }
@@ -461,6 +492,17 @@ pub fn record_lock_timeout(scope: LockScope) {
 /// acquisition is not counted.
 pub fn record_lock_error(scope: LockScope) {
     counter!(MUTATION_LOCK_ERRORS_TOTAL, LABEL_SCOPE => scope.label()).increment(1);
+}
+
+/// The provisioning deadline scan skipped a sandbox whose local mutation locks stayed busy. An
+/// `overdue` sandbox was already past its deadline, so the skip delays its expiry.
+pub fn record_provisioning_deadline_skip(overdue: bool) {
+    counter!(PROVISIONING_DEADLINE_SKIPS_TOTAL, LABEL_OVERDUE => overdue_label(overdue))
+        .increment(1);
+}
+
+const fn overdue_label(overdue: bool) -> &'static str {
+    if overdue { "true" } else { "false" }
 }
 
 /// Counts one local relay setup or outbound peer attempt exactly once, and times peer requests.
@@ -619,6 +661,8 @@ mod tests {
             ("openshell_server_mutation_lock_connections_capacity", 4),
             ("openshell_server_mutation_lock_connections_in_use", 0),
             ("openshell_server_supervisor_sessions", 0),
+            ("openshell_server_supervisor_hosts", 0),
+            ("openshell_server_supervisor_host_instances_max", 0),
             ("openshell_server_relay_pending", 0),
             (
                 "openshell_server_relay_rejected_total{reason=\"replica_capacity\"}",
@@ -651,6 +695,14 @@ mod tests {
             ),
             (
                 "openshell_server_mutation_lock_errors_total{scope=\"sandbox\"}",
+                0,
+            ),
+            (
+                "openshell_server_provisioning_deadline_skips_total{overdue=\"false\"}",
+                0,
+            ),
+            (
+                "openshell_server_provisioning_deadline_skips_total{overdue=\"true\"}",
                 0,
             ),
         ] {

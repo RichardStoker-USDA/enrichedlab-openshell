@@ -46,6 +46,8 @@ pub(crate) struct PublishRequest {
     pub(crate) allocation_identity: [u8; 32],
     pub(crate) policy_generation: u64,
     pub(crate) ttl: Duration,
+    /// Authored ports eligible for refresh, before DNS address filtering.
+    pub(crate) eligible_ports: BTreeSet<u16>,
     pub(crate) contracts: Vec<ResolvedPortContract>,
 }
 
@@ -59,6 +61,7 @@ pub(crate) struct ResolvedEndpointRecord {
     pub(crate) mapping_id: Uuid,
     pub(crate) created_at: Instant,
     pub(crate) expires_at: Instant,
+    pub(crate) eligible_ports: BTreeSet<u16>,
     pub(crate) contracts: Vec<ResolvedPortContract>,
 }
 
@@ -84,15 +87,26 @@ pub(crate) struct MappingLookup {
 }
 
 impl MappingLookup {
-    pub(crate) fn pinned_addresses(&self) -> Vec<IpAddr> {
+    /// Select only contracts authorized for this process and destination port.
+    pub(crate) fn pinned_addresses_for(
+        &self,
+        endpoint_ids: &[PolicyEndpointId],
+    ) -> Result<Vec<IpAddr>, MappingLookupError> {
         let mut seen = HashSet::new();
-        self.record
+        let addresses = self
+            .record
             .contracts
             .iter()
-            .filter(|contract| contract.port == self.port)
+            .filter(|contract| {
+                contract.port == self.port && endpoint_ids.contains(&contract.endpoint_id)
+            })
             .flat_map(|contract| contract.pinned_addresses.iter().copied())
             .filter(|address| seen.insert(*address))
-            .collect()
+            .collect::<Vec<_>>();
+        if addresses.is_empty() {
+            return Err(MappingLookupError::EndpointMismatch);
+        }
+        Ok(addresses)
     }
 
     pub(crate) fn endpoint_ids(&self) -> impl Iterator<Item = &PolicyEndpointId> {
@@ -112,18 +126,7 @@ impl MappingLookup {
         &self,
         endpoint_id: &PolicyEndpointId,
     ) -> Result<UpstreamConnector, MappingLookupError> {
-        let mut seen = HashSet::new();
-        let addresses = self
-            .record
-            .contracts
-            .iter()
-            .filter(|contract| contract.port == self.port && &contract.endpoint_id == endpoint_id)
-            .flat_map(|contract| contract.pinned_addresses.iter().copied())
-            .filter(|address| seen.insert(*address))
-            .collect::<Vec<_>>();
-        if addresses.is_empty() {
-            return Err(MappingLookupError::EndpointMismatch);
-        }
+        let addresses = self.pinned_addresses_for(std::slice::from_ref(endpoint_id))?;
         let plan = build_pinned_validation_plan(addresses)
             .map_err(|_| MappingLookupError::InvalidMapping)?;
         validate_destination(DestinationRequest {
@@ -260,13 +263,14 @@ struct Publication {
     key: AllocationKey,
     policy_generation: u64,
     ttl: Duration,
+    eligible_ports: BTreeSet<u16>,
     contracts: Vec<ResolvedPortContract>,
 }
 
 struct StoreState {
     records: BTreeMap<IpAddr, ResolvedEndpointRecord>,
     allocations: BTreeMap<AllocationKey, IpAddr>,
-    expired_allocations: BTreeSet<IpAddr>,
+    expired_allocations: BTreeMap<IpAddr, ResolvedEndpointRecord>,
     next_ipv4: u32,
     end_ipv4: u32,
     next_ipv6: u128,
@@ -291,7 +295,7 @@ impl ResolvedEndpointStore {
             state: RwLock::new(StoreState {
                 records: BTreeMap::new(),
                 allocations: BTreeMap::new(),
-                expired_allocations: BTreeSet::new(),
+                expired_allocations: BTreeMap::new(),
                 next_ipv4,
                 end_ipv4,
                 next_ipv6,
@@ -304,6 +308,34 @@ impl ResolvedEndpointStore {
         }
     }
 
+    /// Recover refresh identity without authorizing expired upstream addresses.
+    pub(super) fn expired_for_connect(
+        &self,
+        address: IpAddr,
+        port: u16,
+        generation: u64,
+    ) -> Result<ResolvedEndpointRecord, MappingLookupError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| MappingLookupError::LockPoisoned)?;
+        let record = state
+            .records
+            .get(&address)
+            .or_else(|| state.expired_allocations.get(&address))
+            .ok_or(MappingLookupError::Missing)?;
+        if record.policy_generation != generation {
+            return Err(MappingLookupError::StalePolicy);
+        }
+        if record.is_observation() {
+            return Err(MappingLookupError::Expired);
+        }
+        if !record.eligible_ports.contains(&port) {
+            return Err(MappingLookupError::PortMismatch);
+        }
+        Ok(record.clone())
+    }
+
     pub(crate) fn publish(
         &self,
         request: PublishRequest,
@@ -314,9 +346,11 @@ impl ResolvedEndpointStore {
             return Err(PublishError::StalePolicy);
         }
         if request.ttl.is_zero()
+            || request.eligible_ports.contains(&0)
             || request.contracts.is_empty()
             || request.contracts.iter().any(|contract| {
                 contract.port == 0
+                    || !request.eligible_ports.contains(&contract.port)
                     || contract.pinned_addresses.is_empty()
                     || contract
                         .pinned_addresses
@@ -336,6 +370,7 @@ impl ResolvedEndpointStore {
                 },
                 policy_generation: request.policy_generation,
                 ttl: request.ttl,
+                eligible_ports: request.eligible_ports,
                 contracts: request.contracts,
             },
             now,
@@ -365,6 +400,7 @@ impl ResolvedEndpointStore {
                 },
                 policy_generation,
                 ttl: super::MAX_MAPPING_TTL,
+                eligible_ports: BTreeSet::new(),
                 contracts: Vec::new(),
             },
             now,
@@ -390,6 +426,7 @@ impl ResolvedEndpointStore {
             key,
             policy_generation,
             ttl,
+            eligible_ports,
             contracts,
         } = publication;
         let family = key.family;
@@ -433,7 +470,7 @@ impl ResolvedEndpointStore {
             if allocated.saturating_mul(5) >= capacity.saturating_mul(4)
                 && !emitted.swap(true, Ordering::Relaxed)
             {
-                openshell_ocsf::ocsf_emit!(build_pool_high_water_event(
+                crate::telemetry::egress_emit!(build_pool_high_water_event(
                     allocated, capacity, family,
                 ));
             }
@@ -461,6 +498,7 @@ impl ResolvedEndpointStore {
             mapping_id: Uuid::new_v4(),
             created_at: now,
             expires_at: now + ttl,
+            eligible_ports,
             contracts,
         };
         state.expired_allocations.remove(&synthetic_address);
@@ -534,8 +572,9 @@ impl ResolvedEndpointStore {
             .filter_map(|(address, record)| (now >= record.expires_at).then_some(*address))
             .collect::<Vec<_>>();
         for address in &expired {
-            state.records.remove(address);
-            state.expired_allocations.insert(*address);
+            if let Some(record) = state.records.remove(address) {
+                state.expired_allocations.insert(*address, record);
+            }
         }
         Ok(expired.len())
     }
@@ -548,7 +587,7 @@ fn live_record(
     now: Instant,
 ) -> Result<&ResolvedEndpointRecord, MappingLookupError> {
     let Some(record) = state.records.get(&synthetic_address) else {
-        return if state.expired_allocations.contains(&synthetic_address) {
+        return if state.expired_allocations.contains_key(&synthetic_address) {
             Err(MappingLookupError::Expired)
         } else {
             Err(MappingLookupError::Missing)
@@ -622,6 +661,7 @@ mod tests {
             allocation_identity: [1; 32],
             policy_generation: generation,
             ttl,
+            eligible_ports: BTreeSet::from([5432]),
             contracts: vec![ResolvedPortContract {
                 endpoint_id: PolicyEndpointId {
                     policy_name: "database".to_string(),
@@ -735,7 +775,10 @@ mod tests {
             .lookup_intent(observed.synthetic_address, 443, 1, now)
             .unwrap();
         assert_eq!(intent.record.normalized_name.as_str(), "unknown.example");
-        assert!(intent.pinned_addresses().is_empty());
+        assert!(matches!(
+            intent.pinned_addresses_for(&[]),
+            Err(MappingLookupError::EndpointMismatch)
+        ));
         assert!(matches!(
             store.lookup_intent(observed.synthetic_address, 443, 2, now),
             Err(MappingLookupError::StalePolicy)
@@ -1019,6 +1062,55 @@ mod tests {
         let endpoint = lookup.endpoint_ids().next().unwrap().clone();
         let connector = lookup.connector_for(&endpoint).await.unwrap();
         assert_eq!(connector.addrs(), &["203.0.113.8:5432".parse().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn endpoint_selection_unions_authorized_contracts_only_and_binds_connector() {
+        let store = store(1);
+        let now = Instant::now();
+        let mut request = request("must-not-resolve.invalid", 1, Duration::from_secs(5));
+        let first = request.contracts[0].clone();
+        let mut second = first.clone();
+        second.endpoint_id.endpoint_index = 1;
+        second.pinned_addresses = vec!["203.0.113.9".parse().unwrap(), first.pinned_addresses[0]];
+        let mut unrelated = first.clone();
+        unrelated.endpoint_id.policy_name = "other-binary".to_string();
+        unrelated.pinned_addresses = vec!["10.2.3.4".parse().unwrap()];
+        let mut other_port = second.clone();
+        other_port.port = 443;
+        other_port.pinned_addresses = vec!["203.0.113.10".parse().unwrap()];
+        request.eligible_ports.insert(443);
+        request
+            .contracts
+            .extend([second.clone(), unrelated.clone(), other_port]);
+        let record = store.publish(request, 1, now).unwrap();
+        let lookup = store
+            .lookup(record.synthetic_address, 5432, 1, now)
+            .unwrap();
+        assert_eq!(
+            lookup
+                .pinned_addresses_for(&[first.endpoint_id.clone(), second.endpoint_id])
+                .unwrap(),
+            [
+                "203.0.113.8".parse::<IpAddr>().unwrap(),
+                "203.0.113.9".parse().unwrap()
+            ]
+        );
+        let connector = lookup.connector_for(&first.endpoint_id).await.unwrap();
+        assert_eq!(connector.addrs(), &["203.0.113.8:5432".parse().unwrap()]);
+        assert!(matches!(
+            lookup
+                .connector_for(&PolicyEndpointId {
+                    policy_name: "absent".to_string(),
+                    endpoint_index: 0
+                })
+                .await,
+            Err(MappingLookupError::EndpointMismatch)
+        ));
+        assert!(matches!(
+            lookup.pinned_addresses_for(&[]),
+            Err(MappingLookupError::EndpointMismatch)
+        ));
     }
 
     #[tokio::test]

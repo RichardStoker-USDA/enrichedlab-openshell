@@ -2,24 +2,31 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! OCSF security events for gateway authentication and authorization
-//! outcomes.
+//! outcomes, and for the state changes users and operators request.
 //!
 //! Events carry a low-cardinality reason category, never presented
 //! credentials, raw verification errors, or request bodies.
 
 use openshell_ocsf::{
     ActionId, ActivityId, ApiActivityBuilder, AuthProtocolId, AuthenticationBuilder, ConfidenceId,
-    DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo, HttpMethod, HttpRequest,
-    ResourceDetails, Service, SeverityId, StatusId, Url, User, UserTypeId, ocsf_emit,
+    DetectionFindingBuilder, DispositionId, Endpoint, EventContext, FindingInfo, HttpMethod,
+    HttpRequest, ResourceDetails, Service, SeverityId, StatusId, Url, User, UserTypeId, ocsf_emit,
 };
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
+use tonic::{Code, Status};
 
 use super::identity::IdentityProvider;
 use super::principal::{Principal, SandboxIdentitySource};
+use crate::grpc::mutation_replay::REPLAYED_HEADER;
+
+pub mod catalog;
+#[cfg(test)]
+pub mod test_support;
 
 /// Where a gateway connection came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,21 +67,7 @@ impl RequestOrigin {
     }
 }
 
-use super::authenticator::{AuthFailureReason, AuthMechanism, bearer_credential};
-
-fn category(reason: AuthFailureReason) -> &'static str {
-    match reason {
-        AuthFailureReason::MissingCredential => "missing_credential",
-        AuthFailureReason::ConflictingCredentials => "conflicting_credentials",
-        AuthFailureReason::MalformedCredential => "malformed_credential",
-        AuthFailureReason::InvalidCredential => "invalid_credential",
-        AuthFailureReason::ExpiredCredential => "expired_credential",
-        AuthFailureReason::AudienceOrIssuerMismatch => "audience_or_issuer_mismatch",
-        AuthFailureReason::UnknownIdentity => "unknown_identity",
-        AuthFailureReason::StaleIdentity => "stale_identity",
-        AuthFailureReason::IdentityProviderUnavailable => "identity_provider_unavailable",
-    }
-}
+use super::authenticator::{AuthFailureReason, AuthMechanism, AuthRejection, bearer_credential};
 
 fn severity(reason: AuthFailureReason) -> SeverityId {
     match reason {
@@ -91,17 +84,37 @@ fn severity(reason: AuthFailureReason) -> SeverityId {
     }
 }
 
-fn with_protocol(
-    builder: AuthenticationBuilder<'_>,
-    mechanism: AuthMechanism,
-) -> AuthenticationBuilder<'_> {
-    match mechanism {
-        AuthMechanism::Oidc => builder.auth_protocol(AuthProtocolId::OpenId),
-        AuthMechanism::Mtls => builder.auth_protocol_other("mtls"),
-        AuthMechanism::SandboxJwt => builder.auth_protocol_other("sandbox_jwt"),
-        AuthMechanism::ComputeDriver => builder.auth_protocol_other("compute_driver"),
-        AuthMechanism::GatewayPeer => builder.auth_protocol_other("k8s_service_account"),
+/// The request to `path` as an OCSF HTTP request; gRPC calls are POSTs.
+fn post(path: &str) -> HttpRequest {
+    HttpRequest {
+        http_method: HttpMethod::Post,
+        url: Some(Url::from_path(path)),
     }
+}
+
+/// An Authentication event for `user`'s request to `path` from `origin`,
+/// naming the protocol of `mechanism` when known.
+fn authentication<'a>(
+    ctx: &'a EventContext,
+    path: &str,
+    origin: &RequestOrigin,
+    user: User,
+    mechanism: Option<AuthMechanism>,
+) -> AuthenticationBuilder<'a> {
+    let mut builder = AuthenticationBuilder::new(ctx, user, Service::new("openshell-gateway"))
+        .http_request(post(path));
+    match mechanism {
+        Some(AuthMechanism::Oidc) => builder = builder.auth_protocol(AuthProtocolId::OpenId),
+        Some(mechanism) => builder = builder.auth_protocol_other(mechanism.as_str()),
+        None => {}
+    }
+    if let Some(source) = origin.source {
+        builder = builder.src_endpoint(source.endpoint());
+    }
+    if let Some(request_id) = &origin.request_id {
+        builder = builder.correlation_uid(request_id);
+    }
+    builder
 }
 
 /// Emit an Authentication failure event for a gRPC request to `path`.
@@ -111,31 +124,42 @@ pub fn emit_authentication_failure(
     mechanism: Option<AuthMechanism>,
     reason: AuthFailureReason,
 ) {
+    authentication_failure(path, origin, User::unidentified(), mechanism, reason);
+}
+
+/// Emit an Authentication failure event for a credential that a handler
+/// verifies itself, returning the status that refuses the current request.
+///
+/// The event names `principal`, the caller the router established from a
+/// separate credential, or leaves the user unidentified when the rejected
+/// credential is the one that named the caller.
+pub fn reject_credential(principal: Option<&Principal>, rejection: AuthRejection) -> Status {
+    let (path, origin) = current_request();
+    authentication_failure(
+        &path,
+        &origin,
+        principal.map_or_else(User::unidentified, principal_user),
+        Some(rejection.mechanism),
+        rejection.reason,
+    );
+    rejection.status
+}
+
+fn authentication_failure(
+    path: &str,
+    origin: &RequestOrigin,
+    user: User,
+    mechanism: Option<AuthMechanism>,
+    reason: AuthFailureReason,
+) {
     let ctx = crate::gateway_ocsf::context("", "");
-    let mut builder = AuthenticationBuilder::new(
-        &ctx,
-        User::unidentified(),
-        Service::new("openshell-gateway"),
-    )
-    .action(ActionId::Denied)
-    .disposition(DispositionId::Blocked)
-    .severity(severity(reason))
-    .status(StatusId::Failure)
-    .status_detail(category(reason))
-    .http_request(HttpRequest {
-        http_method: HttpMethod::Post,
-        url: Some(Url::from_path(path)),
-    })
-    .message(format!("authentication failed: {}", category(reason)));
-    if let Some(mechanism) = mechanism {
-        builder = with_protocol(builder, mechanism);
-    }
-    if let Some(source) = origin.source {
-        builder = builder.src_endpoint(source.endpoint());
-    }
-    if let Some(request_id) = &origin.request_id {
-        builder = builder.correlation_uid(request_id);
-    }
+    let builder = authentication(&ctx, path, origin, user, mechanism)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(severity(reason))
+        .status(StatusId::Failure)
+        .status_detail(reason.as_str())
+        .message(format!("authentication failed: {}", reason.as_str()));
     ocsf_emit!(builder.build());
 }
 
@@ -195,7 +219,10 @@ fn authenticated(principal: &Principal) -> bool {
     match principal {
         Principal::User(user) => user.identity.provider != IdentityProvider::LocalDev,
         Principal::Anonymous => false,
-        Principal::Operator(_) | Principal::Sandbox(_) | Principal::Peer(_) => true,
+        Principal::Operator(_)
+        | Principal::Sandbox(_)
+        | Principal::Peer(_)
+        | Principal::Supervisor(_) => true,
     }
 }
 
@@ -213,6 +240,7 @@ fn mechanism(principal: &Principal) -> Option<AuthMechanism> {
             SandboxIdentitySource::ComputeDriver { .. } => AuthMechanism::ComputeDriver,
         }),
         Principal::Peer(_) => Some(AuthMechanism::GatewayPeer),
+        Principal::Supervisor(_) => Some(AuthMechanism::SupervisorToken),
         Principal::Anonymous => None,
     }
 }
@@ -227,26 +255,55 @@ fn credential_digest(
     headers: &http::HeaderMap,
     peer_certificate_sha256: Option<&str>,
 ) -> Option<[u8; 32]> {
+    let credential = match principal {
+        Principal::Operator(operator) => operator.certificate_sha256.as_str(),
+        Principal::User(user) if user.identity.provider == IdentityProvider::Mtls => {
+            peer_certificate_sha256.unwrap_or_default()
+        }
+        _ => bearer_credential(headers).unwrap_or_default(),
+    };
+    digest(principal, None, credential)
+}
+
+/// A digest of `principal`, the mechanism when it is not the principal's
+/// own, and the credential, kept apart by separators.
+fn digest(
+    principal: &Principal,
+    mechanism: Option<AuthMechanism>,
+    credential: &str,
+) -> Option<[u8; 32]> {
     let mut material = principal.audit_actor().into_bytes();
     material.push(0);
-    match principal {
-        Principal::Operator(operator) => {
-            material.extend_from_slice(operator.certificate_sha256.as_bytes());
-        }
-        Principal::User(user) if user.identity.provider == IdentityProvider::Mtls => {
-            material.extend_from_slice(peer_certificate_sha256.unwrap_or_default().as_bytes());
-        }
-        _ => {
-            if let Some(token) = bearer_credential(headers) {
-                material.extend_from_slice(token.as_bytes());
-            }
-        }
+    if let Some(mechanism) = mechanism {
+        material.extend_from_slice(mechanism.as_str().as_bytes());
+        material.push(0);
     }
+    material.extend_from_slice(credential.as_bytes());
     openshell_crypto::sha256(&material).ok()
 }
 
+/// Whether the handler for `path` finishes verifying `principal`'s
+/// credential, and so records its logon itself once it accepts it: the
+/// recorded runtime of a compute-driver credential on `IssueSandboxToken`,
+/// and the lineage of a gateway JWT on `RefreshSandboxToken`. Other
+/// credentials are fully verified by the router.
+fn handler_verifies(path: &str, principal: &Principal) -> bool {
+    let Principal::Sandbox(sandbox) = principal else {
+        return false;
+    };
+    match sandbox.source {
+        SandboxIdentitySource::ComputeDriver { .. } => {
+            path == super::compute_driver::ISSUE_SANDBOX_TOKEN_PATH
+        }
+        SandboxIdentitySource::BootstrapJwt { .. } => {
+            path == super::sandbox_jwt::REFRESH_SANDBOX_TOKEN_PATH
+        }
+    }
+}
+
 /// Emit an Authentication logon event for a request to `path` that
-/// authenticated as `principal`, unless its credential is already logged on.
+/// authenticated as `principal`, unless its credential is already logged on
+/// or the handler finishes verifying it.
 ///
 /// `peer_certificate_sha256` fingerprints the connection's verified client
 /// certificate, which identifies an mTLS user's credential.
@@ -258,37 +315,56 @@ pub fn emit_logon(
     headers: &http::HeaderMap,
     peer_certificate_sha256: Option<&str>,
 ) {
-    // Without a digest the credential cannot be deduplicated, so it logs on.
-    if !authenticated(principal)
-        || credential_digest(principal, headers, peer_certificate_sha256)
-            .is_some_and(|digest| !logons.log_on(digest, Instant::now()))
+    if authenticated(principal)
+        && !handler_verifies(path, principal)
+        && logs_on(
+            logons,
+            credential_digest(principal, headers, peer_certificate_sha256),
+        )
     {
-        return;
+        logon(path, origin, principal, mechanism(principal));
     }
+}
+
+/// Emit an Authentication logon event for the current request once its
+/// handler has finished verifying `principal`'s credential, unless the
+/// credential is already logged on.
+pub fn emit_handler_logon(logons: &Logons, principal: &Principal, headers: &http::HeaderMap) {
+    if logs_on(logons, credential_digest(principal, headers, None)) {
+        let (path, origin) = current_request();
+        logon(&path, &origin, principal, mechanism(principal));
+    }
+}
+
+/// Emit an Authentication logon event for the SSH session `token` that a
+/// handler accepted from `principal`, unless it is already logged on.
+pub fn emit_ssh_session_logon(logons: &Logons, principal: &Principal, token: &str) {
+    let mechanism = AuthMechanism::SshSessionToken;
+    if logs_on(logons, digest(principal, Some(mechanism), token)) {
+        let (path, origin) = current_request();
+        logon(&path, &origin, principal, Some(mechanism));
+    }
+}
+
+/// Whether the credential with `digest` makes a new logon. Without a digest
+/// the credential cannot be deduplicated, so it logs on.
+fn logs_on(logons: &Logons, digest: Option<[u8; 32]>) -> bool {
+    digest.is_none_or(|digest| logons.log_on(digest, Instant::now()))
+}
+
+fn logon(
+    path: &str,
+    origin: &RequestOrigin,
+    principal: &Principal,
+    mechanism: Option<AuthMechanism>,
+) {
     let ctx = crate::gateway_ocsf::context("", "");
-    let mut builder = AuthenticationBuilder::new(
-        &ctx,
-        principal_user(principal),
-        Service::new("openshell-gateway"),
-    )
-    .action(ActionId::Allowed)
-    .disposition(DispositionId::Allowed)
-    .severity(SeverityId::Informational)
-    .status(StatusId::Success)
-    .http_request(HttpRequest {
-        http_method: HttpMethod::Post,
-        url: Some(Url::from_path(path)),
-    })
-    .message("authentication succeeded");
-    if let Some(mechanism) = mechanism(principal) {
-        builder = with_protocol(builder, mechanism);
-    }
-    if let Some(source) = origin.source {
-        builder = builder.src_endpoint(source.endpoint());
-    }
-    if let Some(request_id) = &origin.request_id {
-        builder = builder.correlation_uid(request_id);
-    }
+    let builder = authentication(&ctx, path, origin, principal_user(principal), mechanism)
+        .action(ActionId::Allowed)
+        .disposition(DispositionId::Allowed)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .message("authentication succeeded");
     ocsf_emit!(builder.build());
 }
 
@@ -301,6 +377,64 @@ tokio::task_local! {
 struct RequestContext {
     path: String,
     origin: RequestOrigin,
+    /// Set once a handler has emitted the request's authorization denial.
+    denied: Arc<AtomicBool>,
+    mutation: Arc<Mutex<Mutation>>,
+}
+
+impl RequestContext {
+    fn new(path: String, origin: RequestOrigin) -> Self {
+        Self {
+            path,
+            origin,
+            denied: Arc::default(),
+            mutation: Arc::default(),
+        }
+    }
+}
+
+/// What a state-changing request acted on and, when it succeeded without a
+/// plain change, how it ended.
+#[derive(Debug, Default)]
+struct Mutation {
+    resources: Vec<ResourceDetails>,
+    outcome: Option<Outcome>,
+}
+
+/// How a call that returned OK ended, when its response alone does not say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// A success detail, such as `no_op:already_absent`.
+    Detail(&'static str),
+    /// The gateway refused the request in its response body.
+    Rejected(Code),
+}
+
+/// Record that the current request's change acts on `resource`.
+pub fn record_target(resource: ResourceDetails) {
+    let _ = REQUEST.try_with(|request| {
+        lock(&request.mutation).resources.push(resource);
+    });
+}
+
+/// Change the resources recorded for the current request.
+pub fn amend_targets(amend: impl FnOnce(&mut Vec<ResourceDetails>)) {
+    let _ = REQUEST.try_with(|request| amend(&mut lock(&request.mutation).resources));
+}
+
+/// Record how the current request's change ended when its response alone
+/// does not say.
+pub fn record_outcome(outcome: Outcome) {
+    let _ = REQUEST.try_with(|request| lock(&request.mutation).outcome = Some(outcome));
+}
+
+/// A resource of `type_label` named by the caller, bounded in length.
+pub fn requested(type_label: &str, name: &str) -> ResourceDetails {
+    ResourceDetails::named(type_label, bounded(name))
+}
+
+fn lock(mutation: &Mutex<Mutation>) -> std::sync::MutexGuard<'_, Mutation> {
+    mutation.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Run a request handler so the authorization denials it raises are
@@ -311,8 +445,166 @@ struct RequestContext {
 /// polled are recorded without the request's path and origin.
 pub async fn with_request<F: Future>(path: String, origin: RequestOrigin, handler: F) -> F::Output {
     REQUEST
-        .scope(RequestContext { path, origin }, handler)
+        .scope(RequestContext::new(path, origin), handler)
         .await
+}
+
+/// Run a request handler as [`with_request`] does, then record the state
+/// change a user or operator `principal` attempted, unless the handler
+/// already recorded it as an authorization denial. A streamed response is
+/// recorded when its body ends, with the status in its trailers.
+pub async fn with_audited_request<E, F>(
+    path: String,
+    origin: RequestOrigin,
+    principal: &Principal,
+    handler: F,
+) -> Result<http::Response<tonic::body::Body>, E>
+where
+    F: Future<Output = Result<http::Response<tonic::body::Body>, E>>,
+{
+    let audited = matches!(principal, Principal::User(_) | Principal::Operator(_))
+        && catalog::lookup(&path).is_some();
+    if !audited {
+        return with_request(path, origin, handler).await;
+    }
+    let request = RequestContext::new(path, origin);
+    let pending = PendingMutation {
+        request: request.clone(),
+        principal: principal.clone(),
+        recorded: false,
+    };
+    match REQUEST.scope(request, handler).await {
+        Ok(response) => {
+            if response
+                .headers()
+                .get(REPLAYED_HEADER)
+                .is_some_and(|value| value == "true")
+            {
+                let mut mutation = lock(&pending.request.mutation);
+                if !matches!(mutation.outcome, Some(Outcome::Rejected(_))) {
+                    mutation.outcome = Some(Outcome::Detail("no_op:replayed"));
+                }
+            }
+            Ok(pending.follow(response))
+        }
+        Err(error) => {
+            pending.record(Some(Code::Unknown));
+            Err(error)
+        }
+    }
+}
+
+/// The record of a mutation, emitted once when the call ends, or as
+/// unfinished when it is dropped first, such as when its client
+/// disconnected. The change it started may still apply.
+struct PendingMutation {
+    request: RequestContext,
+    principal: Principal,
+    recorded: bool,
+}
+
+impl PendingMutation {
+    /// Record the call now when `response` ends it, or when its body does.
+    fn follow(
+        self,
+        response: http::Response<tonic::body::Body>,
+    ) -> http::Response<tonic::body::Body> {
+        if let Some(status) = Status::from_header_map(response.headers()) {
+            self.record(Some(status.code()));
+            return response;
+        }
+        if http_body::Body::is_end_stream(response.body()) {
+            self.record(Some(Code::Ok));
+            return response;
+        }
+        response.map(|body| {
+            tonic::body::Body::new(AuditedBody {
+                inner: body,
+                pending: Some(self),
+            })
+        })
+    }
+
+    fn record(mut self, code: Option<Code>) {
+        self.record_once(code);
+    }
+
+    fn record_once(&mut self, code: Option<Code>) {
+        if !std::mem::replace(&mut self.recorded, true)
+            && !self.request.denied.load(Ordering::Relaxed)
+        {
+            emit_mutation(&self.request, &self.principal, code);
+        }
+    }
+}
+
+impl Drop for PendingMutation {
+    fn drop(&mut self) {
+        self.record_once(None);
+    }
+}
+
+/// A streamed response body that records its mutation when it ends.
+struct AuditedBody {
+    inner: tonic::body::Body,
+    pending: Option<PendingMutation>,
+}
+
+impl AuditedBody {
+    fn record(&mut self, code: Code) {
+        if let Some(pending) = self.pending.take() {
+            pending.record(Some(code));
+        }
+    }
+}
+
+impl http_body::Body for AuditedBody {
+    type Data = bytes::Bytes;
+    type Error = Status;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        let code = match &polled {
+            std::task::Poll::Ready(Some(Ok(frame))) => frame
+                .trailers_ref()
+                .and_then(Status::from_header_map)
+                .map(|status| status.code()),
+            std::task::Poll::Ready(Some(Err(status))) => Some(status.code()),
+            std::task::Poll::Ready(None) => Some(Code::Ok),
+            std::task::Poll::Pending => None,
+        };
+        if let Some(code) = code {
+            self.record(code);
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for AuditedBody {
+    fn drop(&mut self) {
+        if http_body::Body::is_end_stream(&self.inner) {
+            self.record(Code::Ok);
+        }
+    }
+}
+
+/// The path and origin of the request a handler is serving, or empty
+/// values outside one.
+fn current_request() -> (String, RequestOrigin) {
+    REQUEST
+        .try_with(|request| (request.path.clone(), request.origin.clone()))
+        .unwrap_or_default()
 }
 
 /// Carry the current request's audit context into `future`, for work a
@@ -352,6 +644,9 @@ pub enum AuthzDenial<'a> {
     PlatformAdminRequired,
     /// The operation requires a verified mTLS operator.
     OperatorRequired,
+    /// A sandbox requested a credential for an extension service its policy
+    /// does not select.
+    ExtensionServiceNotSelected { service: &'a str },
 }
 
 impl AuthzDenial<'_> {
@@ -366,6 +661,7 @@ impl AuthzDenial<'_> {
             Self::InsufficientWorkspaceRole { .. } => "insufficient_workspace_role",
             Self::PlatformAdminRequired => "platform_admin_required",
             Self::OperatorRequired => "operator_required",
+            Self::ExtensionServiceNotSelected { .. } => "extension_service_not_selected",
         }
     }
 
@@ -381,6 +677,10 @@ impl AuthzDenial<'_> {
             | Self::InsufficientWorkspaceRole { workspace } => {
                 Some(ResourceDetails::named("workspace", bounded(workspace)))
             }
+            Self::ExtensionServiceNotSelected { service } => Some(ResourceDetails::named(
+                "extension_service",
+                bounded(service),
+            )),
             _ => None,
         }
     }
@@ -399,15 +699,15 @@ impl AuthzDenial<'_> {
     }
 }
 
-/// Longest request-supplied identifier recorded on an event.
-const MAX_REQUESTED_ID_LEN: usize = 128;
+/// Longest identifier recorded on an event.
+const MAX_ID_LEN: usize = 128;
 
-/// Cap a request-supplied identifier so a caller cannot inflate events.
+/// Cap an identifier so a caller cannot inflate events.
 fn bounded(value: &str) -> String {
-    if value.len() <= MAX_REQUESTED_ID_LEN {
+    if value.len() <= MAX_ID_LEN {
         return value.to_string();
     }
-    let mut end = MAX_REQUESTED_ID_LEN;
+    let mut end = MAX_ID_LEN;
     while !value.is_char_boundary(end) {
         end -= 1;
     }
@@ -421,17 +721,31 @@ fn principal_user(principal: &Principal) -> User {
         Principal::Operator(operator) => User::new(&operator.identity.subject, UserTypeId::Admin),
         Principal::Sandbox(sandbox) => User::other(&sandbox.sandbox_id, "Sandbox"),
         Principal::Peer(peer) => User::other(&peer.replica_id, "Gateway Peer"),
+        Principal::Supervisor(supervisor) => {
+            User::other(&supervisor.identity.subject, "Supervisor")
+        }
         Principal::Anonymous => User::unidentified(),
     }
 }
 
-/// Emit an authorization denial raised by a handler for the current request.
+/// Emit an authorization denial raised by a handler for the current request,
+/// naming the targets the request recorded.
 pub fn emit_authorization_denial(principal: &Principal, denial: AuthzDenial<'_>) {
-    let request = REQUEST.try_with(Clone::clone).ok();
-    let (path, origin) = request
-        .map(|request| (request.path, request.origin))
+    let (path, origin) = current_request();
+    let targets = REQUEST
+        .try_with(|request| {
+            request.denied.store(true, Ordering::Relaxed);
+            lock(&request.mutation).resources.clone()
+        })
         .unwrap_or_default();
-    emit_authorization_denial_for(&path, &origin, principal, denial);
+    emit_denial(&path, &origin, principal, denial, targets);
+}
+
+/// Emit an authorization denial raised by a handler for the current request,
+/// returning the status that refuses it with `message`.
+pub fn deny(principal: &Principal, denial: AuthzDenial<'_>, message: impl Into<String>) -> Status {
+    emit_authorization_denial(principal, denial);
+    Status::permission_denied(message)
 }
 
 /// Emit an API Activity denial for a gRPC request to `path`, paired with a
@@ -442,6 +756,16 @@ pub fn emit_authorization_denial_for(
     principal: &Principal,
     denial: AuthzDenial<'_>,
 ) {
+    emit_denial(path, origin, principal, denial, Vec::new());
+}
+
+fn emit_denial(
+    path: &str,
+    origin: &RequestOrigin,
+    principal: &Principal,
+    denial: AuthzDenial<'_>,
+    mut resources: Vec<ResourceDetails>,
+) {
     let ctx = crate::gateway_ocsf::context("", "");
     let category = denial.category();
     let finding = denial.is_boundary_violation(principal);
@@ -451,32 +775,17 @@ pub fn emit_authorization_denial_for(
         .request_id
         .clone()
         .or_else(|| finding.then(|| uuid::Uuid::new_v4().to_string()));
-    let (service, operation) = path
-        .strip_prefix('/')
-        .and_then(|path| path.split_once('/'))
-        .unwrap_or(("", "unknown"));
-
-    let mut builder = ApiActivityBuilder::new(&ctx, operation)
-        .actor_user(principal_user(principal))
-        .src_endpoint(origin.source.map_or_else(
-            || Endpoint::from_name("unknown"),
-            ConnectionSource::endpoint,
-        ))
+    let mut builder = api_activity(&ctx, path, origin, principal)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
         .severity(SeverityId::Medium)
         .status(StatusId::Failure)
         .status_detail(category)
         .message(format!("authorization denied: {category}"));
-    if !service.is_empty() {
-        builder = builder
-            .api_service(Service::new(service))
-            .http_request(HttpRequest {
-                http_method: HttpMethod::Post,
-                url: Some(Url::from_path(path)),
-            });
+    if let Some(resource) = denial.resource().filter(|r| !resources.contains(r)) {
+        resources.push(resource);
     }
-    if let Some(resource) = denial.resource() {
+    for resource in resources {
         builder = builder.resource(resource);
     }
     if let Some(uid) = &correlation_uid {
@@ -530,6 +839,127 @@ pub fn emit_authorization_denial_for(
         }
         ocsf_emit!(finding.build());
     }
+}
+
+/// An API Activity event for `principal`'s request to `path` from `origin`,
+/// naming the activity of a cataloged method.
+fn api_activity<'a>(
+    ctx: &'a EventContext,
+    path: &str,
+    origin: &RequestOrigin,
+    principal: &Principal,
+) -> ApiActivityBuilder<'a> {
+    let (service, operation) = path
+        .strip_prefix('/')
+        .and_then(|path| path.split_once('/'))
+        .unwrap_or(("", "unknown"));
+    let mut builder = ApiActivityBuilder::new(ctx, operation)
+        .actor_user(principal_user(principal))
+        .src_endpoint(origin.source.map_or_else(
+            || Endpoint::from_name("unknown"),
+            ConnectionSource::endpoint,
+        ));
+    if !service.is_empty() {
+        builder = builder
+            .api_service(Service::new(service))
+            .http_request(post(path));
+    }
+    if let Some(activity) = catalog::lookup(path) {
+        builder = builder.activity(activity);
+    }
+    builder
+}
+
+/// Most resources one mutation record lists.
+const MAX_RECORDED_RESOURCES: usize = 16;
+
+/// Emit the record of a mutation that ended with `code`, or that never
+/// finished when `code` is `None`.
+fn emit_mutation(request: &RequestContext, principal: &Principal, code: Option<Code>) {
+    let RequestContext { path, origin, .. } = request;
+    let mutation = std::mem::take(&mut *lock(&request.mutation));
+    let ctx = crate::gateway_ocsf::context("", "");
+    let mut builder = api_activity(&ctx, path, origin, principal);
+    let omitted = mutation
+        .resources
+        .len()
+        .saturating_sub(MAX_RECORDED_RESOURCES);
+    for resource in mutation.resources.into_iter().take(MAX_RECORDED_RESOURCES) {
+        builder = builder.resource(ResourceDetails {
+            name: resource.name.as_deref().map(bounded),
+            uid: resource.uid.as_deref().map(bounded),
+            ..resource
+        });
+    }
+    let code = code.map(|code| match mutation.outcome {
+        Some(Outcome::Rejected(rejected)) if code == Code::Ok => rejected,
+        _ => code,
+    });
+    let (severity, status, message, detail) = match code.map(failure) {
+        None => (
+            SeverityId::Medium,
+            StatusId::Unknown,
+            "mutation did not finish".to_string(),
+            Some("unknown:cancelled".to_string()),
+        ),
+        Some(None) => (
+            SeverityId::Informational,
+            StatusId::Success,
+            "mutation succeeded".to_string(),
+            match mutation.outcome {
+                Some(Outcome::Detail(detail)) => Some(detail.to_string()),
+                _ => None,
+            },
+        ),
+        Some(Some(failure)) => (
+            if failure.starts_with("rejected:") {
+                SeverityId::Low
+            } else {
+                SeverityId::Medium
+            },
+            StatusId::Failure,
+            format!("mutation failed: {failure}"),
+            Some(failure),
+        ),
+    };
+    let message = if omitted == 0 {
+        message
+    } else {
+        format!("{message}; {omitted} more resources not listed")
+    };
+    builder = builder.severity(severity).status(status).message(message);
+    if let Some(detail) = detail {
+        builder = builder.status_detail(detail);
+    }
+    if let Some(request_id) = &origin.request_id {
+        builder = builder.correlation_uid(request_id);
+    }
+    ocsf_emit!(builder.build());
+}
+
+/// The failure category for a gRPC `code`: `rejected:` when the gateway
+/// refused the request, `error:` when it could not complete it.
+fn failure(code: Code) -> Option<String> {
+    let (kind, name) = match code {
+        Code::Ok => return None,
+        Code::InvalidArgument => ("rejected", "invalid_argument"),
+        Code::NotFound => ("rejected", "not_found"),
+        Code::AlreadyExists => ("rejected", "already_exists"),
+        Code::PermissionDenied => ("rejected", "permission_denied"),
+        Code::FailedPrecondition => ("rejected", "failed_precondition"),
+        Code::Aborted => ("rejected", "aborted"),
+        Code::OutOfRange => ("rejected", "out_of_range"),
+        Code::Unauthenticated => ("rejected", "unauthenticated"),
+        Code::ResourceExhausted => ("rejected", "resource_exhausted"),
+        Code::Cancelled => ("error", "cancelled"),
+        Code::Unknown => ("error", "unknown"),
+        Code::DeadlineExceeded => ("error", "deadline_exceeded"),
+        Code::Unimplemented => ("error", "unimplemented"),
+        Code::Internal => ("error", "internal"),
+        Code::Unavailable => ("error", "unavailable"),
+        Code::DataLoss => ("error", "data_loss"),
+    };
+    Some(format!("{kind}:{name}"))
 }
 
 #[cfg(test)]
