@@ -6,7 +6,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use sha2::{Digest, Sha256};
 use tonic::transport::{Channel, Server};
 use tonic::{Code, Request, Response, Status};
 use tonic_types::{ErrorDetails, StatusExt};
@@ -207,13 +206,15 @@ async fn forwards_each_receipt_once_as_its_exact_bytes() {
     assert_eq!(sent.len(), 2);
     let (token, request) = sent
         .iter()
-        .find(|(_, request)| request.idempotency_key == idempotency_key(GATEWAY, "sandbox-a"))
+        .find(|(_, request)| {
+            request.idempotency_key == idempotency_key(GATEWAY, "sandbox-a").unwrap()
+        })
         .unwrap();
     assert_eq!(token, "Bearer first-token");
     assert_eq!(request.payload, first);
     assert_eq!(
         request.payload_sha256,
-        crate::store::hex(&Sha256::digest(&first))
+        crate::store::hex(&openshell_crypto::sha256(&first).unwrap())
     );
     assert_eq!(request.tenant_id, "site");
     assert_eq!(request.group_key, "operations");
@@ -306,7 +307,7 @@ async fn a_retry_after_a_lost_answer_returns_the_original_record() {
         }
     );
     let sent = h.sent();
-    let key = idempotency_key(GATEWAY, "sandbox-a");
+    let key = idempotency_key(GATEWAY, "sandbox-a").unwrap();
     assert_eq!(
         sent.iter()
             .filter(|(_, request)| request.idempotency_key == key)
@@ -412,8 +413,12 @@ async fn an_unreadable_token_sends_nothing() {
 
 #[test]
 fn idempotency_keys_fit_the_record_syntax_for_any_sandbox_id() {
+    assert_eq!(
+        idempotency_key("one", "a").unwrap(),
+        "receipt:53f9f86cb55c999698c3dd42e68b1331d89092e472b2dc13d140cc13b2d29634"
+    );
     for id in ["a", &"x".repeat(128)] {
-        let key = idempotency_key(GATEWAY, id);
+        let key = idempotency_key(GATEWAY, id).unwrap();
         assert!((8..=128).contains(&key.len()), "{key}");
         assert!(
             key.bytes()
@@ -421,7 +426,10 @@ fn idempotency_keys_fit_the_record_syntax_for_any_sandbox_id() {
             "{key}"
         );
     }
-    assert_ne!(idempotency_key("one", "a"), idempotency_key("two", "a"));
+    assert_ne!(
+        idempotency_key("one", "a").unwrap(),
+        idempotency_key("two", "a").unwrap()
+    );
 }
 
 #[test]
@@ -474,7 +482,7 @@ async fn a_receipt_that_cannot_be_sent_never_holds_back_the_ones_after_it() {
     let sent = h.sent();
     let sent_key = |id: &str| {
         sent.iter()
-            .any(|(_, request)| request.idempotency_key == idempotency_key(GATEWAY, id))
+            .any(|(_, request)| request.idempotency_key == idempotency_key(GATEWAY, id).unwrap())
     };
     assert!(sent_key("sandbox-1-digest-lost") && sent_key("sandbox-6-valid"));
     assert_eq!(
@@ -482,7 +490,7 @@ async fn a_receipt_that_cannot_be_sent_never_holds_back_the_ones_after_it() {
             .unwrap()
             .split_whitespace()
             .next(),
-        Some(crate::store::hex(&Sha256::digest(&lost_digest)).as_str())
+        Some(crate::store::hex(&openshell_crypto::sha256(&lost_digest).unwrap()).as_str())
     );
     assert_eq!(
         h.outcome("sandbox-2-garbled")["refused"]["reason"],
@@ -581,11 +589,8 @@ async fn sixty_four_unreadable_receipts_never_hold_back_the_next_one() {
             refused: 0
         }
     );
-    assert!(
-        h.sent().iter().any(
-            |(_, request)| request.idempotency_key == idempotency_key(GATEWAY, "sandbox-valid")
-        )
-    );
+    assert!(h.sent().iter().any(|(_, request)| request.idempotency_key
+        == idempotency_key(GATEWAY, "sandbox-valid").unwrap()));
     assert_eq!(h.store.outbox_len(), 64);
     for path in locked {
         fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();

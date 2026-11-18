@@ -17,7 +17,6 @@ use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use tonic::{Code, Request, Status};
 use tonic_types::StatusExt;
@@ -136,9 +135,12 @@ pub enum Pass {
 
 /// The idempotency key of a sandbox's receipt: stable for the gateway and sandbox, within the
 /// record's syntax whatever the id's length.
-pub fn idempotency_key(gateway: &str, sandbox_id: &str) -> String {
-    let digest = Sha256::digest(format!("{gateway}\n{sandbox_id}").as_bytes());
-    format!("receipt:{}", hex(&digest))
+pub fn idempotency_key(
+    gateway: &str,
+    sandbox_id: &str,
+) -> Result<String, openshell_crypto::CryptoError> {
+    let digest = openshell_crypto::sha256(format!("{gateway}\n{sandbox_id}").as_bytes())?;
+    Ok(format!("receipt:{}", hex(&digest)))
 }
 
 /// The receipt's source time: when its end was observed, at the record's microsecond precision.
@@ -306,7 +308,7 @@ async fn send(
         project_id: String::new(),
         run_id: String::new(),
         event_type: EVENT_TYPE.to_string(),
-        idempotency_key: idempotency_key(gateway, id),
+        idempotency_key: idempotency_key(gateway, id)?,
         source_time: Some(source_time),
         payload: bytes,
         payload_sha256: sha256,

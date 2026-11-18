@@ -213,6 +213,7 @@ wrappers = [
     "openshell-server",
     "pbkdf2",
     "rfc6979",
+    "rsa", # HMAC implementation used by the SSH dependency
     "russh",
     "sqlx-postgres",
     "ssh-key",

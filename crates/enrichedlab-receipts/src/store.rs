@@ -28,7 +28,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 
 use serde::{Serialize, de::DeserializeOwned};
-use sha2::{Digest, Sha256};
 
 /// Working records of one kind kept at once.
 pub const MAX_TRACKED: usize = 4096;
@@ -71,6 +70,8 @@ pub enum StoreError {
     Unreadable(PathBuf),
     #[error("{0} does not match its recorded SHA-256")]
     Digest(PathBuf),
+    #[error("receipt digest unavailable: {0}")]
+    Crypto(#[from] openshell_crypto::CryptoError),
     #[error("record cannot be encoded: {0}")]
     Encode(serde_json::Error),
 }
@@ -322,10 +323,10 @@ impl Store {
         if !path.exists() && self.full() && !self.tracked(id)? {
             return Err(StoreError::Full("receipt"));
         }
+        let sha256 = hex(&openshell_crypto::sha256(bytes)?);
         let written = if path.exists() || !publish_new(&path, &format!("{id}.json"), bytes)? {
             existing_receipt(id, path, &sidecar)?
         } else {
-            let sha256 = hex(&Sha256::digest(bytes));
             self.ledger().receipts += 1;
             replace_file(&sidecar, digest_line(&sha256, id).as_bytes())?;
             WrittenReceipt {
@@ -498,7 +499,7 @@ impl Store {
     pub fn read_receipt(&self, id: &str) -> Result<(Vec<u8>, String), StoreError> {
         let path = self.path("receipts", id)?;
         let bytes = read_bounded(&path)?.ok_or_else(|| StoreError::Unreadable(path.clone()))?;
-        let sha256 = hex(&Sha256::digest(&bytes));
+        let sha256 = hex(&openshell_crypto::sha256(&bytes)?);
         let sidecar = path.with_extension("json.sha256");
         let recorded = match fs::read_to_string(&sidecar) {
             Ok(recorded) => recorded,
@@ -657,7 +658,7 @@ fn existing_receipt(id: &str, path: PathBuf, sidecar: &Path) -> Result<WrittenRe
     if serde_json::from_slice::<serde::de::IgnoredAny>(&bytes).is_err() {
         return Err(StoreError::Unreadable(path));
     }
-    let sha256 = hex(&Sha256::digest(&bytes));
+    let sha256 = hex(&openshell_crypto::sha256(&bytes)?);
     match fs::read_to_string(sidecar) {
         Ok(recorded) => {
             if recorded.split_whitespace().next() != Some(sha256.as_str()) {
@@ -1014,7 +1015,10 @@ pub(crate) mod tests {
         let store = Store::open(&root).unwrap();
         let first = store.write_receipt("a", b"{\"a\":1}").unwrap();
         assert!(first.new);
-        assert_eq!(first.sha256, hex(&Sha256::digest(b"{\"a\":1}")));
+        assert_eq!(
+            first.sha256,
+            "015abd7f5cc57a2dd94b7590f04ad8084273905ee33ec5cebeae62276a97f862"
+        );
         let again = store.write_receipt("a", b"{\"a\":2}").unwrap();
         assert!(!again.new);
         assert_eq!(again.sha256, first.sha256);
