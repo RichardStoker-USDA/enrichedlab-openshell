@@ -8444,7 +8444,8 @@ fn reconcile_pinned_accounts(
             .position(|c| c["name"] == SANDBOX_BOOTSTRAP_CONTAINER_NAME)
             .ok_or("pinned accounts require the trusted bootstrap")?;
         let tool = pinned_account_tool(&inits[bootstrap], uid, gid);
-        inits.splice(bootstrap + 1..bootstrap + 1, [tool, init]);
+        let after_bootstrap = bootstrap + 1;
+        inits.splice(after_bootstrap..after_bootstrap, [tool, init]);
     }
     let volumes = spec["volumes"]
         .as_array_mut()
