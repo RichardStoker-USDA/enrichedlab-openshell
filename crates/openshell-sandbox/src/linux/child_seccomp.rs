@@ -506,6 +506,60 @@ mod tests {
     }
 
     #[test]
+    fn compiled_filter_checks_each_identity_argument() {
+        // Evaluate the actual program with synthetic seccomp_data words. This
+        // measures the filter's decision independently of Linux credential checks.
+        fn decision(filter: &ChildHardeningProgram, syscall: i64, arguments: [u32; 3]) -> u32 {
+            let mut words = [0_u32; 16];
+            words[0] = syscall_number(syscall).unwrap();
+            words[1] = native_audit_arch();
+            for (slot, argument) in arguments.into_iter().enumerate() {
+                words[4 + 2 * slot] = argument;
+            }
+            let mut accumulator = 0;
+            let mut pc = 0;
+            loop {
+                let op = &filter.instructions[pc];
+                pc += 1;
+                match op.code {
+                    BPF_LD_W_ABS => accumulator = words[usize::try_from(op.k / 4).unwrap()],
+                    BPF_JMP_JEQ_K | BPF_JMP_JSET_K => {
+                        let take = if op.code == BPF_JMP_JEQ_K {
+                            accumulator == op.k
+                        } else {
+                            accumulator & op.k != 0
+                        };
+                        pc += usize::from(if take { op.jt } else { op.jf });
+                    }
+                    BPF_RET_K => return op.k,
+                    _ => panic!("unknown child filter instruction: {op:?}", op = op.code),
+                }
+            }
+        }
+
+        let filter = prepare(std::process::id()).unwrap();
+        let (uid, gid) = fixed_process_identity().unwrap();
+        for (call, identity) in [(libc::SYS_setresuid, uid), (libc::SYS_setresgid, gid)] {
+            for mask in 0..8 {
+                let args = std::array::from_fn(|slot| {
+                    if mask & (1 << slot) == 0 {
+                        identity
+                    } else {
+                        u32::MAX
+                    }
+                });
+                assert_eq!(decision(&filter, call, args), SECCOMP_RET_ALLOW);
+            }
+            let other = if identity == 1 { 2 } else { 1 };
+            for slot in 0..3 {
+                let mut args = [u32::MAX; 3];
+                args[slot] = other;
+                assert_eq!(decision(&filter, call, args), errno(libc::EPERM).k);
+            }
+        }
+    }
+
+    #[test]
     fn filter_preserves_identity_but_denies_changes() {
         const PROBE_ENV: &str = "OPENSHELL_CHILD_SECCOMP_IDENTITY_PROBE";
         if std::env::var_os(PROBE_ENV).is_some() {
