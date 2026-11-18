@@ -80,6 +80,15 @@ conflict is listed here and checked by hand on every merge:
 - The workload child filter checks every scalar ID used by build tools and X server helpers. For supplementary groups,
   the workload listener verifies the caller's full group list and acknowledges a match without writing credentials.
   Standalone child filters deny group-list changes. Retest both paths when syncing [NVIDIA/OpenShell#4104](https://github.com/NVIDIA/OpenShell/pull/4104).
+- The non-root child filter permits a capability drop after confirming empty effective, permitted, inheritable and
+  bounding sets and setting no-new-privileges. The kernel checks the request against the calling thread's credentials.
+  Retest both the capability-free workload and the default-deny path on Linux.
+- An explicit sandbox UID or GID enables the `pinned-accounts` init after bootstrap. Admission policies that name
+  allowed initializers must include it. It runs as the workload identity from the same image. The workload gets
+  read-only passwd and group files on a per-Pod volume. Missing IDs use the name `agent` with a numeric suffix on
+  collision and home `/sandbox`. An existing numeric user keeps its name, home and shell and uses the pinned primary
+  group. Image files, supplementary groups and persistent workspace ownership are preserved. Image name service
+  must support local files. Check both default and custom workspaces when syncing the Kubernetes driver.
 - Stored launch material never carries material the gateway withholds: when supervisors export elsewhere, the
   supervisor pool removes it as it records, places or loads material (`launch_material_without_collector_headers`),
   and the Kubernetes driver removes it from a recovered shared generation's Secret. Material without collector fields

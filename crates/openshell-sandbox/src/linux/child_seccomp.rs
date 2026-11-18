@@ -47,6 +47,7 @@ const CLONE_NAMESPACE_FLAGS: u32 = (libc::CLONE_NEWCGROUP
 pub struct ChildHardeningProgram {
     instructions: Vec<libc::sock_filter>,
     setgroups_action: usize,
+    capset_action: usize,
 }
 
 impl ChildHardeningProgram {
@@ -57,6 +58,14 @@ impl ChildHardeningProgram {
     pub fn install(&mut self) -> io::Result<()> {
         mark_inherited_descriptors_close_on_exec()?;
         set_no_new_privileges()?;
+        // The kernel checks the calling thread's proposed credentials atomically.
+        // With empty sets, no new privileges and no way to enter a new user
+        // namespace, the only valid capset is a drop to the empty sets.
+        self.instructions[self.capset_action] = if capability_sets_are_empty() {
+            stmt(BPF_RET_K, SECCOMP_RET_ALLOW)
+        } else {
+            errno(libc::EPERM)
+        };
         // Only the production launch thread installs the listener that answers
         // setgroups without changing kernel credentials. Its children inherit
         // both the filter and the thread-local witness across fork.
@@ -190,7 +199,6 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
         libc::SYS_io_uring_setup,
         libc::SYS_io_uring_enter,
         libc::SYS_io_uring_register,
-        libc::SYS_capset,
         libc::SYS_setfsuid,
         libc::SYS_setfsgid,
         libc::SYS_sethostname,
@@ -203,6 +211,8 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
 
     append_unconditional_deny(&mut instructions, libc::SYS_setgroups)?;
     let setgroups_action = instructions.len() - 1;
+    append_unconditional_deny(&mut instructions, libc::SYS_capset)?;
+    let capset_action = instructions.len() - 1;
 
     // Helper launchers reset IDs before exec. Every supplied ID must be the
     // fixed identity, or -1 where Linux defines it as "leave unchanged".
@@ -277,6 +287,7 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
     Ok(ChildHardeningProgram {
         instructions,
         setgroups_action,
+        capset_action,
     })
 }
 
@@ -471,6 +482,31 @@ const fn jump(code: u16, value: u32, jt: u8, jf: u8) -> libc::sock_filter {
         jf,
         k: value,
     }
+}
+
+fn capability_sets_are_empty() -> bool {
+    if rustix::process::getuid().is_root() || rustix::process::geteuid().is_root() {
+        return false;
+    }
+    let Ok(caps) = rustix::thread::capabilities(None) else {
+        return false;
+    };
+    if !(caps.permitted.is_empty() && caps.effective.is_empty() && caps.inheritable.is_empty()) {
+        return false;
+    }
+    // Ambient bits must be both permitted and inheritable. Verify the entire
+    // bounding set too, including capability numbers unknown to this binary.
+    for bit in 0..=u64::BITS {
+        // SAFETY: PR_CAPBSET_READ takes a scalar capability number and no pointers.
+        match unsafe { libc::prctl(libc::PR_CAPBSET_READ, libc::c_ulong::from(bit), 0, 0, 0) } {
+            0 => {}
+            -1 => {
+                return bit > 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL);
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn set_no_new_privileges() -> io::Result<()> {
@@ -785,9 +821,46 @@ mod tests {
     #[test]
     fn filter_preserves_thread_and_process_creation() {
         if std::env::var_os("OPENSHELL_CHILD_SECCOMP_CREATION_PROBE").is_some() {
+            use rustix::thread::{CapabilitySet, CapabilitySets, capabilities, set_capabilities};
+            let empty = CapabilitySets {
+                effective: CapabilitySet::empty(),
+                permitted: CapabilitySet::empty(),
+                inheritable: CapabilitySet::empty(),
+            };
+            let eligible = capability_sets_are_empty();
+            let original = capabilities(None).expect("read current thread capabilities");
             let mut filter = prepare(std::process::id().saturating_add(1))
                 .expect("prepare child hardening filter");
             filter.install().expect("install child hardening filter");
+            let dropped = set_capabilities(None, empty);
+            if eligible {
+                dropped.expect("an empty workload can drop all capabilities again");
+                for request in [
+                    CapabilitySets {
+                        effective: CapabilitySet::CHOWN,
+                        ..empty
+                    },
+                    CapabilitySets {
+                        permitted: CapabilitySet::CHOWN,
+                        ..empty
+                    },
+                    CapabilitySets {
+                        inheritable: CapabilitySet::CHOWN,
+                        ..empty
+                    },
+                ] {
+                    assert_eq!(
+                        set_capabilities(None, request),
+                        Err(rustix::io::Errno::PERM)
+                    );
+                }
+            } else {
+                assert_eq!(dropped, Err(rustix::io::Errno::PERM));
+            }
+            assert_eq!(
+                capabilities(None).expect("read back capabilities"),
+                original
+            );
 
             // A direct clone3 request must report ENOSYS so libc can use its
             // established clone fallback.

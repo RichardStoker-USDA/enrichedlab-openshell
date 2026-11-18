@@ -34,6 +34,8 @@ NVIDIA.
 | A failed initial workload Pod is reported during provisioning | The Kubernetes driver preserves the terminal Pod condition while the gateway awaits configuration admission. |
 | Reap adopted children on kernels without task children lists | The runtime also reads the kernel process table. |
 | Build tools and X server helpers can reapply the workload's current user and group IDs | The child filter checks scalar IDs. The workload listener verifies supplementary groups and acknowledges an unchanged list. [NVIDIA/OpenShell#4104](https://github.com/NVIDIA/OpenShell/pull/4104) |
+| Capability-free workloads can repeat a capability drop | An unprivileged child with empty capability sets and an empty bounding set can clear its own capabilities. |
+| Numeric workload pins support local account lookup | An init container reads the workload image's passwd and group files and supplies read-only copies with the pinned identity. Existing image accounts and workspace ownership are preserved. |
 | A run receipt per sandbox: policy and image digests, runtime, OCSF event counts, exit status, output checksums | in progress |
 
 Changes that are useful beyond one site are offered upstream; this table shrinks as they land.

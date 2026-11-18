@@ -12,6 +12,9 @@
 use std::mem::size_of;
 use std::path::Path;
 
+#[cfg(target_os = "linux")]
+mod pinned_accounts;
+
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
 #[cfg(target_os = "linux")]
@@ -1832,6 +1835,15 @@ fn main() -> Result<()> {
             ));
         }
         return seed_kubernetes_workspace();
+    }
+    #[cfg(target_os = "linux")]
+    if raw_args.get(1).map(String::as_str) == Some("prepare-pinned-accounts") {
+        if raw_args.len() != 2 {
+            return Err(miette::miette!(
+                "usage: openshell-sandbox prepare-pinned-accounts"
+            ));
+        }
+        return pinned_accounts::prepare().into_diagnostic();
     }
     if raw_args.get(1).map(String::as_str) == Some(CAPABILITY_PROBE_SUBCOMMAND) {
         return run_capability_probe();
