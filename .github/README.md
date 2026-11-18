@@ -13,6 +13,7 @@ NVIDIA.
 | | |
 | --- | --- |
 | Upstream release | v0.1.9 |
+| Latest verified fork release | [v0.1.9-el.1](https://github.com/RichardStoker-USDA/enrichedlab-openshell/releases/tag/v0.1.9-el.1) |
 | Default branch | `enrichedlab/main` (upstream release plus the changes below) |
 | Images | `ghcr.io/richardstoker-usda/enrichedlab-openshell/{gateway,supervisor,sandbox,cli,receipts}`, linux/amd64 and linux/arm64 |
 | Chart | `oci://ghcr.io/richardstoker-usda/enrichedlab-openshell/charts/helm-chart` |
@@ -29,6 +30,7 @@ NVIDIA.
 | Operator-fixed labels and annotations on every Sandbox, workload and dedicated supervisor Pod and workspace claim (`fixed_pod_labels`, `fixed_pod_annotations`), for clusters whose admission, telemetry or retention policy requires them | available |
 | Supervisor telemetry to the gateway's collector, a separate collector, or none (`supervisor_telemetry`), without forwarding the gateway's collector headers or TLS client keys | available |
 | Retention class and expiry on every sandbox object | in progress |
+| GNU Make and CMake may reapply the workload's current user and group IDs | Identity-preserving calls only, as proposed in [NVIDIA/OpenShell#4104](https://github.com/NVIDIA/OpenShell/pull/4104) |
 | A run receipt per sandbox: policy and image digests, runtime, OCSF event counts, exit status, output checksums | in progress |
 
 Changes that are useful beyond one site are offered upstream; this table shrinks as they land.
