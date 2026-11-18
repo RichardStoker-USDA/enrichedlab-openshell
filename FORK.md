@@ -100,6 +100,8 @@ pair from the Sandbox object's `openshell.ai/warm-pair-id`.
 When pushing, the script also disables any upstream workflow GitHub has enabled in the fork. Upstream's workflows
 expect NVIDIA's runners and secrets; the fork runs only its own `enrichedlab-*` workflows.
 
+On the v0.1.9 line the gateway builds with vendored Z3 5.3.3. Use the same solver release for system-library tests. The receipt store and its forwarding keys use the SHA-256 provider from `openshell-crypto`. Existing receipt digests and record keys keep their byte format.
+
 ## Images
 
 `.github/workflows/enrichedlab-images.yml` builds the gateway, supervisor, sandbox and CLI images, and the run receipt

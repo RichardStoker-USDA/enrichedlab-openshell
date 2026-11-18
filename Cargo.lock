@@ -9931,9 +9931,9 @@ dependencies = [
 
 [[package]]
 name = "z3-src"
-version = "503.2.2"
+version = "503.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9d8286d7eea4bf77e3e3c1335990d8bfe1bded16e50b852b2d6801a0189861f"
+checksum = "cfb8cac8650fc9a7e536c4583f8f68a4ce63eba9f13832ee5a30bce79bd71a6b"
 dependencies = [
  "cmake",
 ]
