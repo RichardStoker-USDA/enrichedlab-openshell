@@ -71,6 +71,7 @@ conflict is listed here and checked by hand on every merge:
   fills upstream's header and TLS slots with empty values before `configure_supervisor_otlp_headers` and
   `configure_supervisor_otlp_tls` run, so those calls leave them empty. Check on every merge that the compute runtime
   is still built before those two calls; `withheld_collector_material_never_reaches_launch_bundles` fails if it is not.
+- The Kubernetes driver accepts optional supervisor_egress rules under sandbox_runtime for dedicated supervisor Pods. The upstream supervisor_runtime_class_name setting selects their RuntimeClass. Keep the workload egress deny independent of the supervisor rules.
 - The process reaper falls back to the kernel process table when task children lists are unavailable. It reads process stat files as bytes and only waits on its own direct children. Keep both kernel configurations covered.
 - The workload child filter allows GNU Make and CMake to reapply their current user and group IDs. Each argument must retain its present value. Keep the existing identity-change restrictions and the build-tool checks when syncing NVIDIA/OpenShell#4104.
 - Stored launch material never carries material the gateway withholds: when supervisors export elsewhere, the

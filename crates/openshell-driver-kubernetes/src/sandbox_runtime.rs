@@ -201,13 +201,14 @@ pub fn pair_label_value(sandbox_id: &str) -> String {
 pub fn workload_fence(
     namespace: &str,
     names: &SandboxRuntimeNames,
-    boundary_port: u16,
+    runtime: &crate::config::KubernetesSandboxRuntimeConfig,
 ) -> KubernetesSandboxRuntimeNetworkFence {
     KubernetesSandboxRuntimeNetworkFenceSpec {
         namespace: namespace.to_string(),
         policy_name: names.workload_policy.clone(),
         supervisor_policy_name: names.supervisor_policy.clone(),
-        boundary_port,
+        boundary_port: runtime.boundary_port,
+        supervisor_egress: runtime.supervisor_egress.clone(),
     }
     .provision()
 }

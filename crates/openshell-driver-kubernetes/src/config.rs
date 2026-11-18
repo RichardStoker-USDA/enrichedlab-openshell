@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use k8s_openapi::api::networking::v1::NetworkPolicyEgressRule;
 pub use openshell_core::DynamicStringAllowlist as OperatorNamespaceAllowlist;
 use openshell_core::config;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -118,6 +119,10 @@ impl FromStr for KubernetesControlConnection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesSandboxRuntimeConfig {
+    /// Egress rules for dedicated supervisor Pods. An empty list allows no egress through this policy.
+    /// Omitting the field preserves the upstream unrestricted supervisor egress rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_egress: Option<Vec<NetworkPolicyEgressRule>>,
     pub app_listener: KubernetesAppListenerConfig,
     /// TCP port of the Sandbox Protocol listener: the workload boundary for
     /// supervisor-initiated sandboxes, the supervisor for runtime-initiated ones.
@@ -128,6 +133,7 @@ impl Default for KubernetesSandboxRuntimeConfig {
     fn default() -> Self {
         Self {
             boundary_port: 5500,
+            supervisor_egress: None,
             app_listener: KubernetesAppListenerConfig::default(),
         }
     }

@@ -120,6 +120,8 @@ pub struct KubernetesSandboxRuntimeNetworkFenceSpec {
     pub policy_name: String,
     pub supervisor_policy_name: String,
     pub boundary_port: u16,
+    /// Egress rules for supervisor Pods; `None` allows any connection.
+    pub supervisor_egress: Option<Vec<NetworkPolicyEgressRule>>,
 }
 
 /// Labels and policy needed to remove direct workload-pod egress.
@@ -180,8 +182,9 @@ impl KubernetesSandboxRuntimeNetworkFenceSpec {
         };
 
         // Namespace-wide default-deny policies are additive with this rule.
-        // Select only OpenShell supervisor pods and explicitly allow their
-        // policy-approved DNS and upstream connections.
+        // Select only OpenShell supervisor pods and allow their policy-approved
+        // DNS and upstream connections: the site's rules when it sets them,
+        // otherwise any connection.
         let supervisor_policy = NetworkPolicy {
             metadata: ObjectMeta {
                 name: Some(self.supervisor_policy_name),
@@ -194,7 +197,10 @@ impl KubernetesSandboxRuntimeNetworkFenceSpec {
                     ..Default::default()
                 },
                 policy_types: Some(vec!["Egress".to_string()]),
-                egress: Some(vec![NetworkPolicyEgressRule::default()]),
+                egress: Some(
+                    self.supervisor_egress
+                        .unwrap_or_else(|| vec![NetworkPolicyEgressRule::default()]),
+                ),
                 ..Default::default()
             }),
         };
@@ -744,6 +750,7 @@ mod tests {
             namespace: "sandbox-ns".to_string(),
             policy_name: "openshell-boundary-sandbox-1".to_string(),
             supervisor_policy_name: "openshell-sandbox-supervisors".to_string(),
+            supervisor_egress: None,
             boundary_port: 5500,
         }
         .provision();
@@ -766,6 +773,7 @@ mod tests {
             namespace: "sandbox-ns".to_string(),
             policy_name: "openshell-boundary-sandbox-1".to_string(),
             supervisor_policy_name: "openshell-sandbox-supervisors".to_string(),
+            supervisor_egress: None,
             boundary_port: 5500,
         }
         .provision();
@@ -799,11 +807,41 @@ mod tests {
     }
 
     #[test]
+    fn network_fence_renders_site_supervisor_egress_rules() {
+        use k8s_openapi::api::networking::v1::IPBlock;
+        let public_only = NetworkPolicyEgressRule {
+            to: Some(vec![NetworkPolicyPeer {
+                ip_block: Some(IPBlock {
+                    cidr: "0.0.0.0/0".to_string(),
+                    except: Some(vec!["10.0.0.0/8".to_string(), "192.0.2.0/24".to_string()]),
+                }),
+                ..Default::default()
+            }]),
+            ports: None,
+        };
+        let fence = KubernetesSandboxRuntimeNetworkFenceSpec {
+            namespace: "sandbox-ns".to_string(),
+            policy_name: "openshell-sandbox-workloads".to_string(),
+            supervisor_policy_name: "openshell-sandbox-supervisors".to_string(),
+            supervisor_egress: Some(vec![public_only.clone()]),
+            boundary_port: 5500,
+        }
+        .provision();
+        let spec = fence
+            .supervisor_policy
+            .spec
+            .expect("supervisor policy has a spec");
+        assert_eq!(spec.egress, Some(vec![public_only]));
+        assert_ne!(spec.egress, Some(vec![NetworkPolicyEgressRule::default()]));
+    }
+
+    #[test]
     fn network_fence_keeps_supervisor_egress_available() {
         let fence = KubernetesSandboxRuntimeNetworkFenceSpec {
             namespace: "sandbox-ns".to_string(),
             policy_name: "openshell-sandbox-workloads".to_string(),
             supervisor_policy_name: "openshell-sandbox-supervisors".to_string(),
+            supervisor_egress: None,
             boundary_port: 5500,
         }
         .provision();

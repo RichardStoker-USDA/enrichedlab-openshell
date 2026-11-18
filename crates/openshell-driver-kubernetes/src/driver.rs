@@ -3035,7 +3035,7 @@ impl KubernetesComputeDriver {
         namespace: &str,
         names: &SandboxRuntimeNames,
     ) -> Result<(), KubernetesDriverError> {
-        let fence = workload_fence(namespace, names, self.config.sandbox_runtime.boundary_port);
+        let fence = workload_fence(namespace, names, &self.config.sandbox_runtime);
         let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
         for (mut policy, component) in [
             (fence.workload_policy, "sandbox-workload-fence"),
@@ -10627,7 +10627,15 @@ mod tests {
     #[test]
     fn sandbox_runtime_fence_validation_accepts_api_normalization_and_injected_metadata() {
         let names = SandboxRuntimeNames::new("sandbox-id-a");
-        let mut expected = workload_fence("namespace-a", &names, 5000).workload_policy;
+        let mut expected = workload_fence(
+            "namespace-a",
+            &names,
+            &crate::config::KubernetesSandboxRuntimeConfig {
+                boundary_port: 5000,
+                ..Default::default()
+            },
+        )
+        .workload_policy;
         expected.metadata.labels = Some(BTreeMap::from([(
             LABEL_MANAGED_BY.to_string(),
             LABEL_MANAGED_BY_VALUE.to_string(),
