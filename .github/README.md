@@ -13,7 +13,7 @@ NVIDIA.
 | | |
 | --- | --- |
 | Upstream release | v0.1.9 |
-| Latest verified fork release | [v0.1.9-el.1](https://github.com/RichardStoker-USDA/enrichedlab-openshell/releases/tag/v0.1.9-el.1) |
+| Fork releases | [Latest release](https://github.com/RichardStoker-USDA/enrichedlab-openshell/releases/latest). The first tagged build is [v0.1.9-el.1](https://github.com/RichardStoker-USDA/enrichedlab-openshell/releases/tag/v0.1.9-el.1). Each release lists its image digests and attestation check. |
 | Default branch | `enrichedlab/main` (upstream release plus the changes below) |
 | Images | `ghcr.io/richardstoker-usda/enrichedlab-openshell/{gateway,supervisor,sandbox,cli,receipts}`, linux/amd64 and linux/arm64 |
 | Chart | `oci://ghcr.io/richardstoker-usda/enrichedlab-openshell/charts/helm-chart` |
