@@ -32,8 +32,8 @@ the fork are tags `vX.Y.Z-el.N` on `enrichedlab/main`, where `vX.Y.Z` is the ups
 
 ```shell
 scripts/enrichedlab/sync-upstream.sh                 # fetch, fast-forward main, rebuild enrichedlab/next, report
-scripts/enrichedlab/sync-upstream.sh --merge v0.1.8  # also prepare enrichedlab/merge-v0.1.8
-scripts/enrichedlab/sync-upstream.sh --merge v0.1.8 --push origin
+scripts/enrichedlab/sync-upstream.sh --merge v0.1.9  # also prepare enrichedlab/merge-v0.1.9
+scripts/enrichedlab/sync-upstream.sh --merge v0.1.9 --push origin
 ```
 
 The script refuses to run on a dirty tree, never moves `enrichedlab/main`, and enables `git rerere` for this
@@ -42,7 +42,7 @@ branch passes CI:
 
 ```shell
 git switch enrichedlab/main
-git merge --ff-only enrichedlab/merge-v0.1.8
+git merge --ff-only enrichedlab/merge-v0.1.9
 git push origin enrichedlab/main
 ```
 
@@ -82,17 +82,20 @@ conflict is listed here and checked by hand on every merge:
   `openshell-server`), so the driver's `supervisor_auth_json` is what withholds the material there.
 - Driver start validates upstream's supervisor topology and the fork's fixed metadata and supervisor telemetry; a
   separate telemetry endpoint is refused with a shared supervisor, which exports no supervisor telemetry.
+- For Kata startup, v0.1.9 adds `provisioning_repair_window_seconds` under `[openshell.gateway]` and
+  `runtime_bootstrap_grace_seconds` and `sandbox_attach_request_timeout_seconds` under
+  `[openshell.drivers.kubernetes]`. Set `OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS` on the shared supervisor
+  itself when changing its attach timeout. Upstream distributes shared supervisors across gateway replicas.
+- Gateway writes now emit OCSF API Activity events with method-specific activity IDs. Consumers selecting failed
+  API calls use `class_uid = 6003` and `status_id = 2`. The receipt interceptor uses gateway lifecycle hooks.
 
 ## Carried upstream pull requests
 
-None on the v0.1.8 line. [NVIDIA/OpenShell#3508](https://github.com/NVIDIA/OpenShell/pull/3508) (template-driven warm
-pooling for the Kubernetes driver) was carried on v0.1.5 with three adaptations. v0.1.6 changed the supervisor's
-gateway credentials to per-instance credentials for shared supervisors, and the pull request's registration path
-depends on the earlier process-wide token, so carrying it is a port of its design, not a merge; its author is
-rebasing it upstream. Until a version that applies to the current release exists, the v0.1.6 and later lines have no warm
-pools: the shared supervisor (`supervisor_topology = "gateway"`) is the measured alternative for start latency, and a
-site that needs warm pools keeps the v0.1.5 line. The run receipt interceptor still matches a warm pair's Pods through
-the pair id the Sandbox object names (`openshell.ai/warm-pair-id`); without warm pools that path is unused.
+Upstream closed [NVIDIA/OpenShell#3508](https://github.com/NVIDIA/OpenShell/pull/3508) unmerged on November 12,
+2026. The v0.1.5 fork carried its template-driven warm pools. Since v0.1.6 the gateway issues per-instance
+supervisor credentials and the fork uses the shared supervisor (`supervisor_topology = "gateway"`) for fast
+starts. Warm pools are available only on the older v0.1.5 line. The receipt interceptor still recognizes a warm
+pair from the Sandbox object's `openshell.ai/warm-pair-id`.
 
 When pushing, the script also disables any upstream workflow GitHub has enabled in the fork. Upstream's workflows
 expect NVIDIA's runners and secrets; the fork runs only its own `enrichedlab-*` workflows.

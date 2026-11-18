@@ -12,9 +12,9 @@ NVIDIA.
 
 | | |
 | --- | --- |
-| Upstream release | v0.1.8 |
+| Upstream release | v0.1.9 |
 | Default branch | `enrichedlab/main` (upstream release plus the changes below) |
-| Images | `ghcr.io/richardstoker-usda/enrichedlab-openshell/{gateway,supervisor,sandbox,cli}`, linux/amd64 and linux/arm64 |
+| Images | `ghcr.io/richardstoker-usda/enrichedlab-openshell/{gateway,supervisor,sandbox,cli,receipts}`, linux/amd64 and linux/arm64 |
 | Chart | `oci://ghcr.io/richardstoker-usda/enrichedlab-openshell/charts/helm-chart` |
 | License | Apache 2.0, as upstream |
 
@@ -25,7 +25,7 @@ NVIDIA.
 | Images, the static CLI and the Helm chart built in this repository's CI, each with a signed SLSA build provenance attestation | available |
 | Merge-based tracking of upstream releases, with a preview branch on upstream `main` | available |
 | Sandbox Pods run in Kata Containers microVMs (Cloud Hypervisor) through a RuntimeClass | in testing; configuration only, no code change |
-| Agent Sandbox warm pools: claim a pre-started sandbox before creating a cold one | in progress |
+| Fast sandbox starts with a shared supervisor | shared topology on v0.1.6 and later, with replica spreading in v0.1.9. The older v0.1.5 line carries warm pools |
 | Operator-fixed labels and annotations on every Sandbox, workload and dedicated supervisor Pod and workspace claim (`fixed_pod_labels`, `fixed_pod_annotations`), for clusters whose admission, telemetry or retention policy requires them | available |
 | Supervisor telemetry to the gateway's collector, a separate collector, or none (`supervisor_telemetry`), without forwarding the gateway's collector headers or TLS client keys | available |
 | Retention class and expiry on every sandbox object | in progress |
