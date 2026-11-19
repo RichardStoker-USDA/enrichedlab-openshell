@@ -13,7 +13,7 @@ NVIDIA.
 | | |
 | --- | --- |
 | Upstream release | v0.1.9 |
-| Fork releases | [Latest release](https://github.com/RichardStoker-USDA/enrichedlab-openshell/releases/latest). The first tagged build is [v0.1.9-el.1](https://github.com/RichardStoker-USDA/enrichedlab-openshell/releases/tag/v0.1.9-el.1). Each release lists its image digests and attestation check. |
+| Fork releases | [Latest release](https://github.com/RichardStoker-USDA/enrichedlab-openshell/releases/latest). Release notes list the OCI digests and link to the build workflow. |
 | Default branch | `enrichedlab/main` (upstream release plus the changes below) |
 | Images | `ghcr.io/richardstoker-usda/enrichedlab-openshell/{gateway,supervisor,sandbox,cli,receipts}`, linux/amd64 and linux/arm64 |
 | Chart | `oci://ghcr.io/richardstoker-usda/enrichedlab-openshell/charts/helm-chart` |
@@ -35,19 +35,24 @@ NVIDIA.
 | Reap adopted children on kernels without task children lists | The runtime also reads the kernel process table. |
 | Build tools and X server helpers can reapply the workload's current user and group IDs | The child filter checks scalar IDs. The workload listener verifies supplementary groups and acknowledges an unchanged list. [NVIDIA/OpenShell#4104](https://github.com/NVIDIA/OpenShell/pull/4104) |
 | Capability-free workloads can repeat a capability drop | An unprivileged child with empty capability sets and an empty bounding set can clear its own capabilities. |
-| Numeric workload pins support local account lookup | An init container reads the workload image's passwd and group files and supplies read-only copies with the pinned identity. Existing image accounts and workspace ownership are preserved. |
-| A run receipt per sandbox: policy and image digests, runtime, OCSF event counts, exit status, output checksums | in progress |
+| Numeric workload pins support local account lookup | Two initializers stage the account helper and read the workload image's passwd and group files. The workload mounts read-only account files for the pinned identity. Existing account names, supplementary groups, and workspace ownership are preserved. |
+| Sandbox run receipts | The optional [receipt service](../crates/enrichedlab-receipts/README.md) records start and end observations with provenance. |
 
 Changes that are useful beyond one site are offered upstream; this table shrinks as they land.
 
-## Verify an image
+## Install and verify
+
+Use the CLI and Helm chart from the same fork release. The release notes list the CLI image and chart digests.
+The linked build workflow also keeps the standalone Linux CLI binaries as workflow artifacts.
+Follow the [upstream documentation](https://docs.nvidia.com/openshell/) for gateway setup and [FORK.md](../FORK.md)
+for the settings this fork adds.
+
+Verify an image index before deploying it by digest.
 
 ```shell
 gh attestation verify oci://ghcr.io/richardstoker-usda/enrichedlab-openshell/gateway@sha256:<digest> \
   --repo RichardStoker-USDA/enrichedlab-openshell
 ```
-
-Deploy by digest, never by tag.
 
 ## Maintaining
 
