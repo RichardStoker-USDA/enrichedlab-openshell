@@ -42,12 +42,15 @@ after client disconnect. The second follows driver settlement after a request
 deadline. Start bodies have a 15-second deadline before dispatch. The gateway
 bounds the number of admitted requests in flight to 64.
 
-Confirm receipt writes have settled. Any gateway receipt timeout, failed
-observation, missing metric or receipt write error leaves the drain open until
-the expected starts are reconciled with the receipt store. A failed readiness
-probe refuses a new start. A failure after the final probe follows the
-existing post-commit failure behavior. After restart, prove a read-only call
-and a refused start while the file is still paused before reopening.
+Account for each committed create in the maintenance window. Match its
+sandbox ID to the durable start record or a finalized receipt that contains
+that start. The `kept` outcome by itself can refer to a receipt with no start.
+Keep the drain open if the set of committed creates is unknown, a start is
+missing, or a receipt error or timeout is unresolved. If no creates committed,
+record the evidence covering the full window. A failure after the final
+readiness probe follows the existing post-commit behavior. After restart,
+prove a read-only call and a refused start while the file is still paused
+before reopening.
 
 ## Operator credential export
 

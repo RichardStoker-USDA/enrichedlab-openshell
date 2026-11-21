@@ -626,9 +626,11 @@ available.
 Publish `paused` atomically. Verify the file on each replica, both
 `openshell_sandbox_admission_in_flight` and
 `openshell_sandbox_provisioning_workers` at zero, and no durable provisioning
-operation still pending. Reconcile receipt timeouts and write failures against
-the expected starts before shutdown. Keep the file paused during restart and
-check a read-only request and a refused start before reopening.
+operation still pending. Match each committed create in the window to the
+same sandbox ID in a durable start record or in the start field of a finalized
+receipt. A `kept` result alone is insufficient. Keep the drain open when the
+set of commits or a receipt outcome is unknown. Keep the file paused during
+restart and check a read-only request and a refused start before reopening.
 
 ## Credential Drivers
 
