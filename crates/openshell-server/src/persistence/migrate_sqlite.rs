@@ -346,7 +346,7 @@ async fn read_target(target: &mut PgConnection) -> Result<Snapshot> {
     Ok(actual)
 }
 
-pub(crate) async fn run(backup: &Path, uri_file: &Path) -> Result<()> {
+pub async fn run(backup: &Path, uri_file: &Path) -> Result<()> {
     let uri =
         std::fs::read_to_string(uri_file).map_err(|_| miette!("cannot read target URI file"))?;
     let options = PgConnectOptions::from_str(uri.trim())
@@ -414,9 +414,8 @@ mod tests {
             import(&file, options.clone()),
             import(&file, options.clone())
         );
-        let snapshot = match (first, second) {
-            (Ok(receipt), Err(_)) | (Err(_), Ok(receipt)) => receipt,
-            _ => panic!("exactly one copy must commit"),
+        let ((Ok(snapshot), Err(_)) | (Err(_), Ok(snapshot))) = (first, second) else {
+            panic!("exactly one copy must commit");
         };
         assert_eq!(snapshot.objects, 2);
         assert_eq!(snapshot.claims, 1);
@@ -449,7 +448,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("fixture.sqlite");
         backup(&file, true).await;
-        assert!(import(&file, options.clone()).await.is_err());
+        let error = import(&file, options.clone()).await.err().unwrap();
+        // Corrupt labels are on the second object, after the first insert.
+        assert_eq!(
+            error.to_string(),
+            "gateway object labels cannot be migrated"
+        );
         let mut connection = PgConnection::connect_with(&options).await.unwrap();
         let rows: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_catalog.pg_tables WHERE schemaname = current_schema()",

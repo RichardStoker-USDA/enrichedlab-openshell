@@ -6,7 +6,7 @@
 mod allocation;
 mod legacy_time_wire;
 pub mod lock_order;
-pub(crate) mod migrate_sqlite;
+pub mod migrate_sqlite;
 pub mod mutation_lock;
 pub use allocation::AllocationClaim;
 mod postgres;

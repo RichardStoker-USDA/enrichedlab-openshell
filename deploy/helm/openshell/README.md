@@ -599,6 +599,7 @@ discovery endpoint or its TLS CA.
 | upstreamProxy.url | string | `""` | Proxy URL in http://host:port or https://host:port form. An https:// proxy whose certificate is not publicly trusted also needs caBundle below. |
 | workload.allowMultiReplicaStatefulSet | bool | `false` | Allow replicaCount > 1 while rendering a StatefulSet. Prefer workload.kind=deployment for external database-backed multi-replica gateways; this override exists for operators who explicitly require StatefulSet identity or storage semantics. |
 | workload.kind | string | `"statefulset"` | Gateway workload controller kind. Use `statefulset` for the default SQLite database, or `deployment` when server.externalDbSecret points at an external database. |
+| workload.protectReplicas | bool | `false` | Protect a fixed two-replica Deployment with a one-ready PodDisruptionBudget, hostname anti-affinity, and a rolling update that needs no third node. |
 | workspaceResources.enabled | bool | `true` | Create the sandbox ServiceAccount, Role, RoleBinding, and NetworkPolicy from this chart. Disable for a gateway-only release. |
 
 ----------------------------------------------

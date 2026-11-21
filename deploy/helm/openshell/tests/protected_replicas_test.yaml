@@ -16,6 +16,14 @@ tests:
       - hasDocuments:
           count: 0
 
+  - it: accepts a null workload and renders no budget
+    template: templates/poddisruptionbudget.yaml
+    set:
+      workload: null
+    asserts:
+      - hasDocuments:
+          count: 0
+
   - it: renders a budget selecting the exact release
     template: templates/poddisruptionbudget.yaml
     values:

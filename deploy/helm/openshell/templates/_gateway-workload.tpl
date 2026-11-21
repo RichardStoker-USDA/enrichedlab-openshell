@@ -312,7 +312,7 @@ spec:
     {{- toYaml . | nindent 4 }}
   {{- end }}
   {{- $affinity := deepCopy (.Values.affinity | default dict) }}
-  {{- if .Values.workload.protectReplicas }}
+  {{- if (get (.Values.workload | default dict) "protectReplicas") }}
     {{- $antiAffinity := get $affinity "podAntiAffinity" | default dict }}
     {{- $required := get $antiAffinity "requiredDuringSchedulingIgnoredDuringExecution" | default list }}
     {{- $selector := include "openshell.selectorLabels" . | fromYaml }}

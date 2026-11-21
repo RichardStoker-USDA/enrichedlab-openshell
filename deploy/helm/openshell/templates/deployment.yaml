@@ -12,7 +12,7 @@ spec:
   {{- if ne (include "openshell.autoscalingEnabled" .) "true" }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
-  {{- if .Values.workload.protectReplicas }}
+  {{- if (get (.Values.workload | default dict) "protectReplicas") }}
   strategy:
     type: RollingUpdate
     rollingUpdate:

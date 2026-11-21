@@ -42,12 +42,12 @@ enum Commands {
     GenerateCerts(certgen::CertgenArgs),
     /// Inspect gateway configuration without starting the service.
     Config(ConfigArgs),
-    /// Copy a quiesced SQLite backup into an empty PostgreSQL gateway schema.
+    /// Copy a quiesced `SQLite` backup into an empty `PostgreSQL` gateway schema.
     MigrateSqlite {
-        /// Standalone SQLite backup made with the SQLite online backup API.
+        /// Standalone `SQLite` file made with the online backup API.
         #[arg(long)]
         backup: PathBuf,
-        /// Private file containing the destination PostgreSQL URI.
+        /// Private file containing the destination `PostgreSQL` URI.
         #[arg(long)]
         target_uri_file: PathBuf,
     },

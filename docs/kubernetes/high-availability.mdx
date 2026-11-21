@@ -78,6 +78,13 @@ rules. Remove any previous selector that pins the gateway to one node. The
 budget covers voluntary evictions; use database and node redundancy for
 unplanned failures.
 
+If the release already has a manually managed PodDisruptionBudget with the
+gateway's name, compare its namespace, selector, and minimum availability with
+this chart's render. Transfer only that matching budget to the Helm release by
+adding the label `app.kubernetes.io/managed-by=Helm` and annotations
+`meta.helm.sh/release-name` and `meta.helm.sh/release-namespace` for the current
+release. Verify the budget after the upgrade.
+
 Install or upgrade OpenShell:
 
 ```shell
