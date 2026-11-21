@@ -183,8 +183,6 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub interceptors: Vec<GatewayInterceptorConfig>,
     #[serde(default)]
-    pub sandbox_admission: Option<SandboxAdmissionConfig>,
-    #[serde(default)]
     pub provider_profile_sources: Option<Vec<GatewayProviderProfileSourceConfig>>,
     #[serde(default)]
     pub mtls_auth: Option<MtlsAuthConfig>,
@@ -202,15 +200,6 @@ pub struct GatewayFileSection {
     // rejected in [`load`].
     #[serde(default)]
     pub database_url: Option<String>,
-}
-
-/// Persistent maintenance switch and exact interceptor required for sandbox starts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SandboxAdmissionConfig {
-    pub pause_file: PathBuf,
-    pub receipt_interceptor: String,
-    pub receipt_binding: String,
 }
 
 /// Gateway listener TLS fields accepted in `gateway.toml`.

@@ -21,25 +21,32 @@ authorize the new one.
 
 ## Sandbox maintenance
 
-The optional `[openshell.gateway.sandbox_admission]` table takes an absolute
-`pause_file` and the `receipt_interceptor` and `receipt_binding` of one
-dedicated, authenticated TLS interceptor. The interceptor must have an exact
-post-commit binding for `CreateSandbox`.
+Set `OPENSHELL_SANDBOX_ADMISSION_FILE` to an absolute path and set
+`OPENSHELL_SANDBOX_RECEIPT_INTERCEPTOR` and
+`OPENSHELL_SANDBOX_RECEIPT_BINDING` to the configured name and exact
+`CreateSandbox` post-commit binding of one dedicated, authenticated TLS
+interceptor. A partial configuration prevents the gateway from starting.
 
 Use a read-only, operator-controlled file and update it atomically to `paused`
 or `open` (an ending newline is optional). Missing or malformed content
-closes admissions. `CreateSandbox` and `StartSandbox` also require the
-receipts service to answer its authenticated `Describe` call with the
-negotiated identity and binding. Existing sessions and read-only RPCs continue.
+closes admissions. `CreateSandbox` and `StartSandbox` require a successful
+authenticated `Describe` with the receipt identity, audience and binding
+negotiated at startup. Read-only RPCs and existing sessions remain available.
 
-Before stopping the gateway, verify the effective file on every replica and
-wait for `openshell_sandbox_admission_in_flight` to reach zero, then check the
-receipt failure counters. The gauge covers dependency checks, admitted
-operations and their receipt hooks, including after the client disconnects.
-The gateway bounds these operations to 64 at once. Keep the file paused through
-restart and check a read-only RPC and a refused start before reopening. A
-dependency failure after the readiness check still follows the existing
-post-commit receipt failure behavior.
+Before stopping the gateway, verify the effective file on every replica.
+Wait for both `openshell_sandbox_admission_in_flight` and
+`openshell_sandbox_provisioning_workers` to reach zero. Confirm no durable
+driver operation remains pending. The first gauge includes dispatched starts
+after client disconnect. The second follows driver settlement after a request
+deadline. Start bodies have a 15-second deadline before dispatch. The gateway
+bounds the number of admitted requests in flight to 64.
+
+Confirm receipt writes have settled. Any gateway receipt timeout, failed
+observation, missing metric or receipt write error leaves the drain open until
+the expected starts are reconciled with the receipt store. A failed readiness
+probe refuses a new start. A failure after the final probe follows the
+existing post-commit failure behavior. After restart, prove a read-only call
+and a refused start while the file is still paused before reopening.
 
 ## Operator credential export
 

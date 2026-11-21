@@ -415,15 +415,32 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
+            let mut req = req;
             let permit = if crate::sandbox_admission::guards(req.uri().path())
                 && let Some(admission) = state
                     .as_ref()
                     .and_then(|state| state.sandbox_admission.as_ref())
             {
-                match admission.enter(interceptors.as_ref()).await {
-                    Ok(permit) => Some(permit),
+                let permit = match admission.enter().await {
+                    Ok(permit) => permit,
                     Err(status) => return Ok(status.into_http()),
+                };
+                let (parts, body) = req.into_parts();
+                let bytes = match collect_sandbox_start_body(body).await {
+                    Ok(bytes) => bytes,
+                    Err(status) => return Ok(status.into_http()),
+                };
+                if let Err(status) = admission
+                    .require_receipt_service(interceptors.as_ref())
+                    .await
+                {
+                    return Ok(status.into_http());
                 }
+                if let Err(status) = admission.check_open().await {
+                    return Ok(status.into_http());
+                }
+                req = Request::from_parts(parts, boxed_body_from_bytes(bytes));
+                Some(permit)
             } else {
                 None
             };
@@ -635,6 +652,12 @@ fn encode_unary_grpc_message<M: Message>(message: &M) -> Result<Bytes, tonic::St
     frame.extend_from_slice(&message_len.to_be_bytes());
     frame.extend_from_slice(&message);
     Ok(Bytes::from(frame))
+}
+
+async fn collect_sandbox_start_body(body: BoxBody) -> Result<Bytes, tonic::Status> {
+    tokio::time::timeout(Duration::from_secs(15), collect_intercepted_grpc_body(body))
+        .await
+        .map_err(|_| tonic::Status::deadline_exceeded("sandbox start request body timed out"))?
 }
 
 async fn collect_intercepted_grpc_body(body: BoxBody) -> Result<Bytes, tonic::Status> {
@@ -1558,7 +1581,7 @@ mod tests {
                 return Err(tonic::Status::unavailable("receipt store not ready"));
             }
             Ok(tonic::Response::new(InterceptorManifest {
-                name: "post-commit-test".to_string(),
+                name: "enrichedlab/post-commit-test".to_string(),
                 failure_policy: "fail_open".to_string(),
                 bindings: vec![InterceptorBinding {
                     id: if mode == 2 {
@@ -1659,6 +1682,152 @@ mod tests {
         backend.store(0, Ordering::SeqCst);
         verify().await.unwrap();
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn sandbox_admission_pause_leaves_the_running_gateway_readable() {
+        let (runtime, receiver, backend) = post_commit_test_runtime().await;
+        let dir = tempfile::tempdir().unwrap();
+        let pause = dir.path().join("admission");
+        tokio::fs::write(&pause, b"paused\n").await.unwrap();
+        let mut state = crate::grpc::test_support::test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().sandbox_admission =
+            Some(crate::sandbox_admission::SandboxAdmission::for_test(
+                pause.clone(),
+                "post-commit-test",
+                "audit-create-sandbox",
+            ));
+        let inner = tower::service_fn(|_request: Request<BoxBody>| async {
+            Ok::<_, Infallible>(
+                tonic::Status::new(tonic::Code::Unimplemented, "dispatched").into_http(),
+            )
+        });
+        let create = "/openshell.v1.OpenShell/CreateSandbox";
+        let start = "/openshell.v1.OpenShell/StartSandbox";
+        let lookup = "/openshell.v1.OpenShell/GetSandbox";
+        let request = |path| {
+            Request::builder()
+                .method(http::Method::POST)
+                .uri(path)
+                .body(boxed_body_from_bytes(grpc_frame(&[])))
+                .unwrap()
+        };
+        let mut service =
+            GatewayInterceptorGrpcService::new(inner, Some(runtime.clone()), Some(state.clone()));
+        let readback = service.call(request(lookup)).await.unwrap();
+        assert_eq!(grpc_status_from_response(&readback), "12");
+        for path in [create, start] {
+            let refused = service.call(request(path)).await.unwrap();
+            assert_eq!(grpc_status_from_response(&refused), "14");
+            assert!(
+                refused.headers()["grpc-message"]
+                    .to_str()
+                    .unwrap()
+                    .contains("paused")
+            );
+        }
+
+        let mut recovered = GatewayInterceptorGrpcService::new(inner, Some(runtime), Some(state));
+        let readback = recovered.call(request(lookup)).await.unwrap();
+        assert_eq!(grpc_status_from_response(&readback), "12");
+        let paused = recovered.call(request(create)).await.unwrap();
+        assert_eq!(grpc_status_from_response(&paused), "14");
+        tokio::fs::write(&pause, b"open\n").await.unwrap();
+        backend.store(1, Ordering::SeqCst);
+        let offline = recovered.call(request(start)).await.unwrap();
+        assert_eq!(grpc_status_from_response(&offline), "14");
+        assert!(
+            offline.headers()["grpc-message"]
+                .to_str()
+                .unwrap()
+                .contains("ready")
+        );
+        backend.store(0, Ordering::SeqCst);
+        let admitted = recovered.call(request(start)).await.unwrap();
+        assert_eq!(grpc_status_from_response(&admitted), "12");
+        receiver.abort();
+    }
+
+    #[tokio::test]
+    async fn sandbox_admission_keeps_dispatched_work_after_caller_disconnect() {
+        let (runtime, receiver, _) = post_commit_test_runtime().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("admission");
+        tokio::fs::write(&file, b"open\n").await.unwrap();
+        let mut state = crate::grpc::test_support::test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().sandbox_admission =
+            Some(crate::sandbox_admission::SandboxAdmission::for_test(
+                file,
+                "post-commit-test",
+                "audit-create-sandbox",
+            ));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let inner = {
+            let entered = entered.clone();
+            let release = release.clone();
+            tower::service_fn(move |_request: Request<BoxBody>| {
+                let entered = entered.clone();
+                let release = release.clone();
+                let first = !held.swap(true, Ordering::SeqCst);
+                async move {
+                    if first {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    Ok::<_, Infallible>(
+                        tonic::Status::new(tonic::Code::Unimplemented, "dispatched").into_http(),
+                    )
+                }
+            })
+        };
+        let request = || {
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("/openshell.v1.OpenShell/StartSandbox")
+                .body(boxed_body_from_bytes(grpc_frame(&[])))
+                .unwrap()
+        };
+        let mut first = GatewayInterceptorGrpcService::new(
+            inner.clone(),
+            Some(runtime.clone()),
+            Some(state.clone()),
+        );
+        let cancelled = tokio::spawn(first.call(request()));
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        cancelled.abort();
+        assert!(cancelled.await.is_err());
+
+        let mut canary = GatewayInterceptorGrpcService::new(inner, Some(runtime), Some(state));
+        let still_held = canary.call(request()).await.unwrap();
+        assert_eq!(grpc_status_from_response(&still_held), "8");
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let response = canary.call(request()).await.unwrap();
+                match grpc_status_from_response(&response).as_str() {
+                    "12" => break,
+                    "8" => tokio::task::yield_now().await,
+                    other => panic!("unexpected gRPC status {other}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        receiver.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sandbox_admission_times_out_an_unfinished_body() {
+        let stream = futures_util::stream::pending::<
+            Result<http_body::Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>,
+        >();
+        let body = BoxBody(StreamBody::new(stream).boxed_unsync());
+        let problem = collect_sandbox_start_body(body).await.unwrap_err();
+        assert_eq!(problem.code(), tonic::Code::DeadlineExceeded);
     }
 
     #[test]

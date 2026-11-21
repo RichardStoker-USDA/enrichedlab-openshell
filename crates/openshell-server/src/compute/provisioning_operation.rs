@@ -19,6 +19,7 @@ use super::{
     sandbox_resource_version, sandbox_runtime_generation,
 };
 use crate::persistence::PersistenceError;
+use crate::sandbox_admission::{ActiveWork, PROVISIONING_WORKERS};
 
 /// An attempt may contain several recovery operations on the same generation.
 /// Keep the last operation ID after settlement so a delayed callback cannot
@@ -128,7 +129,9 @@ impl ComputeRuntime {
         let owned_attempt = starting.clone();
         // Dropping a JoinHandle detaches its task. Do not abort it on a monitor
         // error or deadline: the remote side may still commit the request.
+        let active_work = ActiveWork::start(PROVISIONING_WORKERS);
         let worker = async move {
+            let _active_until_settled = active_work;
             let result = operation.await;
             let settled = if tracked {
                 let settled = runtime

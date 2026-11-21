@@ -856,17 +856,10 @@ pub(crate) async fn run_server(
         .transpose()
         .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
 
-    state.sandbox_admission = config_file
-        .as_ref()
-        .and_then(|file| file.openshell.gateway.sandbox_admission.as_ref())
-        .map(|guard| {
-            sandbox_admission::SandboxAdmission::new(
-                guard.clone(),
-                &config.gateway_interceptors,
-                state.extension_jwt_issuer.is_some(),
-            )
-        })
-        .transpose()?;
+    state.sandbox_admission = sandbox_admission::SandboxAdmission::from_environment(
+        &config.gateway_interceptors,
+        state.extension_jwt_issuer.is_some(),
+    )?;
     let state = Arc::new(state);
 
     grpc::policy::backfill_legacy_policy_history(&state)

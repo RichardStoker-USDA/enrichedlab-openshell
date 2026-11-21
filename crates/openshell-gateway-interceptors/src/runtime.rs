@@ -746,6 +746,7 @@ mod tests {
     fn test_modify_plan(failure_policy: FailurePolicy) -> BindingPlan {
         BindingPlan {
             interceptor_name: "test".to_string(),
+            advertised_name: String::new(),
             advertised_audience: String::new(),
             binding_id: "binding".to_string(),
             selector: RpcSelector {
@@ -950,6 +951,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(fmt_layer);
         let plan = BindingPlan {
             interceptor_name: "test".to_string(),
+            advertised_name: String::new(),
             advertised_audience: String::new(),
             binding_id: "binding".to_string(),
             selector: RpcSelector {
@@ -1146,6 +1148,7 @@ mod tests {
     async fn invalid_modify_patch_honors_fail_open_without_mutating_operation() {
         let plan = BindingPlan {
             interceptor_name: "test".to_string(),
+            advertised_name: String::new(),
             advertised_audience: String::new(),
             binding_id: "binding".to_string(),
             selector: RpcSelector {

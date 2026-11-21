@@ -131,6 +131,7 @@ impl RpcSelector {
 #[derive(Clone)]
 pub struct BindingPlan {
     pub(crate) interceptor_name: String,
+    pub(crate) advertised_name: String,
     pub(crate) advertised_audience: String,
     pub(crate) binding_id: String,
     pub(crate) selector: RpcSelector,
@@ -183,7 +184,8 @@ impl BindingPlan {
                 "required interceptor bindings changed".into(),
             ));
         };
-        if described.name != self.interceptor_name
+        if self.advertised_name.is_empty()
+            || described.name != self.advertised_name
             || self.advertised_audience.is_empty()
             || described.expected_audience != self.advertised_audience
             || binding.id != self.binding_id
@@ -343,6 +345,7 @@ impl ExecutionPlan {
                 for phase in normalized.phases {
                     let plan = BindingPlan {
                         interceptor_name: config.name.clone(),
+                        advertised_name: manifest.name.clone(),
                         advertised_audience: manifest.expected_audience.clone(),
                         binding_id: normalized.binding_id.clone(),
                         selector: normalized.selector.clone(),
