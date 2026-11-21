@@ -498,7 +498,24 @@ impl Default for SandboxCreateConfig<'_> {
 }
 
 /// Create a sandbox with default settings.
-pub async fn sandbox_create(
+pub fn sandbox_create<'a>(
+    server: &'a str,
+    gateway_name: &'a str,
+    config: SandboxCreateConfig<'a>,
+    workspace: &'a str,
+    tls: &'a TlsOptions,
+) -> impl Future<Output = Result<i32>> + 'a {
+    // Keep request preparation and readiness state off the caller's stack.
+    Box::pin(sandbox_create_inner(
+        server,
+        gateway_name,
+        config,
+        workspace,
+        tls,
+    ))
+}
+
+async fn sandbox_create_inner(
     server: &str,
     gateway_name: &str,
     config: SandboxCreateConfig<'_>,

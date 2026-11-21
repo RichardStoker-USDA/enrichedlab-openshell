@@ -3499,7 +3499,7 @@ async fn run_async() -> Result<()> {
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name)?;
-                    let exit_code = Box::pin(run::sandbox_create(
+                    let exit_code = run::sandbox_create(
                         endpoint,
                         &ctx.name,
                         run::SandboxCreateConfig {
@@ -3534,7 +3534,7 @@ async fn run_async() -> Result<()> {
                         },
                         &cli.workspace,
                         &tls,
-                    ))
+                    )
                     .await?;
                     if exit_code != 0 {
                         std::process::exit(exit_code);

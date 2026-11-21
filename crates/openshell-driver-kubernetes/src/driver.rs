@@ -4485,7 +4485,7 @@ impl KubernetesComputeDriver {
                     encoded_generation,
                     encoded_authentication,
                     encoded_expected_runtime_identity,
-                    StartCutoff::default(),
+                    cutoff,
                 ))
                 .await;
             }
