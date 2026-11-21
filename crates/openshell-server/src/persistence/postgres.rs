@@ -26,7 +26,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
+pub(super) static POSTGRES_MIGRATOR: sqlx::migrate::Migrator =
+    sqlx::migrate!("./migrations/postgres");
 
 #[cfg(test)]
 pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {

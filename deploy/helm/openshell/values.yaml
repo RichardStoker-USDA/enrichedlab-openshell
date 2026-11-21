@@ -26,6 +26,9 @@ workload:
   # gateways; this override exists for operators who explicitly require
   # StatefulSet identity or storage semantics.
   allowMultiReplicaStatefulSet: false
+  # -- Protect a fixed two-replica Deployment with a one-ready PodDisruptionBudget,
+  # hostname anti-affinity, and a rolling update that needs no third node.
+  protectReplicas: false
 
 gateway:
   image:

@@ -12,6 +12,13 @@ spec:
   {{- if ne (include "openshell.autoscalingEnabled" .) "true" }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
+  {{- if .Values.workload.protectReplicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  {{- end }}
   selector:
     matchLabels:
       {{- include "openshell.selectorLabels" . | nindent 6 }}

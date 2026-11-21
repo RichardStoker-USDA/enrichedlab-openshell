@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Richard Stoker
+# SPDX-License-Identifier: Apache-2.0
+
+suite: Protected gateway replicas
+templates:
+  - templates/deployment.yaml
+  - templates/poddisruptionbudget.yaml
+release:
+  name: fixture
+  namespace: fixture
+
+tests:
+  - it: leaves the default gateway without a disruption budget
+    template: templates/poddisruptionbudget.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders a budget selecting the exact release
+    template: templates/poddisruptionbudget.yaml
+    values:
+      - ../ci/values-high-availability.yaml
+    asserts:
+      - equal:
+          path: spec.minAvailable
+          value: 1
+      - equal:
+          path: spec.selector.matchLabels
+          value:
+            app.kubernetes.io/name: openshell
+            app.kubernetes.io/instance: fixture
+
+  - it: replaces one replica at a time and preserves operator placement
+    template: templates/deployment.yaml
+    values:
+      - ../ci/values-high-availability.yaml
+    set:
+      affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].weight: 40
+      affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].preference.matchExpressions[0].key: fixture-zone
+      affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].preference.matchExpressions[0].operator: Exists
+    asserts:
+      - equal:
+          path: spec.strategy.rollingUpdate
+          value:
+            maxSurge: 0
+            maxUnavailable: 1
+      - equal:
+          path: spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[0]
+          value:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: openshell
+                app.kubernetes.io/instance: fixture
+      - equal:
+          path: spec.template.spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].weight
+          value: 40
+
+  - it: rejects protection on a single gateway
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      workload.protectReplicas: true
+      server.externalDbSecret: fixture-db
+    asserts:
+      - failedTemplate:
+          errorMessage: "workload.protectReplicas requires a fixed two-replica Deployment."

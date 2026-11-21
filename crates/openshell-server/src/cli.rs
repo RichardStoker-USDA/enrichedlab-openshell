@@ -42,6 +42,15 @@ enum Commands {
     GenerateCerts(certgen::CertgenArgs),
     /// Inspect gateway configuration without starting the service.
     Config(ConfigArgs),
+    /// Copy a quiesced SQLite backup into an empty PostgreSQL gateway schema.
+    MigrateSqlite {
+        /// Standalone SQLite backup made with the SQLite online backup API.
+        #[arg(long)]
+        backup: PathBuf,
+        /// Private file containing the destination PostgreSQL URI.
+        #[arg(long)]
+        target_uri_file: PathBuf,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -322,6 +331,10 @@ pub async fn run_cli_with_compute_drivers(compute_drivers: ComputeDriverRegistry
 
     match cli.command {
         Some(Commands::GenerateCerts(args)) => certgen::run(args).await,
+        Some(Commands::MigrateSqlite {
+            backup,
+            target_uri_file,
+        }) => crate::persistence::migrate_sqlite::run(&backup, &target_uri_file).await,
         Some(Commands::Config(args)) => match args.command {
             ConfigCommand::Preflight(args) => {
                 let driver =

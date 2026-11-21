@@ -58,33 +58,25 @@ Keep the Secret in the same namespace as the gateway release.
 
 ## Configure Gateway Replicas
 
-Create `values-ha.yaml`:
+Create `values-ha.yaml` for a fixed pair:
 
 ```yaml
 replicaCount: 2
 
 workload:
   kind: deployment
+  protectReplicas: true
 
 server:
   externalDbSecret: openshell-postgres
-
-affinity:
-  podAntiAffinity:
-    requiredDuringSchedulingIgnoredDuringExecution:
-      - labelSelector:
-          matchLabels:
-            app.kubernetes.io/name: openshell
-            app.kubernetes.io/instance: openshell
-        topologyKey: kubernetes.io/hostname
 ```
 
-The anti-affinity rule places the two replicas on different nodes. The
-`app.kubernetes.io/instance` value must match the Helm release name. Change the
-topology key to a zone label when replicas must span availability zones. A
-required rule leaves a replica Pending when the cluster does not have enough
-matching failure domains; use preferred anti-affinity when scheduling the
-replica is more important than strict separation.
+`protectReplicas` adds required hostname anti-affinity, a PodDisruptionBudget
+requiring one ready gateway, and a rolling strategy that replaces one replica at
+a time without a third node. Both nodes must satisfy the gateway's placement
+rules. Remove any previous selector that pins the gateway to one node. The
+budget covers voluntary evictions; use database and node redundancy for
+unplanned failures.
 
 Install or upgrade OpenShell:
 
@@ -133,28 +125,39 @@ openshell status
 openshell sandbox list
 ```
 
-## Protect Voluntary Disruptions
+## Migrate an Existing SQLite Gateway
 
-Add a PodDisruptionBudget so a voluntary disruption, such as node maintenance,
-does not evict every ready gateway pod at once:
+1. Pause admissions, let accepted work reach its durable receipt boundary,
+   and stop the SQLite gateway before taking the final backup. Keep the old
+   gateway stopped and fence all other writers until the PostgreSQL import is
+   confirmed. Keep the original SQLite volume and its independent backup.
+2. Make a standalone SQLite backup with the SQLite backup API. Verify it in
+   isolated storage and confirm its file checksum before import. Keep the
+   credential-storage encryption key, sandbox JWT signing key, and TLS Secrets
+   from the existing release. Store the PostgreSQL URI in the operator's
+   private file and include the trusted CA path if required.
+3. Run the command from the gateway build that matches the SQLite schema:
 
-```yaml
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: openshell
-  namespace: openshell
-spec:
-  minAvailable: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: openshell
-      app.kubernetes.io/instance: openshell
-```
+   ```shell
+   openshell-gateway migrate-sqlite \
+     --backup /private/backup/gateway.sqlite \
+     --target-uri-file /private/config/postgres-uri
+   ```
 
-Apply the manifest separately from the OpenShell chart. Match the namespace and
-release labels to your installation. A PodDisruptionBudget controls voluntary
-evictions; it does not protect against an unavailable node or failure domain.
+   Use a dedicated, empty PostgreSQL schema. The importer verifies the server
+   hostname and certificate, copies gateway objects and allocation claims
+   in one transaction, and prints verified row counts and a digest. Keep that
+   receipt with the backup record. If the commit acknowledgment is lost, keep
+   all gateways stopped and inspect the target before retrying.
+4. Start the Deployment against the verified PostgreSQL state with admissions
+   still paused. Verify both ready endpoints on separate nodes, authenticated peer
+   routing, receipt readiness, and that a sandbox can reconnect across a gateway
+   restart. Resume admissions after those checks pass.
+
+Before the PostgreSQL gateway accepts writes, you can roll back to the fenced
+SQLite source. After it accepts writes, use the previous compatible gateway
+image with the same PostgreSQL state. The immutable SQLite backup has no later
+writes. Gateway state migration leaves the independent receipt store in place.
 
 ## How Peer Routing Works
 

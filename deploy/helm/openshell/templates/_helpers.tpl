@@ -585,6 +585,11 @@ Validate chart values that Helm would otherwise accept silently.
 {{- fail "workload.kind=deployment requires server.externalDbSecret; use workload.kind=statefulset for the default SQLite database." -}}
 {{- end -}}
 {{- include "openshell.validateAutoscaling" . -}}
+{{- if get $workload "protectReplicas" -}}
+{{- if or (ne $workloadKind "deployment") (ne (int .Values.replicaCount) 2) (eq (include "openshell.autoscalingEnabled" .) "true") -}}
+{{- fail "workload.protectReplicas requires a fixed two-replica Deployment." -}}
+{{- end -}}
+{{- end -}}
 {{- if and (gt $maxReplicas 1) (not .Values.server.externalDbSecret) -}}
 {{- fail (printf "%s > 1 requires server.externalDbSecret; multiple gateway replicas cannot share the default per-pod SQLite database." $maxReplicasSource) -}}
 {{- end -}}

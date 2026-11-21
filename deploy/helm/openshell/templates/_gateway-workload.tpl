@@ -311,7 +311,16 @@ spec:
   nodeSelector:
     {{- toYaml . | nindent 4 }}
   {{- end }}
-  {{- with .Values.affinity }}
+  {{- $affinity := deepCopy (.Values.affinity | default dict) }}
+  {{- if .Values.workload.protectReplicas }}
+    {{- $antiAffinity := get $affinity "podAntiAffinity" | default dict }}
+    {{- $required := get $antiAffinity "requiredDuringSchedulingIgnoredDuringExecution" | default list }}
+    {{- $selector := include "openshell.selectorLabels" . | fromYaml }}
+    {{- $separateHosts := dict "labelSelector" (dict "matchLabels" $selector) "topologyKey" "kubernetes.io/hostname" }}
+    {{- $_ := set $antiAffinity "requiredDuringSchedulingIgnoredDuringExecution" (prepend $required $separateHosts) }}
+    {{- $_ := set $affinity "podAntiAffinity" $antiAffinity }}
+  {{- end }}
+  {{- with $affinity }}
   affinity:
     {{- toYaml . | nindent 4 }}
   {{- end }}
