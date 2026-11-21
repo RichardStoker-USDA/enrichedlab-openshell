@@ -6,8 +6,8 @@
 use super::{postgres::POSTGRES_MIGRATOR, sqlite::SQLITE_MIGRATOR};
 use futures::TryStreamExt;
 use miette::{Result, miette};
+use openshell_crypto::Digest;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use sqlx::migrate::{Migrate, Migrator};
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use sqlx::sqlite::SqliteConnectOptions;
@@ -61,12 +61,24 @@ struct Snapshot {
     digest: String,
 }
 
-fn frame(hasher: &mut Sha256, value: &impl Serialize) -> Result<()> {
+fn update_digest(digest: &mut dyn Digest, bytes: &[u8]) -> Result<()> {
+    digest
+        .update(bytes)
+        .map_err(|_| miette!("gateway snapshot hashing failed"))
+}
+
+fn frame(hasher: &mut dyn Digest, value: &impl Serialize) -> Result<()> {
     let bytes =
         serde_json::to_vec(value).map_err(|_| miette!("gateway snapshot encoding failed"))?;
-    hasher.update((bytes.len() as u64).to_be_bytes());
-    hasher.update(bytes);
-    Ok(())
+    update_digest(hasher, &(bytes.len() as u64).to_be_bytes())?;
+    update_digest(hasher, &bytes)
+}
+
+fn finish_digest(digest: Box<dyn Digest>) -> Result<String> {
+    digest
+        .finish()
+        .map(hex::encode)
+        .map_err(|_| miette!("gateway snapshot hashing failed"))
 }
 
 async fn verify_migrations(connection: &mut impl Migrate, migrator: &Migrator) -> Result<()> {
@@ -104,12 +116,13 @@ async fn verify_migrations(connection: &mut impl Migrate, migrator: &Migrator) -
     Ok(())
 }
 
-const SQLITE_OBJECTS: &str = "SELECT * FROM objects ORDER BY id COLLATE BINARY";
+const SQLITE_OBJECTS: &str = "SELECT * FROM objects NOT INDEXED ORDER BY id COLLATE BINARY";
 const PG_OBJECTS: &str =
     "SELECT id, object_type, name, scope, version, status, dedup_key, hit_count, payload,
             created_at_ms, updated_at_ms, labels::text AS labels, resource_version, workspace
      FROM objects ORDER BY id COLLATE \"C\"";
-const SQLITE_CLAIMS: &str = "SELECT * FROM allocation_claims ORDER BY target COLLATE BINARY";
+const SQLITE_CLAIMS: &str =
+    "SELECT * FROM allocation_claims NOT INDEXED ORDER BY target COLLATE BINARY";
 const PG_CLAIMS: &str = "SELECT * FROM allocation_claims ORDER BY target COLLATE \"C\"";
 
 async fn import(backup: &Path, options: PgConnectOptions) -> Result<Snapshot> {
@@ -181,7 +194,7 @@ async fn import(backup: &Path, options: PgConnectOptions) -> Result<Snapshot> {
     {
         return Err(miette!("SQLite backup has unexpected gateway fields"));
     }
-    let healthy: Vec<String> = sqlx::query_scalar("PRAGMA quick_check")
+    let healthy: Vec<String> = sqlx::query_scalar("PRAGMA integrity_check")
         .fetch_all(&mut *source)
         .await
         .map_err(|_| miette!("SQLite integrity check failed"))?;
@@ -189,7 +202,7 @@ async fn import(backup: &Path, options: PgConnectOptions) -> Result<Snapshot> {
         return Err(miette!("SQLite backup failed integrity check"));
     }
     let duplicate_labels: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM objects, json_each(objects.labels)
+        "SELECT EXISTS(SELECT 1 FROM objects NOT INDEXED, json_each(objects.labels)
          GROUP BY objects.id, json_each.key HAVING count(*) > 1)",
     )
     .fetch_one(&mut *source)
@@ -198,6 +211,15 @@ async fn import(backup: &Path, options: PgConnectOptions) -> Result<Snapshot> {
     if duplicate_labels {
         return Err(miette!("SQLite labels contain duplicate keys"));
     }
+
+    // Independently count the source tables without relying on an index.
+    let (object_count, claim_count): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM objects NOT INDEXED),
+                (SELECT count(*) FROM allocation_claims NOT INDEXED)",
+    )
+    .fetch_one(&mut *source)
+    .await
+    .map_err(|_| miette!("cannot count gateway snapshot rows"))?;
 
     let mut connection = PgConnection::connect_with(&options.disable_statement_logging())
         .await
@@ -251,8 +273,9 @@ async fn import(backup: &Path, options: PgConnectOptions) -> Result<Snapshot> {
     verify_migrations(&mut *target, &POSTGRES_MIGRATOR).await?;
 
     let mut expected = Snapshot::default();
-    let mut digest = Sha256::new();
-    digest.update(b"objects");
+    let mut digest = openshell_crypto::sha256_digest()
+        .map_err(|_| miette!("gateway snapshot hashing failed"))?;
+    update_digest(&mut *digest, b"objects")?;
     {
         let mut rows = sqlx::query_as::<_, ObjectRow>(SQLITE_OBJECTS).fetch(&mut *source);
         while let Some(mut row) = rows
@@ -274,11 +297,11 @@ async fn import(backup: &Path, options: PgConnectOptions) -> Result<Snapshot> {
             .execute(&mut *target)
             .await
             .map_err(|_| miette!("PostgreSQL rejected a gateway object"))?;
-            frame(&mut digest, &row)?;
+            frame(&mut *digest, &row)?;
             expected.objects += 1;
         }
     }
-    digest.update(b"allocation_claims");
+    update_digest(&mut *digest, b"allocation_claims")?;
     {
         let mut rows = sqlx::query_as::<_, ClaimRow>(SQLITE_CLAIMS).fetch(&mut *source);
         while let Some(row) = rows
@@ -297,11 +320,18 @@ async fn import(backup: &Path, options: PgConnectOptions) -> Result<Snapshot> {
             .execute(&mut *target)
             .await
             .map_err(|_| miette!("PostgreSQL rejected a gateway allocation claim"))?;
-            frame(&mut digest, &row)?;
+            frame(&mut *digest, &row)?;
             expected.claims += 1;
         }
     }
-    expected.digest = format!("{:x}", digest.finalize());
+    if i64::try_from(expected.objects).ok() != Some(object_count)
+        || i64::try_from(expected.claims).ok() != Some(claim_count)
+    {
+        return Err(miette!(
+            "SQLite gateway row counts differ from the copied rows"
+        ));
+    }
+    expected.digest = finish_digest(digest)?;
     if read_target(&mut target).await? != expected {
         return Err(miette!(
             "PostgreSQL readback differs from the SQLite snapshot"
@@ -316,8 +346,9 @@ async fn import(backup: &Path, options: PgConnectOptions) -> Result<Snapshot> {
 
 async fn read_target(target: &mut PgConnection) -> Result<Snapshot> {
     let mut actual = Snapshot::default();
-    let mut digest = Sha256::new();
-    digest.update(b"objects");
+    let mut digest = openshell_crypto::sha256_digest()
+        .map_err(|_| miette!("gateway snapshot hashing failed"))?;
+    update_digest(&mut *digest, b"objects")?;
     {
         let mut rows = sqlx::query_as::<_, ObjectRow>(PG_OBJECTS).fetch(&mut *target);
         while let Some(mut row) = rows
@@ -326,11 +357,11 @@ async fn read_target(target: &mut PgConnection) -> Result<Snapshot> {
             .map_err(|_| miette!("cannot verify a PostgreSQL object"))?
         {
             row.normalize_labels()?;
-            frame(&mut digest, &row)?;
+            frame(&mut *digest, &row)?;
             actual.objects += 1;
         }
     }
-    digest.update(b"allocation_claims");
+    update_digest(&mut *digest, b"allocation_claims")?;
     {
         let mut rows = sqlx::query_as::<_, ClaimRow>(PG_CLAIMS).fetch(&mut *target);
         while let Some(row) = rows
@@ -338,11 +369,11 @@ async fn read_target(target: &mut PgConnection) -> Result<Snapshot> {
             .await
             .map_err(|_| miette!("cannot verify a PostgreSQL allocation claim"))?
         {
-            frame(&mut digest, &row)?;
+            frame(&mut *digest, &row)?;
             actual.claims += 1;
         }
     }
-    actual.digest = format!("{:x}", digest.finalize());
+    actual.digest = finish_digest(digest)?;
     Ok(actual)
 }
 
@@ -365,6 +396,32 @@ pub async fn run(backup: &Path, uri_file: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::persistence::test_postgres::TestSchema;
+    use openshell_crypto::CryptoError;
+
+    #[test]
+    fn snapshot_digest_failure_is_redacted() {
+        struct FailedDigest;
+        impl Digest for FailedDigest {
+            fn update(&mut self, _: &[u8]) -> std::result::Result<(), CryptoError> {
+                Err(CryptoError::UnsupportedPosture)
+            }
+            fn finish(self: Box<Self>) -> std::result::Result<[u8; 32], CryptoError> {
+                Err(CryptoError::UnsupportedPosture)
+            }
+        }
+        assert_eq!(
+            frame(&mut FailedDigest, &"private fixture")
+                .unwrap_err()
+                .to_string(),
+            "gateway snapshot hashing failed"
+        );
+        assert_eq!(
+            finish_digest(Box::new(FailedDigest))
+                .unwrap_err()
+                .to_string(),
+            "gateway snapshot hashing failed"
+        );
+    }
 
     async fn backup(path: &Path, corrupt_labels: bool) {
         let mut source = SqliteConnection::connect_with(

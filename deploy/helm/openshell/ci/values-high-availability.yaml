@@ -8,7 +8,6 @@ replicaCount: 2
 
 workload:
   kind: deployment
-  protectReplicas: true
 
 server:
   externalDbSecret: openshell-ha-pg

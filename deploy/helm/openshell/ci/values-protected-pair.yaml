@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Fixed two-node gateway qualification with an existing PostgreSQL Secret.
+# Both nodes must be schedulable for the gateway. This profile cannot autoscale.
+replicaCount: 2
+
+workload:
+  kind: deployment
+  protectReplicas: true
+
+server:
+  externalDbSecret: openshell-ha-pg

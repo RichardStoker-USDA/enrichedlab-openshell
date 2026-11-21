@@ -27,7 +27,7 @@ tests:
   - it: renders a budget selecting the exact release
     template: templates/poddisruptionbudget.yaml
     values:
-      - ../ci/values-high-availability.yaml
+      - ../ci/values-protected-pair.yaml
     asserts:
       - equal:
           path: spec.minAvailable
@@ -41,7 +41,7 @@ tests:
   - it: replaces one replica at a time and preserves operator placement
     template: templates/deployment.yaml
     values:
-      - ../ci/values-high-availability.yaml
+      - ../ci/values-protected-pair.yaml
     set:
       affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].weight: 40
       affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].preference.matchExpressions[0].key: fixture-zone

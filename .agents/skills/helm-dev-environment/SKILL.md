@@ -143,6 +143,14 @@ namespace with a `uri` key. For local manual testing, either create your own
 PostgreSQL Secret or use the e2e PostgreSQL fixture manifest in
 `e2e/kubernetes/postgres-fixture.yaml`.
 
+Use `ci/values-high-availability.yaml` for the scalable local e2e profile.
+Use `ci/values-protected-pair.yaml` for the fixed two-replica profile on a
+disposable cluster with two schedulable nodes. Both use the existing PostgreSQL
+fixture. The fixed profile requires one gateway on each node, so one-node
+dev clusters cannot complete its rollout. For node-loss qualification, stop
+one fixture node and check that the surviving endpoint still serves. Keep
+this separate from the scalable relay and rebalance test.
+
 For the `high-availability` profile, return to the repository root and apply the
 GatewayClass and BackendTrafficPolicy manifest after Skaffold has installed
 Envoy Gateway:

@@ -20,6 +20,12 @@ PostgreSQL service or a separately operated PostgreSQL cluster with its own
 backup and failover plan.
 </Warning>
 
+If the gateway requires an admission receipt service, monitor it as a separate
+availability dependency. Gateway readiness checks PostgreSQL. The gateway can
+answer state reads while CreateSandbox and StartSandbox fail closed on an
+unavailable receipt service. Track receipt availability and durable start
+delivery separately from gateway readiness and disruption budgets.
+
 ## Requirements
 
 An HA gateway deployment requires:
@@ -154,8 +160,10 @@ openshell sandbox list
    Use a dedicated, empty PostgreSQL schema. The importer verifies the server
    hostname and certificate, copies gateway objects and allocation claims
    in one transaction, and prints verified row counts and a digest. Keep that
-   receipt with the backup record. If the commit acknowledgment is lost, keep
-   all gateways stopped and inspect the target before retrying.
+   receipt with the backup record. The importer checks the entire SQLite
+   database, cross-checks both table counts against its copy and verifies the
+   target rows before commit. If the commit acknowledgment is lost, keep all
+   gateways stopped and inspect the target before retrying.
 4. Start the Deployment against the verified PostgreSQL state with admissions
    still paused. Verify both ready endpoints on separate nodes, authenticated peer
    routing, receipt readiness, and that a sandbox can reconnect across a gateway

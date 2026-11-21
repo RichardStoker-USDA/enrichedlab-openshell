@@ -724,6 +724,14 @@ returns `UNAVAILABLE` with "lock sandbox SSH identity failed", and neither
 `openshell_server_mutation_lock_timeouts_total` nor
 `openshell_server_mutation_lock_errors_total` counts it.
 
+For a fixed pair with `workload.protectReplicas=true`, check that two eligible
+nodes satisfy the gateway affinity and that the ready pods run on distinct
+hosts. Check the release's PodDisruptionBudget for `minAvailable: 1` and
+the Deployment for `maxSurge: 0` and `maxUnavailable: 1`. A pod pinned Pending
+commonly means there is only one eligible node. Avoid combining a rollout
+with a node eviction. Check the configured admission receipt service separately
+when both gateway endpoints are Ready but sandbox create or start is refused.
+
 For multi-replica gateway installs, supervisor and client session traffic may
 be served by a non-owner gateway replica and relayed to the current supervisor
 owner over the internal `PeerRelay` RPC. Check the headless peer Service,
