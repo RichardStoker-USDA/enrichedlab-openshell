@@ -25,7 +25,8 @@ Set `OPENSHELL_SANDBOX_ADMISSION_FILE` to an absolute path and set
 `OPENSHELL_SANDBOX_RECEIPT_INTERCEPTOR` and
 `OPENSHELL_SANDBOX_RECEIPT_BINDING` to the configured name and exact
 `CreateSandbox` post-commit binding of one dedicated, authenticated TLS
-interceptor. A partial configuration prevents the gateway from starting.
+interceptor. Enable the gateway metrics listener to observe the drain. A partial
+configuration or disabled listener prevents the configured gateway from starting.
 
 Use a read-only, operator-controlled file and update it atomically to `paused`
 or `open` (an ending newline is optional). Missing or malformed content

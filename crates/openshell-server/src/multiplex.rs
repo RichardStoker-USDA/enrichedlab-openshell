@@ -1568,7 +1568,16 @@ mod tests {
     use tower::Service;
 
     #[derive(Clone, Default)]
-    struct PostCommitTestInterceptor(Arc<AtomicUsize>);
+    struct ReceiptSettlement {
+        entered: Arc<tokio::sync::Notify>,
+        acknowledged: Arc<tokio::sync::Notify>,
+    }
+
+    #[derive(Clone, Default)]
+    struct PostCommitTestInterceptor {
+        mode: Arc<AtomicUsize>,
+        settlement: Option<ReceiptSettlement>,
+    }
 
     #[tonic::async_trait]
     impl GatewayInterceptor for PostCommitTestInterceptor {
@@ -1576,7 +1585,7 @@ mod tests {
             &self,
             _request: tonic::Request<DescribeRequest>,
         ) -> Result<tonic::Response<InterceptorManifest>, tonic::Status> {
-            let mode = self.0.load(Ordering::SeqCst);
+            let mode = self.mode.load(Ordering::SeqCst);
             if mode == 1 {
                 return Err(tonic::Status::unavailable("receipt store not ready"));
             }
@@ -1613,6 +1622,10 @@ mod tests {
             &self,
             _request: tonic::Request<InterceptorEvaluation>,
         ) -> Result<tonic::Response<InterceptorResult>, tonic::Status> {
+            if let Some(settlement) = &self.settlement {
+                settlement.entered.notify_one();
+                settlement.acknowledged.notified().await;
+            }
             Ok(tonic::Response::new(InterceptorResult {
                 allowed: true,
                 ..InterceptorResult::default()
@@ -1635,7 +1648,9 @@ mod tests {
         Bytes::from(frame)
     }
 
-    async fn post_commit_test_runtime() -> (
+    async fn post_commit_test_runtime(
+        settlement: Option<ReceiptSettlement>,
+    ) -> (
         GatewayInterceptorRuntime,
         tokio::task::JoinHandle<()>,
         Arc<AtomicUsize>,
@@ -1643,12 +1658,13 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let backend = Arc::new(AtomicUsize::new(0));
-        let controlled = backend.clone();
+        let mode = backend.clone();
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(GatewayInterceptorServer::new(PostCommitTestInterceptor(
-                    controlled,
-                )))
+                .add_service(GatewayInterceptorServer::new(PostCommitTestInterceptor {
+                    mode,
+                    settlement,
+                }))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
@@ -1656,6 +1672,7 @@ mod tests {
         let runtime = openshell_gateway_interceptors::initialize(vec![GatewayInterceptorConfig {
             name: "post-commit-test".to_string(),
             grpc_endpoint: format!("http://{address}"),
+            timeout: Some("5s".into()),
             ..GatewayInterceptorConfig::default()
         }])
         .await
@@ -1666,7 +1683,7 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_admission_rejects_unready_or_rebound_receipts() {
-        let (runtime, task, backend) = post_commit_test_runtime().await;
+        let (runtime, task, backend) = post_commit_test_runtime(None).await;
         let verify = || {
             runtime.check_post_commit_ready(
                 "/openshell.v1.OpenShell/CreateSandbox",
@@ -1686,7 +1703,7 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_admission_pause_leaves_the_running_gateway_readable() {
-        let (runtime, receiver, backend) = post_commit_test_runtime().await;
+        let (runtime, receiver, backend) = post_commit_test_runtime(None).await;
         let dir = tempfile::tempdir().unwrap();
         let pause = dir.path().join("admission");
         tokio::fs::write(&pause, b"paused\n").await.unwrap();
@@ -1749,8 +1766,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_admission_keeps_dispatched_work_after_caller_disconnect() {
-        let (runtime, receiver, _) = post_commit_test_runtime().await;
+    async fn sandbox_admission_counts_cancelled_create_through_receipt_settlement() {
+        use openshell_core::proto::SandboxResponse;
+
+        let metrics = crate::gateway_metrics::MetricsCapture::install();
+        let settlement = ReceiptSettlement::default();
+        let (runtime, receiver, _) = post_commit_test_runtime(Some(settlement.clone())).await;
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("admission");
         tokio::fs::write(&file, b"open\n").await.unwrap();
@@ -1761,58 +1782,44 @@ mod tests {
                 "post-commit-test",
                 "audit-create-sandbox",
             ));
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let inner = {
-            let entered = entered.clone();
-            let release = release.clone();
-            tower::service_fn(move |_request: Request<BoxBody>| {
-                let entered = entered.clone();
-                let release = release.clone();
-                let first = !held.swap(true, Ordering::SeqCst);
-                async move {
-                    if first {
-                        entered.notify_one();
-                        release.notified().await;
-                    }
-                    Ok::<_, Infallible>(
-                        tonic::Status::new(tonic::Code::Unimplemented, "dispatched").into_http(),
-                    )
-                }
-            })
-        };
+        let inner = tower::service_fn(|_request: Request<BoxBody>| async {
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert("grpc-status", HeaderValue::from_static("0"));
+            let body = grpc_frame(&SandboxResponse::default().encode_to_vec());
+            Ok::<_, Infallible>(Response::new(tonic_body_from_bytes_and_trailers(
+                body,
+                Some(trailers),
+            )))
+        });
         let request = || {
             Request::builder()
                 .method(http::Method::POST)
-                .uri("/openshell.v1.OpenShell/StartSandbox")
-                .body(boxed_body_from_bytes(grpc_frame(&[])))
+                .uri("/openshell.v1.OpenShell/CreateSandbox")
+                .body(boxed_body_from_bytes(grpc_frame(
+                    &CreateSandboxRequest::default().encode_to_vec(),
+                )))
                 .unwrap()
         };
-        let mut first = GatewayInterceptorGrpcService::new(
-            inner.clone(),
-            Some(runtime.clone()),
-            Some(state.clone()),
-        );
+        let mut first =
+            GatewayInterceptorGrpcService::new(inner, Some(runtime.clone()), Some(state.clone()));
         let cancelled = tokio::spawn(first.call(request()));
-        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        tokio::time::timeout(Duration::from_secs(2), settlement.entered.notified())
             .await
             .unwrap();
         cancelled.abort();
         assert!(cancelled.await.is_err());
+        assert_eq!(
+            metrics.value("openshell_sandbox_admission_in_flight"),
+            Some(1)
+        );
 
-        let mut canary = GatewayInterceptorGrpcService::new(inner, Some(runtime), Some(state));
-        let still_held = canary.call(request()).await.unwrap();
+        let mut second = GatewayInterceptorGrpcService::new(inner, Some(runtime), Some(state));
+        let still_held = second.call(request()).await.unwrap();
         assert_eq!(grpc_status_from_response(&still_held), "8");
-        release.notify_one();
+        settlement.acknowledged.notify_one();
         tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let response = canary.call(request()).await.unwrap();
-                match grpc_status_from_response(&response).as_str() {
-                    "12" => break,
-                    "8" => tokio::task::yield_now().await,
-                    other => panic!("unexpected gRPC status {other}"),
-                }
+            while metrics.value("openshell_sandbox_admission_in_flight") != Some(0) {
+                tokio::task::yield_now().await;
             }
         })
         .await
@@ -2027,7 +2034,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_commit_decode_failure_preserves_committed_response() {
-        let (runtime, interceptor_task, _) = post_commit_test_runtime().await;
+        let (runtime, interceptor_task, _) = post_commit_test_runtime(None).await;
         let committed = Arc::new(AtomicUsize::new(0));
         let committed_for_service = committed.clone();
         let committed_body = Bytes::from_static(b"malformed committed gRPC response");

@@ -859,6 +859,7 @@ pub(crate) async fn run_server(
     state.sandbox_admission = sandbox_admission::SandboxAdmission::from_environment(
         &config.gateway_interceptors,
         state.extension_jwt_issuer.is_some(),
+        metrics_endpoint.is_some(),
     )?;
     let state = Arc::new(state);
 

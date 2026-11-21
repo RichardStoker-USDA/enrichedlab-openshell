@@ -39,6 +39,7 @@ impl SandboxAdmission {
     pub fn from_environment(
         interceptors: &[GatewayInterceptorConfig],
         signed_extensions: bool,
+        metrics_enabled: bool,
     ) -> Result<Option<Self>, openshell_core::Error> {
         let pause_file = std::env::var_os("OPENSHELL_SANDBOX_ADMISSION_FILE");
         let receipt_interceptor = std::env::var("OPENSHELL_SANDBOX_RECEIPT_INTERCEPTOR");
@@ -56,6 +57,7 @@ impl SandboxAdmission {
                 },
                 interceptors,
                 signed_extensions,
+                metrics_enabled,
             )
             .map(Some),
             _ => Err(openshell_core::Error::config(
@@ -68,8 +70,14 @@ impl SandboxAdmission {
         config: SandboxAdmissionConfig,
         interceptors: &[GatewayInterceptorConfig],
         signed_extensions: bool,
+        metrics_enabled: bool,
     ) -> Result<Self, openshell_core::error::Error> {
         use openshell_core::error::Error;
+        if !metrics_enabled {
+            return Err(Error::config(
+                "sandbox admission requires the gateway metrics listener",
+            ));
+        }
         if !config.pause_file.is_absolute()
             || config.receipt_binding.trim().is_empty()
             || !signed_extensions
@@ -196,6 +204,21 @@ mod tests {
         assert!(!guards("/openshell.v1.OpenShell/StopSandbox"));
         assert!(!guards("/openshell.v1.OpenShell/IssueSandboxToken"));
         assert!(!guards("/openshell.v1.OpenShell/CreateSandboxTemplate"));
+    }
+
+    #[test]
+    fn configured_admission_without_metrics_is_refused() {
+        let settings = SandboxAdmissionConfig {
+            pause_file: "/example/admission".into(),
+            receipt_interceptor: "receipts".into(),
+            receipt_binding: "record-start".into(),
+        };
+        let error = SandboxAdmission::new(settings, &[], true, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires the gateway metrics listener")
+        );
     }
 
     #[tokio::test]

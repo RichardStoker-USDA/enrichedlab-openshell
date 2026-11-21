@@ -607,6 +607,29 @@ The gateway validates snapshot structure and provider-profile semantics. It trea
 
 `image_pull_policy` is a shared driver setting with the canonical values `always`, `if_not_present`, `never`, and `newer`. Set it inside the relevant driver table. Drivers translate these values to their runtime APIs; `newer` is supported only by Podman and is rejected at Docker and Kubernetes startup.
 
+### Pause sandbox admissions
+
+Set these environment variables together for a gateway with a metrics listener
+and a dedicated, authenticated TLS receipt interceptor:
+
+| Variable | Value |
+| --- | --- |
+| `OPENSHELL_SANDBOX_ADMISSION_FILE` | Absolute path to an operator-controlled file containing `open` or `paused`. An ending newline is optional. |
+| `OPENSHELL_SANDBOX_RECEIPT_INTERCEPTOR` | The configured interceptor name. Its binding policy must be `exact`. |
+| `OPENSHELL_SANDBOX_RECEIPT_BINDING` | The interceptor's exact `CreateSandbox` post-commit binding ID. |
+
+A missing or invalid file refuses `CreateSandbox` and `StartSandbox`. While the
+file is open, those RPCs first verify the receipt service's identity and binding
+over its configured connection. Read-only RPCs and existing sessions remain
+available.
+
+Publish `paused` atomically. Verify the file on each replica, both
+`openshell_sandbox_admission_in_flight` and
+`openshell_sandbox_provisioning_workers` at zero, and no durable provisioning
+operation still pending. Reconcile receipt timeouts and write failures against
+the expected starts before shutdown. Keep the file paused during restart and
+check a read-only request and a refused start before reopening.
+
 ## Credential Drivers
 
 Set `credential_drivers` only when the gateway should store provider secrets in an external credential backend. Provider secrets include injectable credentials and gateway-only refresh material such as OAuth refresh tokens, client secrets, and service-account private keys. OpenShell supports at most one enabled credential driver at a time. When `credential_drivers` is omitted, the gateway uses its default encrypted database credential storage. `credential_drivers = []` is invalid in the TOML file; omit the field for the default encrypted store, or select a backend such as `kubernetes-secrets` or `vault`.
