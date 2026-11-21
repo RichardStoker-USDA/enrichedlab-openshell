@@ -3,11 +3,14 @@
 
 //! Operator-controlled sandbox admission at the authenticated gateway boundary.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use crate::persistence::{ObjectCursor, ObjectType, Store};
 use metrics::{Gauge, counter, gauge};
 use openshell_core::config::{GatewayInterceptorBindingPolicy, GatewayInterceptorConfig};
+use openshell_core::proto::{Sandbox, SandboxPhase};
 use openshell_gateway_interceptors::GatewayInterceptorRuntime;
+use prost::Message as _;
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::Status;
@@ -106,7 +109,7 @@ impl SandboxAdmission {
         })
     }
 
-    pub async fn check_open(&self) -> Result<(), Status> {
+    async fn read_pause(&self) -> Result<bool, Status> {
         let unavailable = || Status::unavailable("sandbox admission setting is unavailable");
         let file = tokio::fs::File::open(&self.config.pause_file)
             .await
@@ -117,10 +120,61 @@ impl SandboxAdmission {
             .await
             .map_err(|_| unavailable())?;
         match bytes.as_slice() {
-            b"open" | b"open\n" => Ok(()),
-            b"paused" | b"paused\n" => Err(Status::unavailable("sandbox admissions are paused")),
+            b"open" | b"open\n" => Ok(false),
+            b"paused" | b"paused\n" => Ok(true),
             _ => Err(unavailable()),
         }
+    }
+
+    pub async fn check_open(&self) -> Result<(), Status> {
+        if self.read_pause().await? {
+            return Err(Status::unavailable("sandbox admissions are paused"));
+        }
+        Ok(())
+    }
+
+    pub async fn is_paused(&self) -> bool {
+        matches!(self.read_pause().await, Ok(true))
+    }
+
+    /// A failed compensation can leave an active or transitional sandbox even
+    /// after driver and request futures have finished. Read the persisted
+    /// lifecycle, independently of the process gauges and RPC result.
+    pub async fn durable_drain_clear(&self, store: &Store) -> bool {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            if !self.is_paused().await {
+                return false;
+            }
+            let page_size = 128;
+            let mut after = None;
+            loop {
+                let Ok(records) = store
+                    .list_by_type_after(Sandbox::object_type(), after.as_ref(), page_size)
+                    .await
+                else {
+                    return false;
+                };
+                if !records.iter().all(|record| {
+                    Sandbox::decode(record.payload.as_slice()).is_ok_and(|sandbox| {
+                        matches!(
+                            SandboxPhase::try_from(sandbox.phase()),
+                            Ok(SandboxPhase::Stopped | SandboxPhase::Completed)
+                        ) && !sandbox
+                            .status
+                            .and_then(|status| status.provisioning)
+                            .is_some_and(|operation| operation.driver_operation_pending)
+                    })
+                }) {
+                    return false;
+                }
+                if records.len() < page_size as usize {
+                    return self.is_paused().await;
+                }
+                after = records.last().map(ObjectCursor::from);
+            }
+        })
+        .await
+        .unwrap_or(false)
     }
 
     pub async fn enter(&self) -> Result<StartPermit, Status> {

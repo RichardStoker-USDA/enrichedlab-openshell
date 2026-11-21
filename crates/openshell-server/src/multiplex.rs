@@ -1827,6 +1827,109 @@ mod tests {
         receiver.abort();
     }
 
+    #[tokio::test]
+    async fn sandbox_admission_blocks_drain_after_cancelled_create_rollback_fails() {
+        use crate::persistence::ObjectType;
+        use openshell_core::proto::{Sandbox, SandboxPhase, SandboxStatus};
+
+        let metrics = crate::gateway_metrics::MetricsCapture::install();
+        let (runtime, receiver, _) = post_commit_test_runtime(None).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("admission");
+        tokio::fs::write(&file, b"open\n").await.unwrap();
+        let mut state = crate::grpc::test_support::test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().sandbox_admission =
+            Some(crate::sandbox_admission::SandboxAdmission::for_test(
+                file.clone(),
+                "post-commit-test",
+                "audit-create-sandbox",
+            ));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let fail_rollback = Arc::new(tokio::sync::Notify::new());
+        let handler = {
+            let state = state.clone();
+            let entered = entered.clone();
+            let fail_rollback = fail_rollback.clone();
+            tower::service_fn(move |_request: Request<BoxBody>| {
+                let store = state.store.clone();
+                let entered = entered.clone();
+                let fail_rollback = fail_rollback.clone();
+                async move {
+                    entered.notify_one();
+                    fail_rollback.notified().await;
+                    // Model the durable Deleting record retained by failed
+                    // compensation after the compute driver accepted CREATE.
+                    let sandbox = Sandbox {
+                        status: Some(SandboxStatus {
+                            phase: SandboxPhase::Deleting.into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    };
+                    store
+                        .put(
+                            Sandbox::object_type(),
+                            "failed-rollback",
+                            "failed-rollback",
+                            "default",
+                            &sandbox.encode_to_vec(),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    Ok::<_, Infallible>(
+                        tonic::Status::internal("synthetic rollback failure").into_http(),
+                    )
+                }
+            })
+        };
+        let request = Request::builder()
+            .method(http::Method::POST)
+            .uri("/openshell.v1.OpenShell/CreateSandbox")
+            .body(boxed_body_from_bytes(grpc_frame(
+                &CreateSandboxRequest::default().encode_to_vec(),
+            )))
+            .unwrap();
+        let mut service =
+            GatewayInterceptorGrpcService::new(handler, Some(runtime), Some(state.clone()));
+        let caller = tokio::spawn(service.call(request));
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.is_err());
+        tokio::fs::write(&file, b"paused\n").await.unwrap();
+        let admission = state.sandbox_admission.as_ref().unwrap();
+        assert!(admission.durable_drain_clear(&state.store).await);
+        fail_rollback.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while metrics.value("openshell_sandbox_admission_in_flight") != Some(0) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let endpoint = crate::http::metrics_router_with_admission(recorder.handle(), state);
+        let response = endpoint
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .lines()
+                .any(|line| line == "openshell_sandbox_admission_durable_clear 0")
+        );
+        receiver.abort();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn sandbox_admission_times_out_an_unfinished_body() {
         let stream = futures_util::stream::pending::<

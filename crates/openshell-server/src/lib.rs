@@ -922,13 +922,13 @@ pub(crate) async fn run_server(
             ))
         })?;
         info!(address = %metrics_bind_address, "Metrics server listening");
+        let router = if state.sandbox_admission.is_some() {
+            http::metrics_router_with_admission(prometheus_handle, state.clone())
+        } else {
+            metrics_router(prometheus_handle)
+        };
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(
-                metrics_listener,
-                metrics_router(prometheus_handle).into_make_service(),
-            )
-            .await
-            {
+            if let Err(e) = axum::serve(metrics_listener, router.into_make_service()).await {
                 error!("Metrics server error: {e}");
             }
         });

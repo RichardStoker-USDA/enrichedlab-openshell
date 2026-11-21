@@ -36,8 +36,12 @@ negotiated at startup. Read-only RPCs and existing sessions remain available.
 
 Before stopping the gateway, verify the effective file on every replica.
 Wait for both `openshell_sandbox_admission_in_flight` and
-`openshell_sandbox_provisioning_workers` to reach zero. Confirm no durable
-driver operation remains pending. The first gauge includes dispatched starts
+`openshell_sandbox_provisioning_workers` to reach zero. Read
+`openshell_sandbox_admission_durable_clear` in the same fresh scrape. It is 1
+only when the file is paused and every persisted sandbox is stopped or
+completed with no pending driver operation. A failed rollback can leave
+an active or transitional record even after both in-flight gauges clear.
+Reconcile unresolved lifecycle records against the backend and receipt store. The first gauge includes dispatched starts
 after client disconnect. The second follows driver settlement after a request
 deadline. Start bodies have a 15-second deadline before dispatch. The gateway
 bounds the number of admitted requests in flight to 64.
