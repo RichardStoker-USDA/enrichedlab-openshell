@@ -253,6 +253,24 @@ impl OpenShellService {
 
 #[tonic::async_trait]
 impl openshell_core::proto::sandbox_updates_server::SandboxUpdates for OpenShellService {
+    async fn create_sandbox_before(
+        &self,
+        request: Request<CreateSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        let cutoff =
+            openshell_core::sandbox_start_cutoff::StartCutoff::from_required_header(&request)?;
+        mutation_replay::run(&self.state, cutoff.insert(request)).await
+    }
+
+    async fn start_sandbox_before(
+        &self,
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        let cutoff =
+            openshell_core::sandbox_start_cutoff::StartCutoff::from_required_header(&request)?;
+        mutation_replay::run(&self.state, cutoff.insert(request)).await
+    }
+
     async fn update_sandbox(
         &self,
         request: Request<openshell_core::proto::UpdateSandboxRequest>,

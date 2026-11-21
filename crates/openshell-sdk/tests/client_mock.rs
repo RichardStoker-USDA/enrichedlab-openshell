@@ -1177,6 +1177,20 @@ impl OpenShell for TestOpenShell {
 
 #[tonic::async_trait]
 impl SandboxUpdates for TestOpenShell {
+    async fn create_sandbox_before(
+        &self,
+        _request: tonic::Request<proto::CreateSandboxRequest>,
+    ) -> Result<Response<proto::SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused by this fixture"))
+    }
+
+    async fn start_sandbox_before(
+        &self,
+        _request: tonic::Request<proto::StartSandboxRequest>,
+    ) -> Result<Response<proto::SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused by this fixture"))
+    }
+
     async fn update_sandbox(
         &self,
         request: tonic::Request<proto::UpdateSandboxRequest>,

@@ -1009,6 +1009,15 @@ command. Starting a fresh instance invalidates SSH sessions issued for the
 previous runtime generation. Delete an inactive sandbox normally when you no
 longer need its retained state.
 
+For a time-limited admission, pass `--start-before <UNIX_MS>` to
+`sandbox create` or `sandbox start`. The timestamp is in UTC Unix
+milliseconds. Supported Kubernetes gateways check it after lifecycle
+locks and before starting the backend mutation. Work that starts in
+time keeps its ordinary provisioning and readiness deadlines. Recovery
+preserves an unresolved guarded attempt without starting it again. The
+CLI uses a dedicated RPC for this option, so an older gateway refuses
+the request.
+
 To change the configuration of a retained `Completed` or `Error/MainProcessFailed`
 sandbox, run `sandbox stop` first. Stop cleans up compute and moves the sandbox
 to `Stopped`, preserving its exit code until the next start. This stop behavior

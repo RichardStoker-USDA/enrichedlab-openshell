@@ -24,6 +24,8 @@ const CATALOG: &[(&str, ActivityId)] = &[
     (openshell!("StartSandbox"), UPDATE),
     (openshell!("SuspendSandbox"), UPDATE),
     (openshell!("ResumeSandbox"), UPDATE),
+    ("/openshell.v1.SandboxUpdates/CreateSandboxBefore", CREATE),
+    ("/openshell.v1.SandboxUpdates/StartSandboxBefore", UPDATE),
     ("/openshell.v1.SandboxUpdates/UpdateSandbox", UPDATE),
     (openshell!("BeginRootfsTarStaging"), CREATE),
     (openshell!("CreateSandboxTemplate"), CREATE),

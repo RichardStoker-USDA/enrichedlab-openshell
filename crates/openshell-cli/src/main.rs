@@ -1453,6 +1453,10 @@ enum SandboxCommands {
         #[arg(long, add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
+        /// Start the mutation before this UTC Unix time in milliseconds.
+        #[arg(long, value_name = "UNIX_MS")]
+        start_before: Option<std::num::NonZeroU64>,
+
         /// Create the sandbox from a named sandbox template.
         #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs", "env_from"])]
         template: Option<String>,
@@ -1720,6 +1724,11 @@ enum SandboxCommands {
         /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
+
+        /// Start the mutation before this UTC Unix time in milliseconds.
+        /// The gateway must support the sandbox start cutoff.
+        #[arg(long, value_name = "UNIX_MS")]
+        start_before: Option<std::num::NonZeroU64>,
     },
 
     /// Suspend a ready sandbox and retain its memory state.
@@ -3403,6 +3412,7 @@ async fn run_async() -> Result<()> {
             match command {
                 SandboxCommands::Create {
                     name,
+                    start_before,
                     template,
                     from,
                     upload,
@@ -3494,6 +3504,7 @@ async fn run_async() -> Result<()> {
                         &ctx.name,
                         run::SandboxCreateConfig {
                             name: name.as_deref(),
+                            start_before: start_before.map(std::num::NonZeroU64::get),
                             template: template.as_deref(),
                             from: from.as_deref(),
                             uploads: &upload_specs,
@@ -3636,9 +3647,16 @@ async fn run_async() -> Result<()> {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                             run::sandbox_stop(endpoint, &name, &cli.workspace, &tls).await?;
                         }
-                        SandboxCommands::Start { name } => {
+                        SandboxCommands::Start { name, start_before } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
-                            run::sandbox_start(endpoint, &name, &cli.workspace, &tls).await?;
+                            run::sandbox_start(
+                                endpoint,
+                                &name,
+                                &cli.workspace,
+                                &tls,
+                                start_before.map(std::num::NonZeroU64::get),
+                            )
+                            .await?;
                         }
                         SandboxCommands::Suspend { name } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
@@ -5591,7 +5609,10 @@ mod tests {
         assert!(matches!(
             start.command,
             Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Start { name: None }),
+                command: Some(SandboxCommands::Start {
+                    name: None,
+                    start_before: None
+                }),
             })
         ));
     }

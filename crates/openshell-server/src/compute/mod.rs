@@ -111,6 +111,7 @@ fn supports_suspend_resume(capabilities: &[String]) -> bool {
         .any(|capability| capability == openshell_core::extension_protocol::COMPUTE_SUSPEND_RESUME)
 }
 
+use openshell_core::sandbox_start_cutoff::StartCutoff;
 use provisioning_operation::ProvisioningOperationError;
 /// Driver-specific values that must be delivered atomically with sandbox
 /// creation without expanding the public compute-driver protobuf contract.
@@ -118,6 +119,7 @@ use provisioning_operation::ProvisioningOperationError;
 pub struct SandboxCreateRuntimeInputs {
     pub effective_policy: Option<ProtoSandboxPolicy>,
     pub launch_authentication: Option<Vec<u8>>,
+    pub(crate) start_cutoff: StartCutoff,
 }
 
 impl SandboxCreateRuntimeInputs {
@@ -126,6 +128,7 @@ impl SandboxCreateRuntimeInputs {
         Self {
             effective_policy: Some(effective_policy),
             launch_authentication: None,
+            start_cutoff: StartCutoff::default(),
         }
     }
 }
@@ -935,6 +938,7 @@ pub struct ComputeRuntime {
     driver_info: ComputeDriverInfoSnapshot,
     telemetry_compute_driver: TelemetryComputeDriver,
     driver_process: Option<Arc<ManagedDriverProcess>>,
+    in_process_start_cutoff: bool,
     default_image: String,
     image_preparation_timeout_seconds: u32,
     provisioning_repair_window_ms: i64,
@@ -1062,6 +1066,7 @@ impl ComputeRuntime {
             driver_info,
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process,
+            in_process_start_cutoff: false,
             default_image,
             image_preparation_timeout_seconds: 1800,
             provisioning_repair_window_ms: 300_000,
@@ -1086,6 +1091,12 @@ impl ComputeRuntime {
             supervisor_host: None,
             service_route_index: Arc::new(OnceLock::new()),
         })
+    }
+
+    /// The typed cutoff crosses only the in-process driver boundary.
+    pub(crate) fn with_in_process_start_cutoff(mut self) -> Self {
+        self.in_process_start_cutoff = self.configured_driver_name() == "kubernetes";
+        self
     }
 
     /// Serve the shared supervisor host the gateway coordinates for the
@@ -1684,6 +1695,8 @@ impl ComputeRuntime {
         lifecycle_guard: SandboxLifecycleGuard,
         mutation_guard: MutationGuard,
     ) -> Result<Sandbox, Status> {
+        let cutoff = runtime_inputs.start_cutoff;
+        self.check_start_cutoff(cutoff)?;
         // Defend the internal create path too, before consuming a staged archive
         // or persisting the sandbox. The gRPC handler checks before driver validation.
         self.validate_launch_signer_configured(
@@ -1739,6 +1752,10 @@ impl ComputeRuntime {
                     .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?,
             )
         };
+        cutoff.check()?;
+        if cutoff.is_set() {
+            provisioning_operation::require_start_cutoff(&mut sandbox);
+        }
         let result = self
             .store
             .put_if(
@@ -1830,12 +1847,15 @@ impl ComputeRuntime {
                     // caller cancellation. A crash leaves its sweep marker.
                     if let Some(staged) = staged.as_mut() {
                         staged.prepare_dispatch().await?;
+                    }
+                    cutoff.check()?;
+                    if let Some(staged) = staged.as_mut() {
                         staged.disarm();
                     }
                     let response = driver
-                        .create_sandbox(Request::new(CreateSandboxRequest {
+                        .create_sandbox(cutoff.insert(Request::new(CreateSandboxRequest {
                             sandbox: Some(driver_sandbox),
-                        }))
+                        })))
                         .await;
                     if let Some(staged) = staged.as_mut() {
                         staged.finish_driver_operation(response.is_ok()).await;
@@ -1854,6 +1874,7 @@ impl ComputeRuntime {
             Err(ProvisioningOperationError::Driver { status, settled }) => {
                 let status = match status.code() {
                     Code::AlreadyExists => Status::already_exists("sandbox already exists"),
+                    Code::DeadlineExceeded => status,
                     Code::FailedPrecondition => {
                         Status::failed_precondition(status.message().to_string())
                     }
@@ -2359,14 +2380,35 @@ impl ComputeRuntime {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_sandbox_authenticated(
         &self,
         workspace: &str,
         name: &str,
         authority: Option<&crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>,
     ) -> Result<Sandbox, Status> {
-        self.start_sandbox_with_intent(workspace, name, authority, StartIntent::Start)
+        self.start_sandbox_with_cutoff(workspace, name, authority, StartCutoff::default())
             .await
+    }
+
+    pub(crate) async fn start_sandbox_with_cutoff(
+        &self,
+        workspace: &str,
+        name: &str,
+        authority: Option<&crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>,
+        cutoff: StartCutoff,
+    ) -> Result<Sandbox, Status> {
+        self.start_sandbox_with_intent(workspace, name, authority, StartIntent::Start, cutoff)
+            .await
+    }
+
+    fn check_start_cutoff(&self, cutoff: StartCutoff) -> Result<(), Status> {
+        if cutoff.is_set() && !self.in_process_start_cutoff {
+            return Err(Status::unimplemented(
+                "this compute driver has no sandbox start cutoff",
+            ));
+        }
+        cutoff.check()
     }
 
     #[cfg(test)]
@@ -2398,6 +2440,7 @@ impl ComputeRuntime {
             StartIntent::Resume {
                 restart_if_restore_fails,
             },
+            StartCutoff::default(),
         )
         .await
     }
@@ -2408,6 +2451,7 @@ impl ComputeRuntime {
         name: &str,
         authority: Option<&crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>,
         intent: StartIntent,
+        cutoff: StartCutoff,
     ) -> Result<Sandbox, Status> {
         let verb = match intent {
             StartIntent::Start => "start",
@@ -2440,6 +2484,7 @@ impl ComputeRuntime {
         let sandbox_name = candidate.object_name().to_string();
         let lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
         let sandbox_guard = self.lock_sandbox_for_lifecycle(&lifecycle_guard).await;
+        self.check_start_cutoff(cutoff)?;
         let mut current = self
             .store
             .get_message::<Sandbox>(&sandbox_id)
@@ -2461,6 +2506,7 @@ impl ComputeRuntime {
 
         let mut attempts = 0;
         let (previous, starting, launch_authentication) = loop {
+            cutoff.check()?;
             provisioning_operation::ensure_operation_settled(&current)?;
             self.ensure_no_pending_image_update(&current).await?;
             let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
@@ -2518,6 +2564,11 @@ impl ComputeRuntime {
             }
 
             if phase == SandboxPhase::Starting {
+                if provisioning_operation::start_cutoff_pending(&current) {
+                    return Err(Status::failed_precondition(
+                        "guarded sandbox start remains unresolved",
+                    ));
+                }
                 // Acquiring the lifecycle gate proves that no local worker still
                 // owns this transition. Retry the idempotent driver operation
                 // with the identity and resume intent committed by the original
@@ -2547,6 +2598,7 @@ impl ComputeRuntime {
             };
             let expected_resource_version = sandbox_resource_version(&current);
             let next_identity_for_update = next_identity.clone();
+            cutoff.check()?;
             match self
                 .store
                 .update_message_cas::<Sandbox, _>(
@@ -2565,6 +2617,9 @@ impl ComputeRuntime {
                             self.image_preparation_timeout_seconds,
                             self.provisioning_repair_window_ms,
                         );
+                        if cutoff.is_set() {
+                            provisioning_operation::require_start_cutoff(sandbox);
+                        }
                         if let Some(metadata) = sandbox.metadata.as_mut() {
                             next_identity_for_update.write(&mut metadata.annotations);
                             write_start_intent(
@@ -2624,6 +2679,7 @@ impl ComputeRuntime {
                     starting,
                     lifecycle_guard,
                     launch_authentication,
+                    cutoff,
                 ))
                 .await
             }
@@ -2644,6 +2700,7 @@ impl ComputeRuntime {
         starting: Sandbox,
         lifecycle_guard: SandboxLifecycleGuard,
         launch_authentication: Vec<u8>,
+        cutoff: StartCutoff,
     ) -> Result<Sandbox, Status> {
         self.validate_caller_driver_config(
             starting
@@ -2677,7 +2734,12 @@ impl ComputeRuntime {
                 .call_owned(
                     openshell_otel::rpc::START_SANDBOX,
                     Some(&operation_id),
-                    move |driver| async move { driver.start_sandbox(Request::new(request)).await },
+                    move |driver| async move {
+                        cutoff.check()?;
+                        driver
+                            .start_sandbox(cutoff.insert(Request::new(request)))
+                            .await
+                    },
                 )
                 .await;
             match (response, recreate) {
@@ -2688,10 +2750,13 @@ impl ComputeRuntime {
                             Some(&operation_id),
                             move |driver| async move {
                                 use openshell_core::proto::compute::v1::StartSandboxResponse;
+                                cutoff.check()?;
                                 let response = driver
-                                    .create_sandbox(Request::new(CreateSandboxRequest {
-                                        sandbox: Some(driver_sandbox),
-                                    }))
+                                    .create_sandbox(cutoff.insert(Request::new(
+                                        CreateSandboxRequest {
+                                            sandbox: Some(driver_sandbox),
+                                        },
+                                    )))
                                     .await?;
                                 Ok(tonic::Response::new(StartSandboxResponse {
                                     runtime_identity: response.into_inner().runtime_identity,
@@ -4331,6 +4396,7 @@ impl ComputeRuntime {
             };
 
             if provisioning_deadline::driver_operation_pending(&sandbox)
+                || provisioning_operation::start_cutoff_pending(&sandbox)
                 || in_flight_resume_intent(&sandbox).is_some()
             {
                 warn!(
@@ -4624,6 +4690,9 @@ impl ComputeRuntime {
                     .await;
                 }
                 SandboxPhase::Starting => {
+                    if provisioning_operation::start_cutoff_pending(&sandbox) {
+                        continue;
+                    }
                     if let Err(error) = self.validate_isolation_backend_binding(&sandbox) {
                         warn!(%error, "Rejected pending isolation backend selection");
                         continue;
@@ -5116,6 +5185,7 @@ impl ComputeRuntime {
             || !is_automatic_restart_transition(&current)
             || !due
             || provisioning_deadline::driver_operation_pending(&current)
+            || provisioning_operation::start_cutoff_pending(&current)
             || provisioning_deadline::timed_out(&current)
         {
             // Main-process exit may schedule restart while CREATE is pending.
@@ -8788,6 +8858,7 @@ pub fn new_test_runtime_with_driver(
         },
         telemetry_compute_driver: TelemetryComputeDriver::custom(),
         driver_process: None,
+        in_process_start_cutoff: false,
         default_image: "openshell/sandbox:test".to_string(),
         image_preparation_timeout_seconds: 1800,
         provisioning_repair_window_ms: 300_000,
@@ -10088,6 +10159,7 @@ mod tests {
             },
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process: None,
+            in_process_start_cutoff: false,
             default_image: "openshell/sandbox:test".to_string(),
             image_preparation_timeout_seconds: 1800,
             provisioning_repair_window_ms: 300_000,
@@ -10112,6 +10184,31 @@ mod tests {
             supervisor_host: None,
             service_route_index: Arc::new(OnceLock::new()),
         }
+    }
+
+    #[tokio::test]
+    async fn a_driver_name_alone_cannot_enable_a_start_cutoff() {
+        let driver = Arc::new(TestDriver::default());
+        let runtime = test_runtime_for_driver(driver, "kubernetes").await;
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            openshell_core::sandbox_start_cutoff::HEADER,
+            (openshell_core::time::now_ms() + 60_000)
+                .to_string()
+                .parse()
+                .unwrap(),
+        );
+        let cutoff = StartCutoff::from_required_header(&request).unwrap();
+        assert_eq!(
+            runtime.check_start_cutoff(cutoff).unwrap_err().code(),
+            Code::Unimplemented
+        );
+        assert!(
+            runtime
+                .with_in_process_start_cutoff()
+                .check_start_cutoff(cutoff)
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -17905,6 +18002,61 @@ mod tests {
                 0,
                 "{driver_name} should retain operator-owned lifecycle"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_never_launches_an_unconfirmed_guarded_attempt() {
+        let driver = ControlledDriver::new();
+        let runtime =
+            test_runtime_with_gateway_managed_lifecycle(driver.clone(), "kubernetes").await;
+        let now = openshell_core::time::now_ms();
+        for (id, phase, outcome) in [
+            ("guarded-wake", SandboxPhase::Starting, None),
+            (
+                "guarded-create-refused",
+                SandboxPhase::Provisioning,
+                Some(false),
+            ),
+            (
+                "guarded-create-started",
+                SandboxPhase::Provisioning,
+                Some(true),
+            ),
+        ] {
+            let mut sandbox = sandbox_record(id, id, phase);
+            sandbox.status.as_mut().unwrap().provisioning = Some(
+                provisioning_deadline::new_preparation_record(now, 60, 60_000),
+            );
+            provisioning_operation::require_start_cutoff(&mut sandbox);
+            runtime.store.put_message(&sandbox).await.unwrap();
+            if let Some(started) = outcome {
+                let result = runtime
+                    .await_provisioning_operation(&sandbox, async move {
+                        if started {
+                            Ok(())
+                        } else {
+                            Err(Status::deadline_exceeded("fixture cutoff"))
+                        }
+                    })
+                    .await;
+                assert_eq!(result.is_ok(), started);
+            }
+        }
+
+        runtime.start_persisted_sandboxes().await.unwrap();
+
+        let calls = driver.start_requests();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "guarded-create-started");
+        for id in ["guarded-wake", "guarded-create-refused"] {
+            let retained = runtime
+                .store
+                .get_message::<Sandbox>(id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(provisioning_operation::start_cutoff_pending(&retained));
         }
     }
 

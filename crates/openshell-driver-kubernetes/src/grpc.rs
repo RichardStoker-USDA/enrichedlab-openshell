@@ -153,14 +153,16 @@ impl ComputeDriver for ComputeDriverService {
         Box::pin(
             self.rpc_tracer
                 .trace(openshell_otel::rpc::CREATE_SANDBOX, async {
+                    let cutoff = openshell_core::sandbox_start_cutoff::StartCutoff::get(&request);
                     let sandbox = request
                         .into_inner()
                         .sandbox
                         .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-                    let runtime_identity =
-                        self.driver.create_sandbox(&sandbox).await.map_err(|e| {
-                            Status::from(openshell_core::ComputeDriverError::from(e))
-                        })?;
+                    let runtime_identity = self
+                        .driver
+                        .create_sandbox_before(&sandbox, cutoff)
+                        .await
+                        .map_err(crate::KubernetesDriverError::into_rpc_status)?;
                     Ok(Response::new(CreateSandboxResponse { runtime_identity }))
                 }),
         )
@@ -204,20 +206,20 @@ impl ComputeDriver for ComputeDriverService {
         Box::pin(
             self.rpc_tracer
                 .trace(openshell_otel::rpc::START_SANDBOX, async {
+                    let cutoff = openshell_core::sandbox_start_cutoff::StartCutoff::get(&request);
                     let request = request.into_inner();
                     if request.sandbox_id.is_empty() {
                         return Err(Status::invalid_argument("sandbox_id is required"));
                     }
-                    let runtime_identity = Box::pin(self.driver.start_sandbox(
+                    let runtime_identity = Box::pin(self.driver.start_sandbox_before(
                         &request.sandbox_id,
                         &request.generation_id,
                         &request.launch_authentication,
                         &request.expected_runtime_identity,
+                        cutoff,
                     ))
                     .await
-                    .map_err(|error| {
-                        Status::from(openshell_core::ComputeDriverError::from(error))
-                    })?;
+                    .map_err(crate::KubernetesDriverError::into_rpc_status)?;
                     Ok(Response::new(StartSandboxResponse { runtime_identity }))
                 }),
         )

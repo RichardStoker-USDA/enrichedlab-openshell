@@ -70,6 +70,7 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
+use openshell_core::sandbox_start_cutoff::StartCutoff;
 use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
 use openshell_sandbox_backend::boundary_protocol::{
     GatewayVerificationKey, SandboxTlsClientConfig, SandboxTlsServerConfig,
@@ -485,10 +486,23 @@ pub enum KubernetesDriverError {
     #[error("{0}")]
     Precondition(String),
     #[error("{0}")]
+    StartCutoff(Box<tonic::Status>),
+    #[error("{0}")]
     Message(String),
 }
 
 impl KubernetesDriverError {
+    pub(crate) fn start_cutoff(error: tonic::Status) -> Self {
+        Self::StartCutoff(Box::new(error))
+    }
+
+    pub(crate) fn into_rpc_status(self) -> tonic::Status {
+        match self {
+            Self::StartCutoff(status) => *status,
+            other => openshell_core::ComputeDriverError::from(other).into(),
+        }
+    }
+
     pub(crate) fn from_kube(err: KubeError) -> Self {
         match err {
             KubeError::Api(api) if api.code == 409 && api.reason == "AlreadyExists" => {
@@ -587,6 +601,7 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
             KubernetesDriverError::NotFound => Self::NotFound,
             KubernetesDriverError::InvalidArgument(m) => Self::InvalidArgument(m),
             KubernetesDriverError::Precondition(m) => Self::Precondition(m),
+            KubernetesDriverError::StartCutoff(status) => Self::Message(status.message().into()),
             KubernetesDriverError::Message(m) => Self::Message(m),
         }
     }
@@ -1571,6 +1586,15 @@ impl KubernetesComputeDriver {
     /// namespace.
     ///
     pub async fn ensure_namespace(&self, workspace: &str) -> Result<String, KubernetesDriverError> {
+        self.ensure_namespace_before(workspace, StartCutoff::default())
+            .await
+    }
+
+    async fn ensure_namespace_before(
+        &self,
+        workspace: &str,
+        cutoff: StartCutoff,
+    ) -> Result<String, KubernetesDriverError> {
         let ns_name = managed_namespace(&self.config.gateway_id, workspace);
         let ns_api: Api<Namespace> = Api::all(self.client.clone());
 
@@ -1614,6 +1638,9 @@ impl KubernetesComputeDriver {
             ..Default::default()
         };
 
+        cutoff
+            .check()
+            .map_err(KubernetesDriverError::start_cutoff)?;
         let initial_namespace = match tokio::time::timeout(
             KUBE_API_TIMEOUT,
             ns_api.create(&PostParams::default(), &ns),
@@ -2565,9 +2592,14 @@ impl KubernetesComputeDriver {
     }
 
     #[allow(clippy::similar_names)]
+    pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<String, KubernetesDriverError> {
+        self.create_sandbox_before(sandbox, StartCutoff::default())
+            .await
+    }
+
     #[tracing::instrument(
         name = "kubernetes.provision",
-        skip(self, sandbox),
+        skip(self, sandbox, cutoff),
         fields(
             otel.name = "kubernetes.provision",
             otel.status_code = tracing::field::Empty,
@@ -2575,14 +2607,21 @@ impl KubernetesComputeDriver {
             sandbox.name = %sandbox.name,
         )
     )]
-    pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<String, KubernetesDriverError> {
+    pub(crate) async fn create_sandbox_before(
+        &self,
+        sandbox: &Sandbox,
+        cutoff: StartCutoff,
+    ) -> Result<String, KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let _guard = self
             .lifecycle_gates
             .gate_for(&sandbox.id)
             .lock_owned()
             .await;
-        let result = Box::pin(self.create_sandbox_inner(sandbox)).await;
+        cutoff
+            .check()
+            .map_err(KubernetesDriverError::start_cutoff)?;
+        let result = Box::pin(self.create_sandbox_inner(sandbox, cutoff)).await;
         span_status.finish(result)
     }
 
@@ -2590,6 +2629,7 @@ impl KubernetesComputeDriver {
     async fn create_sandbox_inner(
         &self,
         sandbox: &Sandbox,
+        cutoff: StartCutoff,
     ) -> Result<String, KubernetesDriverError> {
         openshell_core::resource_admission::check_sandbox_driver_config(
             self.config.allow_driver_config,
@@ -2616,7 +2656,7 @@ impl KubernetesComputeDriver {
 
         let target_namespace = match self.config.workspace_mode {
             WorkspaceMode::Shared => self.config.namespace.clone(),
-            WorkspaceMode::Managed => self.ensure_namespace(workspace).await?,
+            WorkspaceMode::Managed => self.ensure_namespace_before(workspace, cutoff).await?,
             WorkspaceMode::Operator => {
                 self.wait_for_operator_allowlist()
                     .await
@@ -2690,6 +2730,9 @@ impl KubernetesComputeDriver {
         let kube_name = self.config.kube_resource_name(workspace, name);
         let mut data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
             .map_err(KubernetesDriverError::InvalidArgument)?;
+        cutoff
+            .check()
+            .map_err(KubernetesDriverError::start_cutoff)?;
         self.create_sandbox_runtime_fence(&target_namespace, &proxy_names)
             .await?;
         // A missing bootstrap Secret keeps both pods inert as defense in
@@ -4172,13 +4215,20 @@ impl KubernetesComputeDriver {
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let _guard = self.lifecycle_gates.gate_for(sandbox_id).lock_owned().await;
-        let result = Box::pin(self.stop_sandbox_inner(sandbox_id)).await;
+        let result = Box::pin(self.stop_sandbox_inner(sandbox_id, StartCutoff::default())).await;
         span_status.finish(result)
     }
 
-    async fn stop_sandbox_inner(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
+    async fn stop_sandbox_inner(
+        &self,
+        sandbox_id: &str,
+        cutoff: StartCutoff,
+    ) -> Result<(), KubernetesDriverError> {
         let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout, phase, placement) =
             self.prepare_sandbox_stop(sandbox_id).await?;
+        cutoff
+            .check()
+            .map_err(KubernetesDriverError::start_cutoff)?;
         if phase != Some(SandboxRuntimeBootstrapPhase::Suspending) {
             self.release_generation_supervisor(sandbox_id, &namespace, &placement)
                 .await?;
@@ -4254,6 +4304,23 @@ impl KubernetesComputeDriver {
         }
     }
 
+    pub async fn start_sandbox(
+        &self,
+        sandbox_id: &str,
+        generation_id: &str,
+        launch_authentication: &[u8],
+        expected_runtime_identity: &str,
+    ) -> Result<String, KubernetesDriverError> {
+        self.start_sandbox_before(
+            sandbox_id,
+            generation_id,
+            launch_authentication,
+            expected_runtime_identity,
+            StartCutoff::default(),
+        )
+        .await
+    }
+
     #[tracing::instrument(
         name = "kubernetes.start_sandbox",
         skip_all,
@@ -4263,20 +4330,25 @@ impl KubernetesComputeDriver {
             sandbox.id = %sandbox_id,
         )
     )]
-    pub async fn start_sandbox(
+    pub(crate) async fn start_sandbox_before(
         &self,
         sandbox_id: &str,
         generation_id: &str,
         launch_authentication: &[u8],
         expected_runtime_identity: &str,
+        cutoff: StartCutoff,
     ) -> Result<String, KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let _guard = self.lifecycle_gates.gate_for(sandbox_id).lock_owned().await;
+        cutoff
+            .check()
+            .map_err(KubernetesDriverError::start_cutoff)?;
         let result = Box::pin(self.start_sandbox_runtime_generation(
             sandbox_id,
             generation_id,
             launch_authentication,
             expected_runtime_identity,
+            cutoff,
         ))
         .await;
         span_status.finish(result)
@@ -4289,6 +4361,7 @@ impl KubernetesComputeDriver {
         encoded_generation: &str,
         encoded_authentication: &[u8],
         encoded_expected_runtime_identity: &str,
+        cutoff: StartCutoff,
     ) -> Result<String, KubernetesDriverError> {
         let staged = self.read_staged_bootstrap_material().await?;
         let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
@@ -4343,6 +4416,9 @@ impl KubernetesComputeDriver {
                     == SandboxRuntimeControlAvailability::Available
                     && sandbox_runtime_bootstrap_is_ready_to_complete(&object)
                 {
+                    cutoff
+                        .check()
+                        .map_err(KubernetesDriverError::start_cutoff)?;
                     self.complete_sandbox_runtime_bootstrap(&lookup_api, &object)
                         .await;
                     let cr_uid = object.metadata.uid.as_deref().ok_or_else(|| {
@@ -4363,7 +4439,7 @@ impl KubernetesComputeDriver {
             // its resources from a clean suspended state. This is safe even
             // after gateway replacement because launch credentials stay in
             // memory and are supplied again by the caller.
-            self.stop_sandbox_inner(sandbox_id).await?;
+            self.stop_sandbox_inner(sandbox_id, cutoff).await?;
             let refreshed = lookup_api
                 .api
                 .list(&ListParams::default().labels(&selector))
@@ -4403,12 +4479,13 @@ impl KubernetesComputeDriver {
                 // Suspend the controller and recreate both Pods so neither
                 // side retains credentials for the replaced gateway. Suspend
                 // even if the old workload Pod disappeared before this call.
-                self.stop_sandbox_inner(sandbox_id).await?;
+                self.stop_sandbox_inner(sandbox_id, cutoff).await?;
                 return Box::pin(self.start_sandbox_runtime_generation(
                     sandbox_id,
                     encoded_generation,
                     encoded_authentication,
                     encoded_expected_runtime_identity,
+                    StartCutoff::default(),
                 ))
                 .await;
             }
@@ -4478,6 +4555,9 @@ impl KubernetesComputeDriver {
                 .expect("restart patch")
                 .remove("containers");
         }
+        cutoff
+            .check()
+            .map_err(KubernetesDriverError::start_cutoff)?;
         self.create_sandbox_runtime_fence(&namespace, &names)
             .await?;
         // Validate the current gateway generation before touching a stopped
@@ -4636,7 +4716,10 @@ impl KubernetesComputeDriver {
         if let Err(error) = restart {
             // The restart patch may not have recorded the sandbox instance yet.
             self.remove_shared_instance(&placement);
-            if let Err(rollback_error) = self.stop_sandbox_inner(sandbox_id).await {
+            if let Err(rollback_error) = self
+                .stop_sandbox_inner(sandbox_id, StartCutoff::default())
+                .await
+            {
                 return Err(KubernetesDriverError::Message(format!(
                     "restart failed: {error}; rollback remains pending: {rollback_error}"
                 )));
@@ -9882,7 +9965,7 @@ mod tests {
             assert_eq!(error.code(), tonic::Code::FailedPrecondition);
             assert!(error.message().contains("allow_driver_config"));
             assert!(
-                matches!(Box::pin(driver.create_sandbox_inner(&sandbox)).await, Err(KubernetesDriverError::Precondition(message)) if message.contains("allow_driver_config"))
+                matches!(Box::pin(driver.create_sandbox_inner(&sandbox, StartCutoff::default())).await, Err(KubernetesDriverError::Precondition(message)) if message.contains("allow_driver_config"))
             );
         }
     }
@@ -12173,7 +12256,7 @@ mod tests {
                     // Shared-mode provisioning reaches validation without namespace creation.
                     if workspace_mode == WorkspaceMode::Shared {
                         assert!(matches!(
-                            Box::pin(driver.create_sandbox_inner(&sandbox)).await,
+                            Box::pin(driver.create_sandbox_inner(&sandbox, StartCutoff::default())).await,
                             Err(KubernetesDriverError::InvalidArgument(message))
                                 if message.contains("reserved OpenShell path")
                         ));
@@ -12803,6 +12886,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_kubernetes_mutation_waiting_for_its_lifecycle_lock_cannot_start_late() {
+        use openshell_core::sandbox_start_cutoff::HEADER;
+
+        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
+        for create in [true, false] {
+            let sandbox = Sandbox {
+                id: if create {
+                    "cutoff-create"
+                } else {
+                    "cutoff-start"
+                }
+                .into(),
+                ..Default::default()
+            };
+            let mutex = driver.lifecycle_gates.gate_for(&sandbox.id);
+            let guard = mutex.lock_owned().await;
+            let mut request = tonic::Request::new(());
+            request.metadata_mut().insert(
+                HEADER,
+                (openshell_core::time::now_ms() + 100)
+                    .to_string()
+                    .parse()
+                    .unwrap(),
+            );
+            let cutoff = StartCutoff::from_required_header(&request).unwrap();
+            let operation = async {
+                if create {
+                    driver.create_sandbox_before(&sandbox, cutoff).await
+                } else {
+                    driver
+                        .start_sandbox_before(&sandbox.id, "", &[], "", cutoff)
+                        .await
+                }
+            };
+            let ((), result) = tokio::join!(
+                async {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    drop(guard);
+                },
+                operation,
+            );
+            assert_eq!(
+                result.unwrap_err().into_rpc_status().code(),
+                tonic::Code::DeadlineExceeded
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn create_sandbox_rejects_disallowed_pod_metadata() {
         let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
         for (template, key) in [
@@ -12820,7 +12952,7 @@ mod tests {
                 ..Default::default()
             };
             assert!(matches!(
-                Box::pin(driver.create_sandbox_inner(&sandbox)).await,
+                Box::pin(driver.create_sandbox_inner(&sandbox, StartCutoff::default())).await,
                 Err(KubernetesDriverError::InvalidArgument(message)) if message.contains(key)
             ));
         }

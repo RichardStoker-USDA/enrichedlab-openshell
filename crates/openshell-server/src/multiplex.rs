@@ -500,7 +500,7 @@ where
                 return inner.ready().await?.call(req).await;
             };
 
-            let path = req.uri().path().to_string();
+            let path = interceptor_policy_path(req.uri().path()).to_string();
             if !interceptors.should_intercept_path(&path) {
                 return inner.ready().await?.call(req).await;
             }
@@ -586,6 +586,18 @@ where
 
             Ok(response)
         })
+    }
+}
+
+/// Guarded methods have the same request, response and interceptor policy as
+/// the original lifecycle methods. Dispatch keeps the real URI.
+fn interceptor_policy_path(path: &str) -> &str {
+    match path {
+        "/openshell.v1.SandboxUpdates/CreateSandboxBefore" => {
+            "/openshell.v1.OpenShell/CreateSandbox"
+        }
+        "/openshell.v1.SandboxUpdates/StartSandboxBefore" => "/openshell.v1.OpenShell/StartSandbox",
+        _ => path,
     }
 }
 
@@ -2143,14 +2155,14 @@ mod tests {
             spec: Some(SandboxSpec::default()),
             ..Default::default()
         };
-        let request = || {
+        let request = |path: &str| {
             let principal = crate::grpc::test_support::authed_request(())
                 .extensions()
                 .get::<Principal>()
                 .unwrap()
                 .clone();
             Request::builder()
-                .uri("/openshell.v1.OpenShell/CreateSandbox")
+                .uri(path)
                 .header("content-type", "application/grpc")
                 .header("openshell-replayed", "true")
                 .extension(principal)
@@ -2161,7 +2173,7 @@ mod tests {
             .ready()
             .await
             .unwrap()
-            .call(request())
+            .call(request("/openshell.v1.OpenShell/CreateSandbox"))
             .await
             .unwrap();
         assert!(!first.headers().contains_key("openshell-replayed"));
@@ -2183,7 +2195,7 @@ mod tests {
             .ready()
             .await
             .unwrap()
-            .call(request())
+            .call(request("/openshell.v1.OpenShell/CreateSandbox"))
             .await
             .unwrap();
         assert_eq!(replay.headers().get("openshell-replayed").unwrap(), "true");
@@ -2200,11 +2212,24 @@ mod tests {
             .ready()
             .await
             .unwrap()
-            .call(request())
+            .call(request("/openshell.v1.OpenShell/CreateSandbox"))
             .await
             .unwrap();
         assert_eq!(denied.headers().get("grpc-status").unwrap(), "7");
         assert_eq!(interceptor.validations.load(Ordering::SeqCst), 3);
+        assert_eq!(interceptor.observations.load(Ordering::SeqCst), 1);
+
+        // The guarded route must enforce the same creation rules even though
+        // it has a distinct gRPC URI to make old gateways fail closed.
+        let guarded = service
+            .ready()
+            .await
+            .unwrap()
+            .call(request("/openshell.v1.SandboxUpdates/CreateSandboxBefore"))
+            .await
+            .unwrap();
+        assert_eq!(guarded.headers().get("grpc-status").unwrap(), "7");
+        assert_eq!(interceptor.validations.load(Ordering::SeqCst), 4);
         assert_eq!(interceptor.observations.load(Ordering::SeqCst), 1);
         task.abort();
     }

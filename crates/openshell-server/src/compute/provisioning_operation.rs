@@ -50,6 +50,24 @@ pub(super) fn claim_record(sandbox: &mut Sandbox) {
     }
 }
 
+pub(super) fn require_start_cutoff(sandbox: &mut Sandbox) {
+    if let Some(record) = sandbox
+        .status
+        .as_mut()
+        .and_then(|status| status.provisioning.as_mut())
+    {
+        record.caller_start_cutoff_pending = true;
+    }
+}
+
+pub(super) fn start_cutoff_pending(sandbox: &Sandbox) -> bool {
+    sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.provisioning.as_ref())
+        .is_some_and(|record| record.caller_start_cutoff_pending)
+}
+
 pub(super) fn ensure_current_result(current: &Sandbox, owned: &Sandbox) -> Result<(), Status> {
     if !same_operation(current, owned)
         || sandbox_runtime_generation(current) != sandbox_runtime_generation(owned)
@@ -132,7 +150,7 @@ impl ComputeRuntime {
             let result = operation.await;
             let settled = if tracked {
                 let settled = runtime
-                    .settle_provisioning_operation(&owned_attempt)
+                    .settle_provisioning_operation(&owned_attempt, result.is_ok())
                     .await
                     .map_err(ProvisioningOperationError::Monitor)?;
                 // Settlement records a known response even if another writer
@@ -251,12 +269,18 @@ impl ComputeRuntime {
         ))
     }
 
-    async fn settle_provisioning_operation(&self, starting: &Sandbox) -> Result<Sandbox, Status> {
+    async fn settle_provisioning_operation(
+        &self,
+        starting: &Sandbox,
+        launch_confirmed: bool,
+    ) -> Result<Sandbox, Status> {
         // Keep the observed response in this task across transient persistence
         // failures. A process crash still leaves the durable claim intact;
         // neither lease expiry nor backend absence can safely clear it.
         loop {
-            let result = self.try_settle_provisioning_operation(starting).await;
+            let result = self
+                .try_settle_provisioning_operation(starting, launch_confirmed)
+                .await;
             match result {
                 Ok(settled) => return Ok(settled),
                 Err(error) if error.code() == tonic::Code::Aborted => return Err(error),
@@ -272,6 +296,7 @@ impl ComputeRuntime {
     async fn try_settle_provisioning_operation(
         &self,
         starting: &Sandbox,
+        launch_confirmed: bool,
     ) -> Result<Sandbox, Status> {
         let current = self
             .store
@@ -296,6 +321,9 @@ impl ComputeRuntime {
                         .and_then(|status| status.provisioning.as_mut())
                     {
                         record.driver_operation_pending = false;
+                        if launch_confirmed {
+                            record.caller_start_cutoff_pending = false;
+                        }
                         // Any stop before this response may have seen absence before
                         // the late create committed. Require another cleanup pass.
                         record.cleanup_completed_time = None;

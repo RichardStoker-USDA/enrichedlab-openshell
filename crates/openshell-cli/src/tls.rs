@@ -344,6 +344,34 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
 /// `TRACEPARENT`/`TRACESTATE` trace context from the environment on every
 /// request. With no token and no trace context, the interceptor is a no-op.
 pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
+    let (channel, interceptor) = authenticated_channel(server, tls).await?;
+    Ok(openshell_sdk::raw::GrpcClient::with_interceptor(
+        channel,
+        interceptor,
+    ))
+}
+
+pub async fn sandbox_updates_client(
+    server: &str,
+    tls: &TlsOptions,
+) -> Result<
+    openshell_core::proto::sandbox_updates_client::SandboxUpdatesClient<
+        tonic::service::interceptor::InterceptedService<Channel, GatewayInterceptor>,
+    >,
+> {
+    let (channel, interceptor) = authenticated_channel(server, tls).await?;
+    Ok(
+        openshell_core::proto::sandbox_updates_client::SandboxUpdatesClient::with_interceptor(
+            channel,
+            interceptor,
+        ),
+    )
+}
+
+async fn authenticated_channel(
+    server: &str,
+    tls: &TlsOptions,
+) -> Result<(Channel, GatewayInterceptor)> {
     let config = sdk_client_config(server, tls)?;
     // Keep the SDK's transport state machine out of every command future.
     // Most CLI commands compose this helper into larger async operations.
@@ -357,10 +385,7 @@ pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
         auth: client.auth_interceptor(),
         trace: EnvTraceContextInterceptor::from_env(),
     };
-    Ok(openshell_sdk::raw::GrpcClient::with_interceptor(
-        client.channel(),
-        interceptor,
-    ))
+    Ok((client.channel(), interceptor))
 }
 
 #[cfg(test)]

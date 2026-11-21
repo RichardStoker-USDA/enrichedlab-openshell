@@ -2351,6 +2351,7 @@ async fn build_compute_runtime(
                 .map_err(|error| {
                     Error::execution(format!("failed to create compute runtime: {error}"))
                 })?
+                .with_in_process_start_cutoff()
                 .with_supervisor_host(supervisor_host)
                 .with_image_update_driver(image_updates)
                 .with_app_endpoint_resolver(app_endpoint_resolver.into_inner()),

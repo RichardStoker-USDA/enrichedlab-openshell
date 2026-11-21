@@ -178,10 +178,12 @@ mod tests {
     // image wire identity, now with explicit presence. Compute configuration
     // updates use a separate capability/service and add one classified RPC.
     // Discovery RPCs move to ServiceDiscovery; message and durable closures are unchanged.
+    // Guarded lifecycle methods reuse the public start/create messages. An
+    // additive provisioning flag defaults to false for every prior row.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "daa132037ee47c7a46b08dfab9bab379961bc06ff3e9ebbb329809b724f2a4f6";
+        "7f3cfcd597eee6ea3d634ab8cf077ff0300158a5a7abd79ea69e6cac8ce15213";
     const DURABLE_SCHEMA_SHA256: &str =
-        "cb15f8f79a855064a43fe8c6cd908bf07eca6604e2bf8ab7d2de0ef33e97da4e";
+        "91e75b341a90ff457ad2892447d3197885beda76dea11c3aaeca786bdd978670";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
     // Encoded with the schema that omitted stable_placeholder. Keep these
@@ -230,6 +232,10 @@ mod tests {
     ];
     const PEER_CONFIG_RPC_SIGNATURES: [&str; 1] = [
         "openshell.v1.OpenShell/PeerNotifyConfigUpdate|.openshell.v1.PeerNotifyConfigUpdateRequest|.openshell.v1.PeerNotifyConfigUpdateResponse|false|false",
+    ];
+    const GUARDED_LIFECYCLE_RPC_SIGNATURES: [&str; 2] = [
+        "openshell.v1.SandboxUpdates/CreateSandboxBefore|.openshell.v1.CreateSandboxRequest|.openshell.v1.SandboxResponse|false|false",
+        "openshell.v1.SandboxUpdates/StartSandboxBefore|.openshell.v1.StartSandboxRequest|.openshell.v1.SandboxResponse|false|false",
     ];
     // Synthetic SandboxSpec bytes with log level, provider, and command fields,
     // emitted before the gateway-owned attachment epoch field was introduced.
@@ -653,11 +659,15 @@ mod tests {
                 "peer config RPC is missing or changed: {signature}"
             );
         }
+        for signature in GUARDED_LIFECYCLE_RPC_SIGNATURES {
+            assert!(methods.iter().any(|method| method == signature));
+        }
         assert_eq!(
             compiled_method_count,
             113 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
+                + GUARDED_LIFECYCLE_RPC_SIGNATURES.len()
                 + isolation_methods.len()
                 + sandbox_protocol_methods.len()
                 + supervisor_host_methods.len(),
@@ -667,7 +677,8 @@ mod tests {
             methods.len(),
             83 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
-                + PEER_CONFIG_RPC_SIGNATURES.len(),
+                + PEER_CONFIG_RPC_SIGNATURES.len()
+                + GUARDED_LIFECYCLE_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -771,6 +782,18 @@ mod tests {
         assert_eq!(spec.providers, ["synthetic-provider"]);
         assert_eq!(spec.command, ["echo"]);
         assert!(spec.provider_attachment_epoch.is_empty());
+    }
+
+    #[test]
+    fn old_provisioning_rows_keep_the_driver_claim_without_a_cutoff() {
+        use openshell_core::proto::SandboxProvisioning;
+
+        let old_row = [0x0a, 3, b'o', b'l', b'd', 0x70, 1];
+        let record = SandboxProvisioning::decode(old_row.as_slice()).unwrap();
+        assert_eq!(record.attempt_id, "old");
+        assert!(record.driver_operation_pending);
+        assert!(!record.caller_start_cutoff_pending);
+        assert_eq!(record.encode_to_vec(), old_row);
     }
 
     #[test]

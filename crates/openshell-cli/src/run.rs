@@ -433,6 +433,7 @@ async fn finalize_sandbox_create_session(
 #[derive(Debug)]
 pub struct SandboxCreateConfig<'a> {
     pub name: Option<&'a str>,
+    pub start_before: Option<u64>,
     pub template: Option<&'a str>,
     pub from: Option<&'a str>,
     pub uploads: &'a [(String, Option<String>, bool)],
@@ -465,6 +466,7 @@ impl Default for SandboxCreateConfig<'_> {
     fn default() -> Self {
         Self {
             name: None,
+            start_before: None,
             template: None,
             from: None,
             uploads: &[],
@@ -505,6 +507,7 @@ pub async fn sandbox_create(
 ) -> Result<i32> {
     let SandboxCreateConfig {
         name,
+        start_before,
         template,
         from,
         uploads,
@@ -715,7 +718,16 @@ pub async fn sandbox_create(
             .collect(),
     };
 
-    let response = match client.create_sandbox(request).await {
+    let response = match start_before {
+        Some(cutoff) => {
+            super::tls::sandbox_updates_client(server, tls)
+                .await?
+                .create_sandbox_before(cutoff_request(request, cutoff))
+                .await
+        }
+        None => client.create_sandbox(request).await,
+    };
+    let response = match response {
         Ok(resp) => resp,
         Err(status) if status.code() == Code::AlreadyExists => {
             return Err(miette::miette!(
@@ -4142,17 +4154,26 @@ pub async fn sandbox_start(
     name: &str,
     workspace: &str,
     tls: &TlsOptions,
+    start_before: Option<u64>,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
-    let sandbox = client
-        .start_sandbox(StartSandboxRequest {
-            request_id: String::new(),
-            name: name.to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                workspace.to_string(),
-            )),
-        })
-        .await
+    let request = StartSandboxRequest {
+        request_id: String::new(),
+        name: name.to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            workspace.to_string(),
+        )),
+    };
+    let response = match start_before {
+        Some(cutoff) => {
+            super::tls::sandbox_updates_client(server, tls)
+                .await?
+                .start_sandbox_before(cutoff_request(request, cutoff))
+                .await
+        }
+        None => client.start_sandbox(request).await,
+    };
+    let sandbox = response
         .into_diagnostic()?
         .into_inner()
         .sandbox
@@ -4160,6 +4181,18 @@ pub async fn sandbox_start(
     wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Ready).await?;
     println!("{} Started sandbox {name}", "✓".green().bold());
     Ok(())
+}
+
+fn cutoff_request<T>(message: T, cutoff: u64) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    request.metadata_mut().insert(
+        openshell_core::sandbox_start_cutoff::HEADER,
+        cutoff
+            .to_string()
+            .parse()
+            .expect("Unix milliseconds are valid metadata"),
+    );
+    request
 }
 
 /// Suspend a ready sandbox, retaining its memory state, and wait until it is suspended.

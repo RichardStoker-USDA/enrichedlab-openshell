@@ -3533,6 +3533,19 @@ async fn run_cli_sandbox_create(
 }
 
 #[tokio::test]
+async fn a_cutoff_create_never_falls_back_to_a_gateway_without_cutoff_support() {
+    let server = run_server().await;
+    let cutoff = (openshell_core::time::now_ms() + 10_000).to_string();
+    let result =
+        run_cli_sandbox_create(&server, "cutoff", &["--start-before", &cutoff, "--detach"]).await;
+    assert!(!result.status.success());
+    assert!(
+        create_requests(&server).await.is_empty(),
+        "an unsupported guarded call must never use legacy CreateSandbox"
+    );
+}
+
+#[tokio::test]
 async fn sandbox_create_upload_is_rejected_before_provisioning_when_planning_fails() {
     let server = run_server().await;
     let source = tempfile::tempdir().unwrap();

@@ -213,6 +213,8 @@ mod tests {
         for path in [
             "/openshell.v1.OpenShell/StopSandbox",
             "/openshell.v1.OpenShell/StartSandbox",
+            "/openshell.v1.SandboxUpdates/CreateSandboxBefore",
+            "/openshell.v1.SandboxUpdates/StartSandboxBefore",
             "/openshell.v1.OpenShell/SuspendSandbox",
             "/openshell.v1.OpenShell/ResumeSandbox",
         ] {

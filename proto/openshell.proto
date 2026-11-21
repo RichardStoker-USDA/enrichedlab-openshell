@@ -883,6 +883,26 @@ service ServiceDiscovery {
 // Optional sandbox mutations are separate from OpenShell so existing generated
 // OpenShell server implementations remain source-compatible.
 service SandboxUpdates {
+  // Create only if OpenShell can begin the mutation before the required
+  // openshell-start-before-unix-ms metadata. An admitted create keeps its
+  // ordinary provisioning deadline.
+  rpc CreateSandboxBefore(CreateSandboxRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
+  // Start a stopped sandbox with the same required mutation cutoff.
+  rpc StartSandboxBefore(StartSandboxRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
   // Update the workload image, command, environment, labels, or annotations of a
   // stopped sandbox while preserving its identity and retained storage. Requires
   // compute-driver support for the selected changes and explicit gateway activation
@@ -4186,6 +4206,10 @@ message SandboxProvisioning {
   // restart. Retained after settlement to reject delayed callbacks from an
   // earlier operation on the same attempt and runtime generation.
   string driver_operation_id = 15;
+  // This attempt needs the original caller's cutoff until the driver
+  // confirms that it started. Recovery must preserve the record without
+  // autonomously launching an unresolved attempt.
+  bool caller_start_cutoff_pending = 16;
 }
 
 // Create-time request to expose one loopback HTTP service in a sandbox.

@@ -558,6 +558,7 @@ async fn handle_create_sandbox_inner(
     request: Request<CreateSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let start_cutoff = openshell_core::sandbox_start_cutoff::StartCutoff::get(&request);
     let request = request.into_inner();
     let await_main_process_attachment = request.await_main_process_attachment;
     let workload_template_name = request.workload_template.trim().to_string();
@@ -813,6 +814,7 @@ async fn handle_create_sandbox_inner(
         })
         .transpose()?;
     runtime_inputs.launch_authentication = launch_authentication;
+    runtime_inputs.start_cutoff = start_cutoff;
 
     let sandbox = Box::pin(state.compute.create_sandbox_with_runtime_inputs_and_guards(
         sandbox,
@@ -1906,6 +1908,7 @@ async fn handle_start_sandbox_inner(
     request: Request<StartSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let start_cutoff = openshell_core::sandbox_start_cutoff::StartCutoff::get(&request);
     let req = request.into_inner();
     let resolved = resolve_and_authorize_sandbox_name(
         state,
@@ -1919,10 +1922,11 @@ async fn handle_start_sandbox_inner(
     let name = resolved.object_name().to_string();
     let mut sandbox = state
         .compute
-        .start_sandbox_authenticated(
+        .start_sandbox_with_cutoff(
             &workspace,
             &name,
             state.sandbox_session_jwt_authority.as_deref(),
+            start_cutoff,
         )
         .await?;
     let remote_authority =
