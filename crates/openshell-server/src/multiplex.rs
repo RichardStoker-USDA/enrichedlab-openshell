@@ -415,95 +415,126 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            let Some(interceptors) = interceptors else {
-                return inner.ready().await?.call(req).await;
+            let permit = if crate::sandbox_admission::guards(req.uri().path())
+                && let Some(admission) = state
+                    .as_ref()
+                    .and_then(|state| state.sandbox_admission.as_ref())
+            {
+                match admission.enter(interceptors.as_ref()).await {
+                    Ok(permit) => Some(permit),
+                    Err(status) => return Ok(status.into_http()),
+                }
+            } else {
+                None
             };
 
-            let path = req.uri().path().to_string();
-            if !interceptors.should_intercept_path(&path) {
-                return inner.ready().await?.call(req).await;
-            }
+            let admitted_start = permit.is_some();
+            let dispatch = async move {
+                let _permit = permit;
+                let Some(interceptors) = interceptors else {
+                    return inner.ready().await?.call(req).await;
+                };
 
-            let context = gateway_interceptor_context(req.extensions());
-            let principal = req.extensions().get::<Principal>().cloned();
-            let (mut parts, body) = req.into_parts();
-            let mut body = match collect_intercepted_grpc_body(body).await {
-                Ok(body) => body,
-                Err(status) => return Ok(status.into_http()),
-            };
-            // Retain only in memory. evaluate_request below validates the single
-            // uncompressed frame before this extension reaches typed dispatch.
-            let original_body = body.clone();
-            if let Some(state) = state.as_ref() {
-                body =
-                    match hydrate_update_provider_identity(&path, body, state, principal.as_ref())
-                        .await
+                let path = req.uri().path().to_string();
+                if !interceptors.should_intercept_path(&path) {
+                    return inner.ready().await?.call(req).await;
+                }
+
+                let context = gateway_interceptor_context(req.extensions());
+                let principal = req.extensions().get::<Principal>().cloned();
+                let (mut parts, body) = req.into_parts();
+                let mut body = match collect_intercepted_grpc_body(body).await {
+                    Ok(body) => body,
+                    Err(status) => return Ok(status.into_http()),
+                };
+                // Retain only in memory. evaluate_request below validates the single
+                // uncompressed frame before this extension reaches typed dispatch.
+                let original_body = body.clone();
+                if let Some(state) = state.as_ref() {
+                    body = match hydrate_update_provider_identity(
+                        &path,
+                        body,
+                        state,
+                        principal.as_ref(),
+                    )
+                    .await
                     {
                         Ok(body) => body,
                         Err(status) => return Ok(status.into_http()),
                     };
-            }
+                }
 
-            let intercepted = match interceptors.evaluate_request(&path, &body, &context).await {
-                Ok(intercepted) => intercepted,
-                Err(status) => return Ok(status.into_http()),
-            };
+                let intercepted = match interceptors.evaluate_request(&path, &body, &context).await
+                {
+                    Ok(intercepted) => intercepted,
+                    Err(status) => return Ok(status.into_http()),
+                };
 
-            parts
-                .extensions
-                .insert(crate::grpc::mutation_replay::OriginalMutation(
-                    original_body[GRPC_FRAME_HEADER_LEN..].to_vec(),
-                ));
+                parts
+                    .extensions
+                    .insert(crate::grpc::mutation_replay::OriginalMutation(
+                        original_body[GRPC_FRAME_HEADER_LEN..].to_vec(),
+                    ));
 
-            let req = Request::from_parts(
-                parts,
-                boxed_body_from_bytes(Bytes::from(intercepted.body.clone())),
-            );
-            let response = inner.ready().await?.call(req).await?;
+                let req = Request::from_parts(
+                    parts,
+                    boxed_body_from_bytes(Bytes::from(intercepted.body.clone())),
+                );
+                let response = inner.ready().await?.call(req).await?;
 
-            if grpc_status_from_response(&response) != "0"
-                || response
-                    .headers()
-                    .get("openshell-replayed")
-                    .is_some_and(|value| value == "true")
-                || !interceptors.has_post_commit(&intercepted)
-            {
-                return Ok(response);
-            }
+                if grpc_status_from_response(&response) != "0"
+                    || response
+                        .headers()
+                        .get("openshell-replayed")
+                        .is_some_and(|value| value == "true")
+                    || !interceptors.has_post_commit(&intercepted)
+                {
+                    return Ok(response);
+                }
 
-            let (response, observation) = observe_intercepted_grpc_response(response).await;
-            let (response_body, trailers) = match observation {
-                Ok(observation) => observation,
-                Err(error) => {
+                let (response, observation) = observe_intercepted_grpc_response(response).await;
+                let (response_body, trailers) = match observation {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            "gateway post-commit response observation failed; preserving committed response"
+                        );
+                        counter!(
+                            "openshell_gateway_interceptor_post_commit_observation_failures_total",
+                            "stage" => "response_body"
+                        )
+                        .increment(1);
+                        return Ok(response);
+                    }
+                };
+                if grpc_status_from_response_and_trailers(&response, trailers.as_ref()) == "0"
+                    && let Err(status) = interceptors
+                        .evaluate_post_commit(&intercepted, &response_body, &context)
+                        .await
+                {
                     warn!(
-                        error = %error,
-                        "gateway post-commit response observation failed; preserving committed response"
+                        error = %status,
+                        "gateway post-commit evaluation failed; preserving committed response"
                     );
                     counter!(
                         "openshell_gateway_interceptor_post_commit_observation_failures_total",
-                        "stage" => "response_body"
+                        "stage" => "evaluation"
                     )
                     .increment(1);
-                    return Ok(response);
                 }
-            };
-            if grpc_status_from_response_and_trailers(&response, trailers.as_ref()) == "0"
-                && let Err(status) = interceptors
-                    .evaluate_post_commit(&intercepted, &response_body, &context)
-                    .await
-            {
-                warn!(
-                    error = %status,
-                    "gateway post-commit evaluation failed; preserving committed response"
-                );
-                counter!(
-                    "openshell_gateway_interceptor_post_commit_observation_failures_total",
-                    "stage" => "evaluation"
-                )
-                .increment(1);
-            }
 
-            Ok(response)
+                Ok(response)
+            };
+            if admitted_start {
+                // Keep processing a committed start and its receipt even if
+                // the client disconnects before its response reaches it.
+                tokio::spawn(dispatch).await.unwrap_or_else(|_| {
+                    Ok(tonic::Status::internal("sandbox start dispatch interrupted").into_http())
+                })
+            } else {
+                dispatch.await
+            }
         })
     }
 }
@@ -1513,8 +1544,8 @@ mod tests {
     use tokio_stream::wrappers::TcpListenerStream;
     use tower::Service;
 
-    #[derive(Clone)]
-    struct PostCommitTestInterceptor;
+    #[derive(Clone, Default)]
+    struct PostCommitTestInterceptor(Arc<AtomicUsize>);
 
     #[tonic::async_trait]
     impl GatewayInterceptor for PostCommitTestInterceptor {
@@ -1522,11 +1553,20 @@ mod tests {
             &self,
             _request: tonic::Request<DescribeRequest>,
         ) -> Result<tonic::Response<InterceptorManifest>, tonic::Status> {
+            let mode = self.0.load(Ordering::SeqCst);
+            if mode == 1 {
+                return Err(tonic::Status::unavailable("receipt store not ready"));
+            }
             Ok(tonic::Response::new(InterceptorManifest {
                 name: "post-commit-test".to_string(),
                 failure_policy: "fail_open".to_string(),
                 bindings: vec![InterceptorBinding {
-                    id: "audit-create-sandbox".to_string(),
+                    id: if mode == 2 {
+                        "wrong-binding"
+                    } else {
+                        "audit-create-sandbox"
+                    }
+                    .to_string(),
                     selector: Some(InterceptorSelector {
                         rpc: "openshell.v1.OpenShell/CreateSandbox".to_string(),
                         service: String::new(),
@@ -1536,7 +1576,7 @@ mod tests {
                     failure_policy: "fail_open".to_string(),
                 }],
                 provider_profiles: false,
-                expected_audience: String::new(),
+                expected_audience: "urn:example:post-commit-test".to_string(),
                 extension: Some(openshell_core::extension_protocol::extension_metadata(
                     openshell_core::extension_protocol::ExtensionFamily::GatewayInterceptor,
                     "openshell/post-commit-test",
@@ -1572,13 +1612,20 @@ mod tests {
         Bytes::from(frame)
     }
 
-    async fn post_commit_test_runtime() -> (GatewayInterceptorRuntime, tokio::task::JoinHandle<()>)
-    {
+    async fn post_commit_test_runtime() -> (
+        GatewayInterceptorRuntime,
+        tokio::task::JoinHandle<()>,
+        Arc<AtomicUsize>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let backend = Arc::new(AtomicUsize::new(0));
+        let controlled = backend.clone();
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(GatewayInterceptorServer::new(PostCommitTestInterceptor))
+                .add_service(GatewayInterceptorServer::new(PostCommitTestInterceptor(
+                    controlled,
+                )))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
@@ -1591,7 +1638,27 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        (runtime, task)
+        (runtime, task, backend)
+    }
+
+    #[tokio::test]
+    async fn sandbox_admission_rejects_unready_or_rebound_receipts() {
+        let (runtime, task, backend) = post_commit_test_runtime().await;
+        let verify = || {
+            runtime.check_post_commit_ready(
+                "/openshell.v1.OpenShell/CreateSandbox",
+                "post-commit-test",
+                "audit-create-sandbox",
+            )
+        };
+        verify().await.unwrap();
+        backend.store(1, Ordering::SeqCst);
+        assert!(verify().await.is_err());
+        backend.store(2, Ordering::SeqCst);
+        assert!(verify().await.is_err());
+        backend.store(0, Ordering::SeqCst);
+        verify().await.unwrap();
+        task.abort();
     }
 
     #[test]
@@ -1791,7 +1858,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_commit_decode_failure_preserves_committed_response() {
-        let (runtime, interceptor_task) = post_commit_test_runtime().await;
+        let (runtime, interceptor_task, _) = post_commit_test_runtime().await;
         let committed = Arc::new(AtomicUsize::new(0));
         let committed_for_service = committed.clone();
         let committed_body = Bytes::from_static(b"malformed committed gRPC response");
@@ -1839,7 +1906,7 @@ mod tests {
             &self,
             request: tonic::Request<DescribeRequest>,
         ) -> Result<tonic::Response<InterceptorManifest>, tonic::Status> {
-            let mut manifest = PostCommitTestInterceptor
+            let mut manifest = PostCommitTestInterceptor::default()
                 .describe(request)
                 .await?
                 .into_inner();
@@ -1897,7 +1964,7 @@ mod tests {
             &self,
             request: tonic::Request<ProviderProfileSnapshotRequest>,
         ) -> Result<tonic::Response<ProviderProfileSnapshot>, tonic::Status> {
-            PostCommitTestInterceptor
+            PostCommitTestInterceptor::default()
                 .snapshot_provider_profiles(request)
                 .await
         }

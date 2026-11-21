@@ -110,6 +110,27 @@ impl GatewayInterceptorRuntime {
         self.plan.negotiated_extensions()
     }
 
+    /// Probe a dedicated post-commit interceptor using its existing authenticated
+    /// connection. Only the protocol identity is sent, with no client RPC fields.
+    pub async fn check_post_commit_ready(
+        &self,
+        path: &str,
+        interceptor: &str,
+        binding_id: &str,
+    ) -> Result<()> {
+        let plan = RpcSelector::from_grpc_path(path)
+            .and_then(|selector| self.plan.bindings(&selector, Phase::PostCommit))
+            .and_then(|plans| {
+                plans.iter().find(|plan| {
+                    plan.interceptor_name == interceptor && plan.binding_id == binding_id
+                })
+            })
+            .ok_or_else(|| {
+                InterceptorError::Config("required interceptor binding is missing".into())
+            })?;
+        plan.check_dedicated_ready().await
+    }
+
     #[must_use]
     pub fn should_intercept_path(&self, path: &str) -> bool {
         let Some(selector) = RpcSelector::from_grpc_path(path) else {
@@ -725,6 +746,7 @@ mod tests {
     fn test_modify_plan(failure_policy: FailurePolicy) -> BindingPlan {
         BindingPlan {
             interceptor_name: "test".to_string(),
+            advertised_audience: String::new(),
             binding_id: "binding".to_string(),
             selector: RpcSelector {
                 service: "openshell.v1.OpenShell".to_string(),
@@ -928,6 +950,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(fmt_layer);
         let plan = BindingPlan {
             interceptor_name: "test".to_string(),
+            advertised_audience: String::new(),
             binding_id: "binding".to_string(),
             selector: RpcSelector {
                 service: "openshell.v1.OpenShell".to_string(),
@@ -1123,6 +1146,7 @@ mod tests {
     async fn invalid_modify_patch_honors_fail_open_without_mutating_operation() {
         let plan = BindingPlan {
             interceptor_name: "test".to_string(),
+            advertised_audience: String::new(),
             binding_id: "binding".to_string(),
             selector: RpcSelector {
                 service: "openshell.v1.OpenShell".to_string(),

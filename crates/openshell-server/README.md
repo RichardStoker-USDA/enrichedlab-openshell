@@ -18,6 +18,29 @@ Retries reuse that generation and session, including after gateway restart.
 Credential renewal retains both; credentials for an older launch cannot
 authorize the new one.
 
+
+## Sandbox maintenance
+
+The optional `[openshell.gateway.sandbox_admission]` table takes an absolute
+`pause_file` and the `receipt_interceptor` and `receipt_binding` of one
+dedicated, authenticated TLS interceptor. The interceptor must have an exact
+post-commit binding for `CreateSandbox`.
+
+Use a read-only, operator-controlled file and update it atomically to `paused`
+or `open` (an ending newline is optional). Missing or malformed content
+closes admissions. `CreateSandbox` and `StartSandbox` also require the
+receipts service to answer its authenticated `Describe` call with the
+negotiated identity and binding. Existing sessions and read-only RPCs continue.
+
+Before stopping the gateway, verify the effective file on every replica and
+wait for `openshell_sandbox_admission_in_flight` to reach zero, then check the
+receipt failure counters. The gauge covers dependency checks, admitted
+operations and their receipt hooks, including after the client disconnects.
+The gateway bounds these operations to 64 at once. Keep the file paused through
+restart and check a read-only RPC and a refused start before reopening. A
+dependency failure after the readiness check still follows the existing
+post-commit receipt failure behavior.
+
 ## Operator credential export
 
 `GetProviderCredentials` exports selected profile-declared runtime environment

@@ -40,6 +40,7 @@ mod provider_profile_sources;
 mod provider_refresh;
 mod readiness;
 mod reflection;
+mod sandbox_admission;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
@@ -359,6 +360,8 @@ pub struct ServerState {
     pub(crate) gateway_interceptors:
         Option<openshell_gateway_interceptors::GatewayInterceptorRuntime>,
 
+    pub(crate) sandbox_admission: Option<sandbox_admission::SandboxAdmission>,
+
     /// Gateway-local provider profile sources. User-imported profiles are read
     /// on demand when the user source is configured.
     pub(crate) provider_profile_sources: provider_profile_sources::ProviderProfileSources,
@@ -466,6 +469,7 @@ impl ServerState {
             grpc_rate_limiter,
             reflection_service,
             gateway_interceptors: None,
+            sandbox_admission: None,
             provider_profile_sources:
                 provider_profile_sources::ProviderProfileSources::with_default_sources(),
             admin_role,
@@ -837,8 +841,6 @@ pub(crate) async fn run_server(
         ));
     }
 
-    let state = Arc::new(state);
-
     // Install the recorder before the endpoint-status startup reconciliation so
     // the lock waits and timeouts recorded there are exported. Its listener
     // binds with the others.
@@ -853,6 +855,19 @@ pub(crate) async fn run_server(
         })
         .transpose()
         .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+
+    state.sandbox_admission = config_file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.sandbox_admission.as_ref())
+        .map(|guard| {
+            sandbox_admission::SandboxAdmission::new(
+                guard.clone(),
+                &config.gateway_interceptors,
+                state.extension_jwt_issuer.is_some(),
+            )
+        })
+        .transpose()?;
+    let state = Arc::new(state);
 
     grpc::policy::backfill_legacy_policy_history(&state)
         .await

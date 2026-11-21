@@ -131,6 +131,7 @@ impl RpcSelector {
 #[derive(Clone)]
 pub struct BindingPlan {
     pub(crate) interceptor_name: String,
+    pub(crate) advertised_audience: String,
     pub(crate) binding_id: String,
     pub(crate) selector: RpcSelector,
     pub(crate) phase: Phase,
@@ -153,6 +154,47 @@ impl std::fmt::Debug for BindingPlan {
             .field("max_response_bytes", &self.max_response_bytes)
             .field("max_patches", &self.max_patches)
             .finish_non_exhaustive()
+    }
+}
+
+impl BindingPlan {
+    pub(crate) async fn check_dedicated_ready(&self) -> Result<()> {
+        let gateway = gateway_metadata(ExtensionFamily::GatewayInterceptor);
+        let mut client = self.client.clone();
+        let described = tokio::time::timeout(
+            self.timeout,
+            client.describe(Request::new(DescribeRequest {
+                gateway: Some(gateway.clone()),
+            })),
+        )
+        .await
+        .map_err(|_| InterceptorError::Transport("required interceptor timed out".into()))?
+        .map_err(|_| InterceptorError::Transport("required interceptor unavailable".into()))?
+        .into_inner();
+        negotiate(
+            ExtensionFamily::GatewayInterceptor,
+            &self.interceptor_name,
+            &gateway,
+            described.extension,
+        )
+        .map_err(|_| InterceptorError::Config("required interceptor identity changed".into()))?;
+        let [binding] = described.bindings.as_slice() else {
+            return Err(InterceptorError::Config(
+                "required interceptor bindings changed".into(),
+            ));
+        };
+        if described.name != self.interceptor_name
+            || self.advertised_audience.is_empty()
+            || described.expected_audience != self.advertised_audience
+            || binding.id != self.binding_id
+            || selector_from_proto(binding.selector.as_ref())? != self.selector
+            || binding.phases != [GatewayInterceptorPhase::PostCommit as i32]
+        {
+            return Err(InterceptorError::Config(
+                "required interceptor binding changed".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -301,6 +343,7 @@ impl ExecutionPlan {
                 for phase in normalized.phases {
                     let plan = BindingPlan {
                         interceptor_name: config.name.clone(),
+                        advertised_audience: manifest.expected_audience.clone(),
                         binding_id: normalized.binding_id.clone(),
                         selector: normalized.selector.clone(),
                         phase,
