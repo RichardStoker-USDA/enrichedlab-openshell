@@ -559,11 +559,27 @@ fn is_kube_resource_version_conflict(error: &KubeError) -> bool {
 /// A guarded mutation keeps its deadline through reads and rejected writes.
 /// Once a write is confirmed, later steps use the ordinary operation budget.
 #[derive(Default)]
-struct LifecycleWrite(StartCutoff);
+struct LifecycleWrite {
+    cutoff: StartCutoff,
+    may_have_written: bool,
+}
 
 impl LifecycleWrite {
+    fn new(cutoff: StartCutoff) -> Self {
+        Self {
+            cutoff,
+            may_have_written: false,
+        }
+    }
+
     fn check(&self) -> Result<(), KubernetesDriverError> {
-        self.0.check().map_err(KubernetesDriverError::start_cutoff)
+        self.cutoff
+            .check()
+            .map_err(KubernetesDriverError::start_cutoff)
+    }
+
+    fn needs_rollback(&self) -> bool {
+        !self.cutoff.is_set() || self.may_have_written
     }
 
     async fn run<T>(
@@ -571,9 +587,16 @@ impl LifecycleWrite {
         write: impl Future<Output = Result<T, KubeError>>,
     ) -> Result<Result<T, KubeError>, KubernetesDriverError> {
         self.check()?;
+        let previously_ambiguous = self.may_have_written;
+        // Keep an interrupted or ambiguous response eligible for recovery.
+        self.may_have_written = true;
         let result = write.await;
-        if result.is_ok() {
-            self.0 = StartCutoff::default();
+        match &result {
+            Ok(_) => self.cutoff = StartCutoff::default(),
+            Err(KubeError::Api(error)) if (400..500).contains(&error.code) && error.code != 408 => {
+                self.may_have_written = previously_ambiguous;
+            }
+            Err(_) => {}
         }
         Ok(result)
     }
@@ -583,12 +606,10 @@ impl LifecycleWrite {
         write: impl Future<Output = Result<T, KubeError>>,
     ) -> Result<Result<Result<T, KubeError>, tokio::time::error::Elapsed>, KubernetesDriverError>
     {
-        self.check()?;
-        let result = tokio::time::timeout(KUBE_API_TIMEOUT, write).await;
-        if matches!(&result, Ok(Ok(_))) {
-            self.0 = StartCutoff::default();
+        match tokio::time::timeout(KUBE_API_TIMEOUT, self.run(write)).await {
+            Ok(result) => Ok(Ok(result?)),
+            Err(elapsed) => Ok(Err(elapsed)),
         }
-        Ok(result)
     }
 }
 
@@ -2670,7 +2691,7 @@ impl KubernetesComputeDriver {
             .gate_for(&sandbox.id)
             .lock_owned()
             .await;
-        let mut start = LifecycleWrite(cutoff);
+        let mut start = LifecycleWrite::new(cutoff);
         start.check()?;
         let result = Box::pin(self.create_sandbox_inner(sandbox, &mut start)).await;
         span_status.finish(result)
@@ -4408,7 +4429,7 @@ impl KubernetesComputeDriver {
     ) -> Result<String, KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let _guard = self.lifecycle_gates.gate_for(sandbox_id).lock_owned().await;
-        let mut start = LifecycleWrite(cutoff);
+        let mut start = LifecycleWrite::new(cutoff);
         start.check()?;
         let result = Box::pin(self.start_sandbox_runtime_generation(
             sandbox_id,
@@ -4779,7 +4800,7 @@ impl KubernetesComputeDriver {
         .await;
 
         if let Err(error) = restart {
-            if matches!(error, KubernetesDriverError::StartCutoff(_)) {
+            if !start.needs_rollback() {
                 return Err(error);
             }
             // The restart patch may not have recorded the sandbox instance yet.
@@ -4872,7 +4893,7 @@ impl KubernetesComputeDriver {
         ) {
             // This stop already belongs to an earlier operation. Leave it to
             // reconciliation rather than starting a new guarded mutation.
-            if start.0.is_set() {
+            if start.cutoff.is_set() {
                 start.check()?;
                 return Err(KubernetesDriverError::Precondition(
                     "sandbox stop is already in progress".to_string(),
@@ -12998,7 +13019,7 @@ mod tests {
         );
         (
             expires,
-            LifecycleWrite(StartCutoff::from_required_header(&request).unwrap()),
+            LifecycleWrite::new(StartCutoff::from_required_header(&request).unwrap()),
         )
     }
 
@@ -13141,6 +13162,19 @@ mod tests {
                 assert_eq!(writes.load(Ordering::SeqCst), 1);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_write_remains_eligible_for_reconciliation() {
+        let (_, mut start) = start_cutoff_fixture();
+        assert!(!start.needs_rollback());
+        let result = tokio::time::timeout(
+            Duration::from_millis(20),
+            start.run(std::future::pending::<Result<(), KubeError>>()),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(start.needs_rollback());
     }
 
     #[tokio::test]

@@ -222,6 +222,162 @@ mod lifecycle_reconciliation {
     }
 
     #[tokio::test]
+    async fn a_wake_with_a_late_failed_restart_read_never_rolls_back_an_unstarted_mutation() {
+        use openshell_core::jwt::{
+            CredentialEpoch, SandboxLaunchAuthentication, SecretJwt, SessionRotation,
+            SessionVerificationKey, SupervisorAuthBundle,
+        };
+
+        let version = SANDBOX_VERSION_V1BETA1;
+        let mut object = snapshot(version, None);
+        object["metadata"]["labels"][LABEL_SANDBOX_NAME] = serde_json::json!("fixture-sandbox");
+        object["spec"]["podTemplate"]["spec"]["initContainers"] =
+            serde_json::json!([{"name": SANDBOX_BOOTSTRAP_CONTAINER_NAME}]);
+        let annotations = &mut object["metadata"]["annotations"];
+        annotations[ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC] = serde_json::json!("fixture");
+        annotations[ANNOTATION_SANDBOX_RUNTIME_LOG_LEVEL] = serde_json::json!("info");
+        let generation = "fixture-generation";
+        let sandbox_id = "sandbox-1";
+        let namespace = "openshell";
+        let names = SandboxRuntimeNames::for_generation(sandbox_id, generation);
+        let mut steps = VecDeque::from([listed(version, object)]);
+        steps.extend(preparing_dependencies().into_iter().take(2));
+        steps.extend([
+            (
+                http::Method::GET,
+                "/api/v1/namespaces/openshell",
+                kube_test_response(
+                    http::StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "openshell"}
+                    }),
+                ),
+            ),
+            (
+                http::Method::GET,
+                "/api/v1/namespaces/openshell/pods/sandbox-cr",
+                kube_test_not_found("Pod", "sandbox-cr"),
+            ),
+            (
+                http::Method::GET,
+                "/api/v1/namespaces/openshell/pods/os-supervisor-sandbox-1",
+                kube_test_not_found("Pod", "os-supervisor-sandbox-1"),
+            ),
+        ]);
+        let absent_secrets = [names.sandbox_secret, names.supervisor_secret];
+        let failed_get = "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr";
+        let (expires, start) = start_cutoff_fixture();
+        let steps = Arc::new(std::sync::Mutex::new(steps));
+        let observed = steps.clone();
+        let failed_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_failures = failed_reads.clone();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let path = request.uri().path();
+            let method = request.method();
+            let mut pending = observed.lock().unwrap();
+            let scripted = pending
+                .iter()
+                .position(|(m, p, _)| m == method && *p == path);
+            let (reply, delay) = match scripted {
+                Some(index) => (pending.remove(index).unwrap().2, false),
+                None if method == http::Method::DELETE
+                    && path.starts_with("/api/v1/namespaces/openshell/secrets/")
+                    && path
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|name| absent_secrets.iter().any(|expected| expected == name)) =>
+                {
+                    (
+                        kube_test_not_found("Secret", path.rsplit('/').next().unwrap()),
+                        false,
+                    )
+                }
+                None => {
+                    assert_eq!(method, http::Method::GET, "wake must not start rollback");
+                    assert_eq!(path, failed_get);
+                    assert_eq!(
+                        observed_failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                        0
+                    );
+                    let reply = kube_test_response(
+                        http::StatusCode::FORBIDDEN,
+                        serde_json::json!({
+                            "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                            "reason": "Forbidden", "message": "fixture restart read failed", "code": 403
+                        }),
+                    );
+                    (reply, true)
+                }
+            };
+            async move {
+                if delay {
+                    wait_past_fixture_cutoff(expires).await;
+                }
+                Ok::<_, std::convert::Infallible>(reply)
+            }
+        });
+        let client = Client::new(service, namespace);
+        let mut driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
+        driver.client = client;
+        driver.sandbox_api_version.set(version).unwrap();
+        driver.shared_supervisor = Some(SharedSupervisor::new(
+            crate::config::SharedSupervisorConfig {
+                service_name: "fixture-supervisor".into(),
+                service_namespace: namespace.into(),
+                runtime_port: 5500,
+                token_secret_name: "fixture-supervisor".into(),
+            },
+            SharedSupervision::new(),
+        ));
+        let launch = serde_json::to_vec(&SandboxLaunchAuthentication {
+            supervisor: SupervisorAuthBundle {
+                session_id: openshell_core::SandboxSessionId::new(),
+                runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                    generation,
+                )
+                .unwrap(),
+                session_rotation: SessionRotation::new(1).unwrap(),
+                auth_epoch: CredentialEpoch::new(1).unwrap(),
+                gateway_token: SecretJwt::parse("gateway.fixture.value").unwrap(),
+                gateway_expires_at: i64::MAX,
+                sandbox_token: SecretJwt::parse("sandbox.fixture.value").unwrap(),
+                sandbox_expires_at: i64::MAX,
+                ssh_host_private_key: None,
+                traces_otlp_headers: None,
+                ocsf_otlp_headers: None,
+                agent_otlp_headers: None,
+                otlp_tls: Vec::new(),
+                traces_otlp_tls: None,
+                ocsf_otlp_tls: None,
+                agent_otlp_tls: None,
+            },
+            gateway_id: "fixture-gateway".into(),
+            verification_keys: vec![SessionVerificationKey {
+                key_id: "fixture-key".into(),
+                public_key_pem: b"public-fixture".to_vec(),
+            }],
+        })
+        .unwrap();
+
+        let error = driver
+            .start_sandbox_before(
+                sandbox_id,
+                generation,
+                &launch,
+                "kubernetes://openshell/cr-uid/old-supervisor",
+                start.cutoff,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("fixture restart read failed"),
+            "{error}"
+        );
+        assert!(steps.lock().unwrap().is_empty());
+        assert_eq!(failed_reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn stale_stop_snapshots_cannot_delete_a_restarted_supervisor() {
         for version in [SANDBOX_VERSION_V1ALPHA1, SANDBOX_VERSION_V1BETA1] {
             for phase in [
