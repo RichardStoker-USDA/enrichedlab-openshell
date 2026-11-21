@@ -26,6 +26,7 @@ use axum::{
 };
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Serialize;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -196,7 +197,6 @@ pub fn metrics_router_with_admission(
             let paused = admission.is_paused().await;
             let mut rendered = handle.render();
             let clear = paused && admission.durable_drain_clear(&state.store).await;
-            use std::fmt::Write as _;
             let _ = writeln!(rendered,
                 "# TYPE openshell_sandbox_admission_durable_clear gauge\nopenshell_sandbox_admission_durable_clear {}",
                 u8::from(clear));
