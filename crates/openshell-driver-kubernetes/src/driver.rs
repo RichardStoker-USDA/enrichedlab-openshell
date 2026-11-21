@@ -271,6 +271,7 @@ fn validate_network_additional_ca_config_map(
 async fn create_or_validate_network_additional_ca_config_map(
     config_maps: &Api<ConfigMap>,
     expected: &ConfigMap,
+    start: &mut LifecycleWrite,
 ) -> Result<(), KubernetesDriverError> {
     let name = expected.metadata.name.as_deref().ok_or_else(|| {
         KubernetesDriverError::Message("network additional CA ConfigMap has no name".to_string())
@@ -288,11 +289,9 @@ async fn create_or_validate_network_additional_ca_config_map(
         }
     }
 
-    match tokio::time::timeout(
-        KUBE_API_TIMEOUT,
-        config_maps.create(&PostParams::default(), expected),
-    )
-    .await
+    match start
+        .run_with_timeout(config_maps.create(&PostParams::default(), expected))
+        .await?
     {
         // Validate the server response as well: an admission controller must
         // not be able to silently alter the immutable material we mount.
@@ -557,29 +556,83 @@ fn is_kube_resource_version_conflict(error: &KubeError) -> bool {
     matches!(error, KubeError::Api(api) if api.code == 409 && api.reason == "Conflict")
 }
 
+/// A guarded mutation keeps its deadline through reads and rejected writes.
+/// Once a write is confirmed, later steps use the ordinary operation budget.
+#[derive(Default)]
+struct LifecycleWrite(StartCutoff);
+
+impl LifecycleWrite {
+    fn check(&self) -> Result<(), KubernetesDriverError> {
+        self.0.check().map_err(KubernetesDriverError::start_cutoff)
+    }
+
+    async fn run<T>(
+        &mut self,
+        write: impl Future<Output = Result<T, KubeError>>,
+    ) -> Result<Result<T, KubeError>, KubernetesDriverError> {
+        self.check()?;
+        let result = write.await;
+        if result.is_ok() {
+            self.0 = StartCutoff::default();
+        }
+        Ok(result)
+    }
+
+    async fn run_with_timeout<T>(
+        &mut self,
+        write: impl Future<Output = Result<T, KubeError>>,
+    ) -> Result<Result<Result<T, KubeError>, tokio::time::error::Elapsed>, KubernetesDriverError>
+    {
+        self.check()?;
+        let result = tokio::time::timeout(KUBE_API_TIMEOUT, write).await;
+        if matches!(&result, Ok(Ok(_))) {
+            self.0 = StartCutoff::default();
+        }
+        Ok(result)
+    }
+}
+
 async fn patch_dynamic_object_with_resource_version_retry(
     api: &Api<DynamicObject>,
     name: &str,
+    patch_for_resource_version: impl FnMut(&str) -> serde_json::Value,
+) -> Result<DynamicObject, KubernetesDriverError> {
+    patch_dynamic_object_before(
+        api,
+        name,
+        patch_for_resource_version,
+        &mut LifecycleWrite::default(),
+    )
+    .await
+}
+
+async fn patch_dynamic_object_before(
+    api: &Api<DynamicObject>,
+    name: &str,
     mut patch_for_resource_version: impl FnMut(&str) -> serde_json::Value,
+    start: &mut LifecycleWrite,
 ) -> Result<DynamicObject, KubernetesDriverError> {
     let operation = async {
         loop {
-            let current = api.get(name).await?;
+            let current = api
+                .get(name)
+                .await
+                .map_err(KubernetesDriverError::from_kube)?;
             let resource_version = current
                 .metadata
                 .resource_version
                 .as_deref()
                 .unwrap_or_default();
             let patch = patch_for_resource_version(resource_version);
-            match api
-                .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
-                .await
+            match start
+                .run(api.patch(name, &PatchParams::default(), &Patch::Merge(&patch)))
+                .await?
             {
                 Ok(updated) => return Ok(updated),
                 Err(error) if is_kube_resource_version_conflict(&error) => {
                     tokio::task::yield_now().await;
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(KubernetesDriverError::from_kube(error)),
             }
         }
     };
@@ -591,7 +644,6 @@ async fn patch_dynamic_object_with_resource_version_retry(
                 KUBE_API_TIMEOUT.as_secs()
             ))
         })?
-        .map_err(KubernetesDriverError::from_kube)
 }
 
 impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
@@ -1586,14 +1638,14 @@ impl KubernetesComputeDriver {
     /// namespace.
     ///
     pub async fn ensure_namespace(&self, workspace: &str) -> Result<String, KubernetesDriverError> {
-        self.ensure_namespace_before(workspace, StartCutoff::default())
+        self.ensure_namespace_before(workspace, &mut LifecycleWrite::default())
             .await
     }
 
     async fn ensure_namespace_before(
         &self,
         workspace: &str,
-        cutoff: StartCutoff,
+        start: &mut LifecycleWrite,
     ) -> Result<String, KubernetesDriverError> {
         let ns_name = managed_namespace(&self.config.gateway_id, workspace);
         let ns_api: Api<Namespace> = Api::all(self.client.clone());
@@ -1638,14 +1690,9 @@ impl KubernetesComputeDriver {
             ..Default::default()
         };
 
-        cutoff
-            .check()
-            .map_err(KubernetesDriverError::start_cutoff)?;
-        let initial_namespace = match tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            ns_api.create(&PostParams::default(), &ns),
-        )
-        .await
+        let initial_namespace = match start
+            .run_with_timeout(ns_api.create(&PostParams::default(), &ns))
+            .await?
         {
             Ok(Ok(created)) => {
                 info!(namespace = %ns_name, workspace = %workspace, "created managed namespace");
@@ -1686,8 +1733,9 @@ impl KubernetesComputeDriver {
                 .await?;
         }
 
-        self.ensure_service_account(&ns_name).await?;
-        self.ensure_managed_ssh_network_policy(&ns_name).await?;
+        self.ensure_service_account(&ns_name, start).await?;
+        self.ensure_managed_ssh_network_policy(&ns_name, start)
+            .await?;
 
         Ok(ns_name)
     }
@@ -1751,6 +1799,7 @@ impl KubernetesComputeDriver {
     async fn ensure_managed_ssh_network_policy(
         &self,
         namespace: &str,
+        start: &mut LifecycleWrite,
     ) -> Result<(), KubernetesDriverError> {
         if !self.config.managed_ssh_ingress.enabled {
             return Ok(());
@@ -1758,15 +1807,13 @@ impl KubernetesComputeDriver {
 
         let policy = managed_ssh_network_policy(namespace, &self.config);
         let policy_api: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
-        match tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            policy_api.patch(
+        match start
+            .run_with_timeout(policy_api.patch(
                 MANAGED_SSH_NETWORK_POLICY_NAME,
                 &PatchParams::apply("openshell"),
                 &Patch::Apply(&policy),
-            ),
-        )
-        .await
+            ))
+            .await?
         {
             Ok(Ok(_)) => {
                 info!(namespace, "applied managed sandbox SSH NetworkPolicy");
@@ -1779,7 +1826,11 @@ impl KubernetesComputeDriver {
         }
     }
 
-    async fn ensure_service_account(&self, namespace: &str) -> Result<(), KubernetesDriverError> {
+    async fn ensure_service_account(
+        &self,
+        namespace: &str,
+        start: &mut LifecycleWrite,
+    ) -> Result<(), KubernetesDriverError> {
         let sa_api: Api<ServiceAccount> = Api::namespaced(self.client.clone(), namespace);
         let sa = ServiceAccount {
             metadata: ObjectMeta {
@@ -1793,8 +1844,9 @@ impl KubernetesComputeDriver {
             ..Default::default()
         };
 
-        match tokio::time::timeout(KUBE_API_TIMEOUT, sa_api.create(&PostParams::default(), &sa))
-            .await
+        match start
+            .run_with_timeout(sa_api.create(&PostParams::default(), &sa))
+            .await?
         {
             Ok(Ok(_)) => {
                 info!(namespace = %namespace, sa = %self.config.service_account_name, "created service account");
@@ -2618,10 +2670,9 @@ impl KubernetesComputeDriver {
             .gate_for(&sandbox.id)
             .lock_owned()
             .await;
-        cutoff
-            .check()
-            .map_err(KubernetesDriverError::start_cutoff)?;
-        let result = Box::pin(self.create_sandbox_inner(sandbox, cutoff)).await;
+        let mut start = LifecycleWrite(cutoff);
+        start.check()?;
+        let result = Box::pin(self.create_sandbox_inner(sandbox, &mut start)).await;
         span_status.finish(result)
     }
 
@@ -2629,7 +2680,7 @@ impl KubernetesComputeDriver {
     async fn create_sandbox_inner(
         &self,
         sandbox: &Sandbox,
-        cutoff: StartCutoff,
+        start: &mut LifecycleWrite,
     ) -> Result<String, KubernetesDriverError> {
         openshell_core::resource_admission::check_sandbox_driver_config(
             self.config.allow_driver_config,
@@ -2656,7 +2707,7 @@ impl KubernetesComputeDriver {
 
         let target_namespace = match self.config.workspace_mode {
             WorkspaceMode::Shared => self.config.namespace.clone(),
-            WorkspaceMode::Managed => self.ensure_namespace_before(workspace, cutoff).await?,
+            WorkspaceMode::Managed => self.ensure_namespace_before(workspace, start).await?,
             WorkspaceMode::Operator => {
                 self.wait_for_operator_allowlist()
                     .await
@@ -2730,10 +2781,7 @@ impl KubernetesComputeDriver {
         let kube_name = self.config.kube_resource_name(workspace, name);
         let mut data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
             .map_err(KubernetesDriverError::InvalidArgument)?;
-        cutoff
-            .check()
-            .map_err(KubernetesDriverError::start_cutoff)?;
-        self.create_sandbox_runtime_fence(&target_namespace, &proxy_names)
+        self.create_sandbox_runtime_fence(&target_namespace, &proxy_names, start)
             .await?;
         // A missing bootstrap Secret keeps both pods inert as defense in
         // depth, but the CR is also created suspended so the controller
@@ -2823,11 +2871,9 @@ impl KubernetesComputeDriver {
         apply_fixed_pod_metadata(&mut obj.metadata, &self.config);
 
         obj.data = data;
-        let created = match tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            agent_sandbox_api.api.create(&PostParams::default(), &obj),
-        )
-        .await
+        let created = match start
+            .run_with_timeout(agent_sandbox_api.api.create(&PostParams::default(), &obj))
+            .await?
         {
             Ok(Ok(result)) => {
                 info!(
@@ -2907,7 +2953,12 @@ impl KubernetesComputeDriver {
             self.config.sandbox_runtime.boundary_port,
             owner,
         );
-        create_or_validate_sandbox_runtime_fence(&policies, &expected).await?;
+        create_or_validate_sandbox_runtime_fence(
+            &policies,
+            &expected,
+            &mut LifecycleWrite::default(),
+        )
+        .await?;
         // Bind the coordinates of the object that was actually validated.
         let stored = tokio::time::timeout(KUBE_API_TIMEOUT, policies.get(&names.control_policy))
             .await
@@ -3096,6 +3147,7 @@ impl KubernetesComputeDriver {
         &self,
         namespace: &str,
         names: &SandboxRuntimeNames,
+        start: &mut LifecycleWrite,
     ) -> Result<(), KubernetesDriverError> {
         let fence = workload_fence(namespace, names, &self.config.sandbox_runtime);
         let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
@@ -3109,7 +3161,7 @@ impl KubernetesComputeDriver {
                 LABEL_MANAGED_BY_VALUE.to_string(),
             );
             labels.insert("openshell.ai/component".to_string(), component.to_string());
-            create_or_validate_sandbox_runtime_fence(&policies, &policy).await?;
+            create_or_validate_sandbox_runtime_fence(&policies, &policy, start).await?;
         }
         Ok(())
     }
@@ -3120,6 +3172,7 @@ impl KubernetesComputeDriver {
     async fn ensure_network_additional_ca_config_map(
         &self,
         namespace: &str,
+        start: &mut LifecycleWrite,
     ) -> Result<Option<NetworkAdditionalCaConfigMap>, KubernetesDriverError> {
         let Some(bundle) = self.network_trust_bundle.as_ref() else {
             return Ok(None);
@@ -3133,7 +3186,7 @@ impl KubernetesComputeDriver {
         })?;
         let digest = bundle.digest().to_string();
         let config_maps = Api::<ConfigMap>::namespaced(self.client.clone(), namespace);
-        create_or_validate_network_additional_ca_config_map(&config_maps, &expected).await?;
+        create_or_validate_network_additional_ca_config_map(&config_maps, &expected, start).await?;
         Ok(Some(NetworkAdditionalCaConfigMap { name, digest }))
     }
 
@@ -3454,6 +3507,7 @@ impl KubernetesComputeDriver {
                         &sandbox.id,
                         mode,
                         dependent_owner.clone(),
+                        &mut LifecycleWrite::default(),
                     )
                     .await?;
                 }
@@ -3469,6 +3523,7 @@ impl KubernetesComputeDriver {
                         main_process_spec,
                         log_level,
                         staged.upstream_proxy_ca_bundle.is_some(),
+                        &mut LifecycleWrite::default(),
                     )
                     .await?;
                 GenerationSupervisor::Dedicated {
@@ -3539,6 +3594,7 @@ impl KubernetesComputeDriver {
         sandbox_id: &str,
         mode: KubernetesControlConnection,
         owner: OwnerReference,
+        start: &mut LifecycleWrite,
     ) -> Result<(), KubernetesDriverError> {
         let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
         let expected = boundary_service(
@@ -3549,7 +3605,10 @@ impl KubernetesComputeDriver {
             mode,
             owner,
         );
-        let service = match services.create(&PostParams::default(), &expected).await {
+        let service = match start
+            .run(services.create(&PostParams::default(), &expected))
+            .await?
+        {
             Ok(service) => service,
             Err(kube::Error::Api(error)) if error.code == 409 => services
                 .get(names.control_service(mode))
@@ -3624,12 +3683,13 @@ impl KubernetesComputeDriver {
         main_process_spec: &str,
         log_level: &str,
         upstream_proxy_ca_bundle_staged: bool,
+        start: &mut LifecycleWrite,
     ) -> Result<String, KubernetesDriverError> {
         // Validate or create the immutable trust generation before creating
         // the dedicated supervisor Pod. A same-name delete/recreate with
         // altered bytes therefore fails closed while no control process runs.
         let network_additional_ca = self
-            .ensure_network_additional_ca_config_map(namespace)
+            .ensure_network_additional_ca_config_map(namespace, start)
             .await?;
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         let mut pod = crate::sandbox_runtime::with_runtime_class(
@@ -3678,8 +3738,9 @@ impl KubernetesComputeDriver {
             &self.config.supervisor_runtime_class_name,
         );
         apply_fixed_pod_metadata(&mut pod.metadata, &self.config);
-        pods.create(&PostParams::default(), &pod)
-            .await
+        start
+            .run(pods.create(&PostParams::default(), &pod))
+            .await?
             .map_err(KubernetesDriverError::from_kube)?
             .metadata
             .uid
@@ -3760,7 +3821,12 @@ impl KubernetesComputeDriver {
             target.address.port(),
             owner,
         );
-        create_or_validate_sandbox_runtime_fence(&policies, &expected).await?;
+        create_or_validate_sandbox_runtime_fence(
+            &policies,
+            &expected,
+            &mut LifecycleWrite::default(),
+        )
+        .await?;
         let stored =
             tokio::time::timeout(KUBE_API_TIMEOUT, policies.get(&names.shared_control_policy))
                 .await
@@ -4102,8 +4168,11 @@ impl KubernetesComputeDriver {
                 // resuming the gated supervisor as well as before creating
                 // it. The shared topology never carries an additional CA:
                 // the gateway refuses that combination fail-closed.
-                self.ensure_network_additional_ca_config_map(namespace)
-                    .await?;
+                self.ensure_network_additional_ca_config_map(
+                    namespace,
+                    &mut LifecycleWrite::default(),
+                )
+                .await?;
                 pods.patch(
                     &names.supervisor_pod,
                     &PatchParams::default(),
@@ -4215,20 +4284,18 @@ impl KubernetesComputeDriver {
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let _guard = self.lifecycle_gates.gate_for(sandbox_id).lock_owned().await;
-        let result = Box::pin(self.stop_sandbox_inner(sandbox_id, StartCutoff::default())).await;
+        let result =
+            Box::pin(self.stop_sandbox_inner(sandbox_id, &mut LifecycleWrite::default())).await;
         span_status.finish(result)
     }
 
     async fn stop_sandbox_inner(
         &self,
         sandbox_id: &str,
-        cutoff: StartCutoff,
+        start: &mut LifecycleWrite,
     ) -> Result<(), KubernetesDriverError> {
         let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout, phase, placement) =
-            self.prepare_sandbox_stop(sandbox_id).await?;
-        cutoff
-            .check()
-            .map_err(KubernetesDriverError::start_cutoff)?;
+            self.prepare_sandbox_stop(sandbox_id, start).await?;
         if phase != Some(SandboxRuntimeBootstrapPhase::Suspending) {
             self.release_generation_supervisor(sandbox_id, &namespace, &placement)
                 .await?;
@@ -4282,6 +4349,7 @@ impl KubernetesComputeDriver {
                     sandbox_id,
                     &namespace,
                     sandbox_runtime_generation(&object).as_slice(),
+                    &mut LifecycleWrite::default(),
                 )
                 .await?;
                 patch_dynamic_object_with_resource_version_retry(
@@ -4340,15 +4408,14 @@ impl KubernetesComputeDriver {
     ) -> Result<String, KubernetesDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let _guard = self.lifecycle_gates.gate_for(sandbox_id).lock_owned().await;
-        cutoff
-            .check()
-            .map_err(KubernetesDriverError::start_cutoff)?;
+        let mut start = LifecycleWrite(cutoff);
+        start.check()?;
         let result = Box::pin(self.start_sandbox_runtime_generation(
             sandbox_id,
             generation_id,
             launch_authentication,
             expected_runtime_identity,
-            cutoff,
+            &mut start,
         ))
         .await;
         span_status.finish(result)
@@ -4361,7 +4428,7 @@ impl KubernetesComputeDriver {
         encoded_generation: &str,
         encoded_authentication: &[u8],
         encoded_expected_runtime_identity: &str,
-        cutoff: StartCutoff,
+        start: &mut LifecycleWrite,
     ) -> Result<String, KubernetesDriverError> {
         let staged = self.read_staged_bootstrap_material().await?;
         let generation = openshell_core::sandbox_generation::SandboxGenerationId::parse(
@@ -4416,11 +4483,8 @@ impl KubernetesComputeDriver {
                     == SandboxRuntimeControlAvailability::Available
                     && sandbox_runtime_bootstrap_is_ready_to_complete(&object)
                 {
-                    cutoff
-                        .check()
-                        .map_err(KubernetesDriverError::start_cutoff)?;
-                    self.complete_sandbox_runtime_bootstrap(&lookup_api, &object)
-                        .await;
+                    self.complete_sandbox_runtime_bootstrap(&lookup_api, &object, start)
+                        .await?;
                     let cr_uid = object.metadata.uid.as_deref().ok_or_else(|| {
                         KubernetesDriverError::Message("sandbox resource has no UID".to_string())
                     })?;
@@ -4439,7 +4503,7 @@ impl KubernetesComputeDriver {
             // its resources from a clean suspended state. This is safe even
             // after gateway replacement because launch credentials stay in
             // memory and are supplied again by the caller.
-            self.stop_sandbox_inner(sandbox_id, cutoff).await?;
+            self.stop_sandbox_inner(sandbox_id, start).await?;
             let refreshed = lookup_api
                 .api
                 .list(&ListParams::default().labels(&selector))
@@ -4479,13 +4543,13 @@ impl KubernetesComputeDriver {
                 // Suspend the controller and recreate both Pods so neither
                 // side retains credentials for the replaced gateway. Suspend
                 // even if the old workload Pod disappeared before this call.
-                self.stop_sandbox_inner(sandbox_id, cutoff).await?;
+                self.stop_sandbox_inner(sandbox_id, start).await?;
                 return Box::pin(self.start_sandbox_runtime_generation(
                     sandbox_id,
                     encoded_generation,
                     encoded_authentication,
                     encoded_expected_runtime_identity,
-                    cutoff,
+                    start,
                 ))
                 .await;
             }
@@ -4555,20 +4619,17 @@ impl KubernetesComputeDriver {
                 .expect("restart patch")
                 .remove("containers");
         }
-        cutoff
-            .check()
-            .map_err(KubernetesDriverError::start_cutoff)?;
-        self.create_sandbox_runtime_fence(&namespace, &names)
+        self.create_sandbox_runtime_fence(&namespace, &names, start)
             .await?;
         // Validate the current gateway generation before touching a stopped
         // sandbox's stale companion. This detects equal-generation
         // delete/recreate tampering before a supervisor can be created or
         // released, while running supervisors remain untouched.
-        self.ensure_network_additional_ca_config_map(&namespace)
+        self.ensure_network_additional_ca_config_map(&namespace, start)
             .await?;
         let mut stale_generations = sandbox_runtime_generation(&object).as_slice().to_vec();
         stale_generations.push(generation.as_str());
-        self.delete_sandbox_runtime_supervisor(sandbox_id, &namespace, &stale_generations)
+        self.delete_sandbox_runtime_supervisor(sandbox_id, &namespace, &stale_generations, start)
             .await?;
         // The legacy Service keeps selecting the workload for old gateways.
         // Add the supervisor endpoint when upgrading a legacy sandbox. A
@@ -4607,6 +4668,7 @@ impl KubernetesComputeDriver {
                         sandbox_id,
                         KubernetesControlConnection::SupervisorInitiated,
                         owner.clone(),
+                        start,
                     )
                     .await?;
                 }
@@ -4617,6 +4679,7 @@ impl KubernetesComputeDriver {
                 sandbox_id,
                 control_connection,
                 owner,
+                start,
             )
             .await?;
         }
@@ -4647,6 +4710,7 @@ impl KubernetesComputeDriver {
                         &main_process_spec,
                         &log_level,
                         staged.upstream_proxy_ca_bundle.is_some(),
+                        start,
                     )
                     .await?,
                 connection: control_connection,
@@ -4657,7 +4721,7 @@ impl KubernetesComputeDriver {
         };
 
         let restart = async {
-            patch_dynamic_object_with_resource_version_retry(
+            patch_dynamic_object_before(
                 &sandbox_api.api,
                 cr_name,
                 |version| {
@@ -4691,6 +4755,7 @@ impl KubernetesComputeDriver {
                         &self.config,
                     )
                 },
+                start,
             )
             .await?;
 
@@ -4714,10 +4779,13 @@ impl KubernetesComputeDriver {
         .await;
 
         if let Err(error) = restart {
+            if matches!(error, KubernetesDriverError::StartCutoff(_)) {
+                return Err(error);
+            }
             // The restart patch may not have recorded the sandbox instance yet.
             self.remove_shared_instance(&placement);
             if let Err(rollback_error) = self
-                .stop_sandbox_inner(sandbox_id, StartCutoff::default())
+                .stop_sandbox_inner(sandbox_id, &mut LifecycleWrite::default())
                 .await
             {
                 return Err(KubernetesDriverError::Message(format!(
@@ -4736,6 +4804,7 @@ impl KubernetesComputeDriver {
     async fn prepare_sandbox_stop(
         &self,
         sandbox_id: &str,
+        start: &mut LifecycleWrite,
     ) -> Result<
         (
             AgentSandboxApi,
@@ -4795,16 +4864,26 @@ impl KubernetesComputeDriver {
             .and_then(|annotations| annotations.get(SANDBOX_POD_NAME_ANNOTATION))
             .cloned()
             .unwrap_or_else(|| kube_name.clone());
-        if !matches!(
+        if matches!(
             phase,
             Some(
                 SandboxRuntimeBootstrapPhase::Releasing | SandboxRuntimeBootstrapPhase::Suspending
             )
         ) {
-            patch_dynamic_object_with_resource_version_retry(
+            // This stop already belongs to an earlier operation. Leave it to
+            // reconciliation rather than starting a new guarded mutation.
+            if start.0.is_set() {
+                start.check()?;
+                return Err(KubernetesDriverError::Precondition(
+                    "sandbox stop is already in progress".to_string(),
+                ));
+            }
+        } else {
+            patch_dynamic_object_before(
                 &agent_sandbox_api.api,
                 &kube_name,
                 sandbox_runtime_stop_begin_patch,
+                start,
             )
             .await?;
         }
@@ -4839,8 +4918,12 @@ impl KubernetesComputeDriver {
     ) -> Result<(), KubernetesDriverError> {
         match placement {
             SupervisorPlacement::Dedicated => {
-                self.delete_sandbox_runtime_supervisor_pod(sandbox_id, namespace)
-                    .await
+                self.delete_sandbox_runtime_supervisor_pod(
+                    sandbox_id,
+                    namespace,
+                    &mut LifecycleWrite::default(),
+                )
+                .await
             }
             SupervisorPlacement::Shared { .. } => {
                 self.remove_shared_instance(placement);
@@ -4853,6 +4936,7 @@ impl KubernetesComputeDriver {
         &self,
         sandbox_id: &str,
         namespace: &str,
+        start: &mut LifecycleWrite,
     ) -> Result<(), KubernetesDriverError> {
         let names = SandboxRuntimeNames::new(sandbox_id);
         let pods = Api::<Pod>::namespaced(self.client.clone(), namespace);
@@ -4862,15 +4946,15 @@ impl KubernetesComputeDriver {
             .map_err(KubernetesDriverError::from_kube)?
         {
             let deletion_timeout = kubernetes_pod_termination_timeout(&pod);
-            match pods
-                .delete(
+            match start
+                .run(pods.delete(
                     &names.supervisor_pod,
                     &DeleteParams::foreground().preconditions(Preconditions {
                         uid: pod.metadata.uid,
                         resource_version: None,
                     }),
-                )
-                .await
+                ))
+                .await?
             {
                 Ok(_) => {}
                 Err(KubeError::Api(error)) if error.code == 404 => return Ok(()),
@@ -4903,10 +4987,11 @@ impl KubernetesComputeDriver {
         sandbox_id: &str,
         namespace: &str,
         generations: &[&str],
+        start: &mut LifecycleWrite,
     ) -> Result<(), KubernetesDriverError> {
-        self.delete_sandbox_runtime_supervisor_pod(sandbox_id, namespace)
+        self.delete_sandbox_runtime_supervisor_pod(sandbox_id, namespace, start)
             .await?;
-        self.delete_sandbox_runtime_generation_secrets(sandbox_id, namespace, generations)
+        self.delete_sandbox_runtime_generation_secrets(sandbox_id, namespace, generations, start)
             .await
     }
 
@@ -4918,6 +5003,7 @@ impl KubernetesComputeDriver {
         sandbox_id: &str,
         namespace: &str,
         generations: &[&str],
+        start: &mut LifecycleWrite,
     ) -> Result<(), KubernetesDriverError> {
         let secrets = Api::<Secret>::namespaced(self.client.clone(), namespace);
         for generation in generations {
@@ -4929,7 +5015,10 @@ impl KubernetesComputeDriver {
             };
             generation_secrets.splice(0..0, [names.sandbox_secret, names.supervisor_secret]);
             for name in &generation_secrets {
-                match secrets.delete(name, &DeleteParams::default()).await {
+                match start
+                    .run(secrets.delete(name, &DeleteParams::default()))
+                    .await?
+                {
                     Ok(_) | Err(KubeError::Api(kube::core::ErrorResponse { code: 404, .. })) => {}
                     Err(error) => return Err(KubernetesDriverError::from_kube(error)),
                 }
@@ -5251,7 +5340,10 @@ impl KubernetesComputeDriver {
             }
             let names = SandboxRuntimeNames::new(&sandbox_id);
             let policies = Api::<NetworkPolicy>::namespaced(self.client.clone(), namespace);
-            match self.create_sandbox_runtime_fence(namespace, &names).await {
+            match self
+                .create_sandbox_runtime_fence(namespace, &names, &mut LifecycleWrite::default())
+                .await
+            {
                 Ok(()) => {}
                 Err(KubernetesDriverError::Precondition(error)) => {
                     warn!(sandbox_id, %error, "sandbox-runtime workload fence is altered; suspending workload");
@@ -5318,7 +5410,12 @@ impl KubernetesComputeDriver {
                     == SandboxRuntimeControlAvailability::Available
                     && sandbox_runtime_bootstrap_is_ready_to_complete(&object)
                 {
-                    self.complete_sandbox_runtime_bootstrap(&lookup_api, &object)
+                    let _ = self
+                        .complete_sandbox_runtime_bootstrap(
+                            &lookup_api,
+                            &object,
+                            &mut LifecycleWrite::default(),
+                        )
                         .await;
                 } else {
                     self.reap_stale_sandbox_runtime_bootstrap(&lookup_api, &object)
@@ -5536,6 +5633,7 @@ impl KubernetesComputeDriver {
                 sandbox_id,
                 namespace,
                 sandbox_runtime_generation(object).as_slice(),
+                &mut LifecycleWrite::default(),
             )
             .await
         {
@@ -5764,15 +5862,16 @@ impl KubernetesComputeDriver {
         &self,
         lookup_api: &AgentSandboxApi,
         object: &DynamicObject,
-    ) {
+        start: &mut LifecycleWrite,
+    ) -> Result<(), KubernetesDriverError> {
         if !sandbox_runtime_bootstrap_is_ready_to_complete(object) {
-            return;
+            return Ok(());
         }
         let (Some(name), Some(resource_version)) = (
             object.metadata.name.as_deref(),
             object.metadata.resource_version.as_deref(),
         ) else {
-            return;
+            return Ok(());
         };
         let namespace = object
             .metadata
@@ -5782,12 +5881,12 @@ impl KubernetesComputeDriver {
         let api =
             Self::agent_sandbox_api(self.client.clone(), &lookup_api.resource.version, namespace);
         let patch = sandbox_runtime_bootstrap_completion_patch(resource_version);
-        match tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            api.api
-                .patch(name, &PatchParams::default(), &Patch::Merge(&patch)),
-        )
-        .await
+        match start
+            .run_with_timeout(
+                api.api
+                    .patch(name, &PatchParams::default(), &Patch::Merge(&patch)),
+            )
+            .await?
         {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
@@ -5798,6 +5897,7 @@ impl KubernetesComputeDriver {
                 "timed out completing sandbox-runtime bootstrap"
             ),
         }
+        Ok(())
     }
 
     async fn reconcile_sandbox_runtime_supervisor(
@@ -5810,7 +5910,12 @@ impl KubernetesComputeDriver {
         let generations = sandbox_runtime_generation(object);
         if !desired_running {
             return self
-                .delete_sandbox_runtime_supervisor(sandbox_id, namespace, generations.as_slice())
+                .delete_sandbox_runtime_supervisor(
+                    sandbox_id,
+                    namespace,
+                    generations.as_slice(),
+                    &mut LifecycleWrite::default(),
+                )
                 .await;
         }
         if let SupervisorPlacement::Shared { .. } = supervisor_placement(object)? {
@@ -9165,6 +9270,7 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
 async fn create_or_validate_sandbox_runtime_fence(
     policies: &Api<NetworkPolicy>,
     expected: &NetworkPolicy,
+    start: &mut LifecycleWrite,
 ) -> Result<(), KubernetesDriverError> {
     let name = expected.metadata.name.as_deref().unwrap_or_default();
     match tokio::time::timeout(KUBE_API_TIMEOUT, policies.get_opt(name)).await {
@@ -9180,11 +9286,9 @@ async fn create_or_validate_sandbox_runtime_fence(
         }
     }
 
-    match tokio::time::timeout(
-        KUBE_API_TIMEOUT,
-        policies.create(&PostParams::default(), expected),
-    )
-    .await
+    match start
+        .run_with_timeout(policies.create(&PostParams::default(), expected))
+        .await?
     {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(KubeError::Api(error))) if error.code == 409 => {
@@ -9965,7 +10069,7 @@ mod tests {
             assert_eq!(error.code(), tonic::Code::FailedPrecondition);
             assert!(error.message().contains("allow_driver_config"));
             assert!(
-                matches!(Box::pin(driver.create_sandbox_inner(&sandbox, StartCutoff::default())).await, Err(KubernetesDriverError::Precondition(message)) if message.contains("allow_driver_config"))
+                matches!(Box::pin(driver.create_sandbox_inner(&sandbox, &mut LifecycleWrite::default())).await, Err(KubernetesDriverError::Precondition(message)) if message.contains("allow_driver_config"))
             );
         }
     }
@@ -12256,7 +12360,7 @@ mod tests {
                     // Shared-mode provisioning reaches validation without namespace creation.
                     if workspace_mode == WorkspaceMode::Shared {
                         assert!(matches!(
-                            Box::pin(driver.create_sandbox_inner(&sandbox, StartCutoff::default())).await,
+                            Box::pin(driver.create_sandbox_inner(&sandbox, &mut LifecycleWrite::default())).await,
                             Err(KubernetesDriverError::InvalidArgument(message))
                                 if message.contains("reserved OpenShell path")
                         ));
@@ -12885,6 +12989,160 @@ mod tests {
         assert!(untouched.labels.is_none() && untouched.annotations.is_none());
     }
 
+    fn start_cutoff_fixture() -> (i64, LifecycleWrite) {
+        let expires = openshell_core::time::now_ms() + 350;
+        let mut request = tonic::Request::new(());
+        request.metadata_mut().insert(
+            openshell_core::sandbox_start_cutoff::HEADER,
+            expires.to_string().parse().unwrap(),
+        );
+        (
+            expires,
+            LifecycleWrite(StartCutoff::from_required_header(&request).unwrap()),
+        )
+    }
+
+    async fn wait_past_fixture_cutoff(expires: i64) {
+        let left = expires.saturating_sub(openshell_core::time::now_ms());
+        tokio::time::sleep(Duration::from_millis(
+            u64::try_from(left.max(0)).unwrap() + 20,
+        ))
+        .await;
+    }
+
+    fn sandbox_api_fixture(client: Client) -> Api<DynamicObject> {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        Api::namespaced_with(client, "fixture", &resource)
+    }
+
+    fn sandbox_resource_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
+            "metadata": {"name": "fixture", "resourceVersion": "42"}
+        })
+    }
+
+    #[tokio::test]
+    async fn a_slow_preflight_read_cannot_start_a_fence_or_stop_write_late() {
+        for fence in [true, false] {
+            let (expires, mut start) = start_cutoff_fixture();
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = calls.clone();
+            let client = Client::new(
+                tower::service_fn(move |request: http::Request<kube::client::Body>| {
+                    observed.lock().unwrap().push(request.method().clone());
+                    async move {
+                        wait_past_fixture_cutoff(expires).await;
+                        let reply = if fence {
+                            kube_test_not_found("NetworkPolicy", "fixture")
+                        } else {
+                            kube_test_response(http::StatusCode::OK, sandbox_resource_fixture())
+                        };
+                        Ok::<_, std::convert::Infallible>(reply)
+                    }
+                }),
+                "fixture",
+            );
+
+            let error = if fence {
+                let policies = Api::namespaced(client, "fixture");
+                let desired = NetworkPolicy {
+                    metadata: ObjectMeta {
+                        name: Some("fixture".into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                create_or_validate_sandbox_runtime_fence(&policies, &desired, &mut start)
+                    .await
+                    .unwrap_err()
+            } else {
+                patch_dynamic_object_before(
+                    &sandbox_api_fixture(client),
+                    "fixture",
+                    sandbox_runtime_stop_begin_patch,
+                    &mut start,
+                )
+                .await
+                .unwrap_err()
+            };
+
+            assert_eq!(
+                error.into_rpc_status().code(),
+                tonic::Code::DeadlineExceeded
+            );
+            assert_eq!(*calls.lock().unwrap(), vec![http::Method::GET]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_write_can_finish_after_cutoff_but_a_conflict_cannot_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for confirmed in [false, true] {
+            let (expires, mut start) = start_cutoff_fixture();
+            let writes = Arc::new(AtomicUsize::new(0));
+            let observed = writes.clone();
+            let client = Client::new(
+                tower::service_fn(move |request: http::Request<kube::client::Body>| {
+                    let first_write = request.method() == http::Method::PATCH
+                        && observed.fetch_add(1, Ordering::SeqCst) == 0;
+                    async move {
+                        let reply = if first_write {
+                            wait_past_fixture_cutoff(expires).await;
+                            if confirmed {
+                                kube_test_response(http::StatusCode::OK, sandbox_resource_fixture())
+                            } else {
+                                kube_test_response(
+                                    http::StatusCode::CONFLICT,
+                                    serde_json::json!({
+                                        "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                                        "reason": "Conflict", "message": "version changed", "code": 409,
+                                    }),
+                                )
+                            }
+                        } else {
+                            kube_test_response(http::StatusCode::OK, sandbox_resource_fixture())
+                        };
+                        Ok::<_, std::convert::Infallible>(reply)
+                    }
+                }),
+                "fixture",
+            );
+            let api = sandbox_api_fixture(client);
+            let first = patch_dynamic_object_before(
+                &api,
+                "fixture",
+                sandbox_runtime_stop_begin_patch,
+                &mut start,
+            )
+            .await;
+            if confirmed {
+                first.unwrap();
+                patch_dynamic_object_before(
+                    &api,
+                    "fixture",
+                    sandbox_runtime_suspension_completion_patch,
+                    &mut start,
+                )
+                .await
+                .unwrap();
+                assert_eq!(writes.load(Ordering::SeqCst), 2);
+            } else {
+                assert_eq!(
+                    first.unwrap_err().into_rpc_status().code(),
+                    tonic::Code::DeadlineExceeded
+                );
+                assert_eq!(writes.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_kubernetes_mutation_waiting_for_its_lifecycle_lock_cannot_start_late() {
         use openshell_core::sandbox_start_cutoff::HEADER;
@@ -12952,7 +13210,7 @@ mod tests {
                 ..Default::default()
             };
             assert!(matches!(
-                Box::pin(driver.create_sandbox_inner(&sandbox, StartCutoff::default())).await,
+                Box::pin(driver.create_sandbox_inner(&sandbox, &mut LifecycleWrite::default())).await,
                 Err(KubernetesDriverError::InvalidArgument(message)) if message.contains(key)
             ));
         }
@@ -15344,7 +15602,12 @@ mod tests {
             ],
         );
         driver
-            .delete_sandbox_runtime_generation_secrets("sandbox-1", "managed-team-a", &["gen7"])
+            .delete_sandbox_runtime_generation_secrets(
+                "sandbox-1",
+                "managed-team-a",
+                &["gen7"],
+                &mut LifecycleWrite::default(),
+            )
             .await
             .expect("generation Secrets are deleted");
         assert!(steps.lock().unwrap().is_empty());

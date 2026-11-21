@@ -1742,7 +1742,6 @@ impl ComputeRuntime {
         }
 
         // Create with MustCreate condition to prevent duplicate creation race
-        self.sandbox_index.update_from_sandbox(&sandbox);
         let labels_map = sandbox.object_labels();
         let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
             None
@@ -1756,6 +1755,7 @@ impl ComputeRuntime {
         if cutoff.is_set() {
             provisioning_operation::require_start_cutoff(&mut sandbox);
         }
+        self.sandbox_index.update_from_sandbox(&sandbox);
         let result = self
             .store
             .put_if(
@@ -1874,7 +1874,7 @@ impl ComputeRuntime {
             Err(ProvisioningOperationError::Driver { status, settled }) => {
                 let status = match status.code() {
                     Code::AlreadyExists => Status::already_exists("sandbox already exists"),
-                    Code::DeadlineExceeded => status,
+                    Code::DeadlineExceeded if cutoff.is_set() => status,
                     Code::FailedPrecondition => {
                         Status::failed_precondition(status.message().to_string())
                     }
